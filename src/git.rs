@@ -293,8 +293,6 @@ fn extend_checkpoint_paths(
     scoped_paths
 }
 
-const DIFF_MAX_LINES: usize = 500;
-
 fn untracked_files_diff(config: &Config) -> String {
     let output = match run_git(["ls-files", "--others", "--exclude-standard"], config) {
         Ok(o) if o.status.success() => o,
@@ -337,14 +335,14 @@ fn append_untracked(combined: &mut String, config: &Config) {
     }
 }
 
-fn truncate_diff(diff: &str) -> String {
+fn truncate_diff(diff: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = diff.lines().collect();
-    if lines.len() <= DIFF_MAX_LINES {
+    if lines.len() <= max_lines {
         return diff.to_string();
     }
-    let truncated = lines[..DIFF_MAX_LINES].join("\n");
+    let truncated = lines[..max_lines].join("\n");
     format!(
-        "{truncated}\n\n... [diff truncated at ~{DIFF_MAX_LINES} lines — {} total] ...",
+        "{truncated}\n\n... [diff truncated at ~{max_lines} lines — {} total] ...",
         lines.len()
     )
 }
@@ -375,7 +373,7 @@ pub fn git_diff_for_review(baseline_ref: Option<&str>, config: &Config) -> Strin
     {
         let diff = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !diff.is_empty() {
-            return truncate_diff(&diff);
+            return truncate_diff(&diff, config.effective_diff_max_lines() as usize);
         }
     }
 
@@ -386,7 +384,7 @@ pub fn git_diff_for_review(baseline_ref: Option<&str>, config: &Config) -> Strin
         let mut combined = String::from_utf8_lossy(&output.stdout).trim().to_string();
         append_untracked(&mut combined, config);
         if !combined.is_empty() {
-            return truncate_diff(&combined);
+            return truncate_diff(&combined, config.effective_diff_max_lines() as usize);
         }
     }
 
@@ -416,7 +414,7 @@ pub fn git_diff_for_review(baseline_ref: Option<&str>, config: &Config) -> Strin
     if combined.is_empty() {
         "(no diff available)".to_string()
     } else {
-        truncate_diff(&combined)
+        truncate_diff(&combined, config.effective_diff_max_lines() as usize)
     }
 }
 
@@ -986,7 +984,7 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(truncate_diff(&short_diff), short_diff);
+        assert_eq!(truncate_diff(&short_diff, 500), short_diff);
     }
 
     #[test]
@@ -995,11 +993,62 @@ mod tests {
             .map(|i| format!("line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let truncated = truncate_diff(&long_diff);
+        let truncated = truncate_diff(&long_diff, 500);
 
         assert!(truncated.contains("line 0"));
         assert!(truncated.contains("line 499"));
         assert!(!truncated.contains("line 500\n"));
         assert!(truncated.contains("... [diff truncated at ~500 lines — 600 total] ..."));
+    }
+
+    #[test]
+    fn truncate_diff_respects_custom_limit() {
+        let diff = (0..50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = truncate_diff(&diff, 10);
+
+        assert!(truncated.contains("line 0"));
+        assert!(truncated.contains("line 9"));
+        assert!(!truncated.contains("line 10\n"));
+        assert!(truncated.contains("... [diff truncated at ~10 lines — 50 total] ..."));
+    }
+
+    #[test]
+    fn git_diff_for_review_truncates_at_configured_limit() {
+        let _env_guard = env_lock();
+        let mut project = TestProject::builder("git_diff_cfg_limit")
+            .auto_commit(true)
+            .with_git()
+            .build();
+
+        // Set a small diff_max_lines via config
+        project.config.diff_max_lines = Some(20);
+
+        project.write_file("seed.txt", "seed");
+        project.commit_all("initial");
+
+        let baseline = git_rev_parse_head(&project.config).unwrap();
+
+        // Create a file with many lines to produce a diff exceeding 20 lines
+        let big_content: String = (0..100)
+            .map(|i| format!("content line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        project.write_file("big.txt", &big_content);
+        project.commit_all("add big file");
+
+        let diff = git_diff_for_review(Some(&baseline), &project.config);
+
+        assert!(
+            diff.contains("... [diff truncated at ~20 lines"),
+            "diff should be truncated at the configured limit of 20: {diff}"
+        );
+        // Lines beyond 20 should not appear in the output
+        assert!(
+            !diff.contains("content line 99"),
+            "diff should not include lines beyond the truncation limit"
+        );
     }
 }

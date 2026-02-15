@@ -28,6 +28,10 @@ pub struct TestConfigOptions {
     pub auto_test: bool,
     pub auto_test_cmd: Option<String>,
     pub planning_only: bool,
+    pub diff_max_lines: Option<u32>,
+    pub context_line_cap: Option<u32>,
+    pub planning_context_excerpt_lines: Option<u32>,
+    pub verbose: bool,
 }
 
 impl Default for TestConfigOptions {
@@ -43,6 +47,10 @@ impl Default for TestConfigOptions {
             auto_test: false,
             auto_test_cmd: None,
             planning_only: false,
+            diff_max_lines: None,
+            context_line_cap: None,
+            planning_context_excerpt_lines: None,
+            verbose: false,
         }
     }
 }
@@ -76,6 +84,10 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         auto_test: options.auto_test,
         auto_test_cmd: options.auto_test_cmd.clone(),
         planning_only: options.planning_only,
+        diff_max_lines: options.diff_max_lines,
+        context_line_cap: options.context_line_cap,
+        planning_context_excerpt_lines: options.planning_context_excerpt_lines,
+        verbose: options.verbose,
     }
 }
 
