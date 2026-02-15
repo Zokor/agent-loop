@@ -102,20 +102,23 @@ fn repo_requires_git(config: &Config) -> bool {
         return true;
     }
 
-    // Use `git rev-parse` to detect git-backed projects even when running from
-    // a subdirectory (where `.git` may not exist directly under project_dir).
-    is_inside_git_work_tree(config)
+    // Detect git-backed projects by walking ancestor directories for a `.git`
+    // entry (file or directory).  This intentionally avoids invoking the `git`
+    // binary so that a missing `git` installation doesn't cause the check to
+    // silently return `false`.
+    has_git_ancestor(&config.project_dir)
 }
 
-fn is_inside_git_work_tree(config: &Config) -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&config.project_dir)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+fn has_git_ancestor(start: &std::path::Path) -> bool {
+    let mut dir = start.to_path_buf();
+    loop {
+        if dir.join(".git").exists() {
+            return true;
+        }
+        if !dir.pop() {
+            return false;
+        }
+    }
 }
 
 fn check_git_when_required(config: &Config) -> Result<(), AgentLoopError> {
@@ -331,6 +334,62 @@ mod tests {
         let err = run_preflight(&project.config)
             .expect_err("should fail when git is required but missing");
         assert!(err.to_string().contains("git is required"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_preflight_fails_for_git_backed_repo_without_git_binary() {
+        // Regression: when the project is inside a git work tree but
+        // `auto_commit = false`, preflight must still detect that git is
+        // required (via the `.git` ancestor walk) and error when the `git`
+        // binary is absent from PATH.
+        let _guard = env_lock();
+        let project = TestProject::builder("preflight_git_backed_no_bin")
+            .auto_commit(false)
+            .with_git()
+            .build();
+
+        project.create_executable("claude", "#!/bin/sh\necho claude\n");
+        project.create_executable("codex", "#!/bin/sh\necho codex\n");
+        // No git in PATH — only agent binaries
+        let _path_override = project.with_path_override();
+
+        let err = run_preflight(&project.config)
+            .expect_err("should fail when git is required but binary is missing");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("git is required"),
+            "error should mention git: {msg}"
+        );
+        assert!(
+            msg.contains("git-scm.com"),
+            "error should contain install hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn has_git_ancestor_detects_dot_git_in_parent() {
+        let project = TestProject::builder("preflight_git_ancestor")
+            .auto_commit(false)
+            .build();
+
+        // Create a bare `.git` directory (no real git init needed).
+        std::fs::create_dir_all(project.root.join(".git"))
+            .expect(".git dir should be created");
+
+        let subdir = project.root.join("deep").join("nested");
+        std::fs::create_dir_all(&subdir).expect("subdir should be created");
+
+        assert!(has_git_ancestor(&project.root));
+        assert!(has_git_ancestor(&subdir));
+    }
+
+    #[test]
+    fn has_git_ancestor_false_without_dot_git() {
+        let project = TestProject::builder("preflight_no_git_ancestor")
+            .auto_commit(false)
+            .build();
+        assert!(!has_git_ancestor(&project.root));
     }
 
     #[test]
