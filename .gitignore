@@ -1,0 +1,12 @@
+# Rust
+target/
+
+# Node (legacy TS version — remove after Rust rewrite)
+node_modules/
+
+# Runtime state
+state/
+.agent-loop/
+
+# OS
+.DS_Store

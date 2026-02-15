@@ -1,0 +1,1251 @@
+use std::{
+    fmt,
+    fs::{self, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::config::Config;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Status {
+    Pending,
+    Planning,
+    Implementing,
+    Reviewing,
+    Approved,
+    Consensus,
+    Disputed,
+    NeedsChanges,
+    NeedsRevision,
+    MaxRounds,
+    Error,
+}
+
+impl fmt::Display for Status {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Pending => "PENDING",
+            Self::Planning => "PLANNING",
+            Self::Implementing => "IMPLEMENTING",
+            Self::Reviewing => "REVIEWING",
+            Self::Approved => "APPROVED",
+            Self::Consensus => "CONSENSUS",
+            Self::Disputed => "DISPUTED",
+            Self::NeedsChanges => "NEEDS_CHANGES",
+            Self::NeedsRevision => "NEEDS_REVISION",
+            Self::MaxRounds => "MAX_ROUNDS",
+            Self::Error => "ERROR",
+        };
+
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopStatus {
+    pub status: Status,
+    pub round: u32,
+    pub implementer: String,
+    pub reviewer: String,
+    pub mode: String,
+    #[serde(rename = "lastRunTask")]
+    pub last_run_task: String,
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u32>,
+    pub timestamp: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatusPatch {
+    pub status: Option<Status>,
+    pub round: Option<u32>,
+    pub implementer: Option<String>,
+    pub reviewer: Option<String>,
+    pub mode: Option<String>,
+    pub last_run_task: Option<String>,
+    pub reason: Option<String>,
+    pub rating: Option<u32>,
+}
+
+fn state_file_path(name: &str, config: &Config) -> PathBuf {
+    config.state_dir.join(Path::new(name))
+}
+
+pub fn normalize_task_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+pub fn summarize_task(value: &str, max_length: Option<usize>) -> String {
+    let normalized = normalize_task_text(value);
+    let limit = max_length.unwrap_or(120);
+
+    if normalized.chars().count() <= limit {
+        return normalized;
+    }
+
+    if limit <= 3 {
+        return ".".repeat(limit);
+    }
+
+    let truncated = normalized.chars().take(limit - 3).collect::<String>();
+    format!("{truncated}...")
+}
+
+pub fn resolve_last_run_task(explicit: Option<&str>, config: &Config) -> String {
+    if let Some(value) = explicit
+        && !value.trim().is_empty()
+    {
+        return normalize_task_text(value);
+    }
+
+    let task_from_state = read_state_file("task.md", config);
+    if !task_from_state.trim().is_empty() {
+        return normalize_task_text(&task_from_state);
+    }
+
+    String::new()
+}
+
+pub fn timestamp() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = now.as_secs() as i64;
+    let millis = now.subsec_millis();
+
+    let days_since_epoch = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let hour = (seconds_of_day / 3_600) as u32;
+    let minute = ((seconds_of_day % 3_600) / 60) as u32;
+    let second = (seconds_of_day % 60) as u32;
+    let (year, month, day) = civil_from_days(days_since_epoch);
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_piece = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_piece + 2) / 5 + 1;
+    let month = month_piece + if month_piece < 10 { 3 } else { -9 };
+
+    if month <= 2 {
+        year += 1;
+    }
+
+    (year as i32, month as u32, day as u32)
+}
+
+pub fn default_status(config: &Config) -> LoopStatus {
+    LoopStatus {
+        status: Status::Pending,
+        round: 0,
+        implementer: config.implementer.to_string(),
+        reviewer: config.reviewer.to_string(),
+        mode: config.run_mode.to_string(),
+        last_run_task: resolve_last_run_task(None, config),
+        reason: None,
+        rating: None,
+        timestamp: timestamp(),
+    }
+}
+
+pub fn normalize_status_value(raw: &Value, config: &Config) -> LoopStatus {
+    let fallback = default_status(config);
+    let Some(map) = raw.as_object() else {
+        return fallback;
+    };
+
+    let status = map
+        .get("status")
+        .and_then(|v| serde_json::from_value::<Status>(v.clone()).ok())
+        .unwrap_or(fallback.status);
+
+    let round = match map.get("round") {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .unwrap_or(fallback.round),
+        _ => fallback.round,
+    };
+
+    let implementer = map
+        .get("implementer")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.implementer.clone());
+
+    let reviewer = map
+        .get("reviewer")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.reviewer.clone());
+
+    let mode = map
+        .get("mode")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "single-agent" | "dual-agent"))
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.mode.clone());
+
+    let last_run_task =
+        resolve_last_run_task(map.get("lastRunTask").and_then(Value::as_str), config);
+
+    let reason = map
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let rating = match map.get("rating") {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|v| (1..=5).contains(v)),
+        _ => None,
+    };
+
+    let status_timestamp = map
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| fallback.timestamp.clone());
+
+    LoopStatus {
+        status,
+        round,
+        implementer,
+        reviewer,
+        mode,
+        last_run_task,
+        reason,
+        rating,
+        timestamp: status_timestamp,
+    }
+}
+
+pub fn read_state_file(name: &str, config: &Config) -> String {
+    fs::read_to_string(state_file_path(name, config)).unwrap_or_default()
+}
+
+pub fn write_state_file(name: &str, content: &str, config: &Config) -> io::Result<()> {
+    let target = state_file_path(name, config);
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    // Build temp path in the same directory as the target so that rename is
+    // guaranteed to be a same-filesystem operation (required for atomic rename).
+    let tmp = {
+        let mut s = target.as_os_str().to_os_string();
+        s.push(".tmp");
+        PathBuf::from(s)
+    };
+
+    if let Err(write_err) = fs::write(&tmp, content) {
+        let _ = fs::remove_file(&tmp);
+        return Err(write_err);
+    }
+
+    // fs::rename is atomic on POSIX (rename(2) overwrites target in one syscall).
+    // On some Windows filesystems, rename fails when the target already exists.
+    // The fallback strategy differs by platform:
+    //   - POSIX: rename should always work; propagate the error if it doesn't.
+    //   - Windows: try rename → remove target + retry rename → non-atomic fs::write.
+    //     The non-atomic fallback is intentional: better to persist data non-atomically
+    //     than to lose the write entirely.
+    match fs::rename(&tmp, &target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if cfg!(windows) {
+                // Windows fallback: remove existing target, then retry rename.
+                if target.exists() {
+                    let _ = fs::remove_file(&target);
+                }
+                if fs::rename(&tmp, &target).is_ok() {
+                    return Ok(());
+                }
+                // Last resort: non-atomic direct write. Clean up the temp file first.
+                let _ = fs::remove_file(&tmp);
+                fs::write(&target, content)?;
+                Ok(())
+            } else {
+                // On POSIX, rename(2) atomically overwrites the target, so a failure
+                // indicates a real problem (permissions, cross-device, etc.). Clean up
+                // the temp file and propagate the original error.
+                let _ = fs::remove_file(&tmp);
+                Err(rename_err)
+            }
+        }
+    }
+}
+
+pub fn is_status_stale(expected_ts: &str, status: &LoopStatus) -> bool {
+    status.timestamp != expected_ts
+}
+
+pub fn read_status(config: &Config) -> LoopStatus {
+    let raw = read_state_file("status.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return default_status(config);
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => normalize_status_value(&value, config),
+        Err(err) => {
+            let mut fallback = default_status(config);
+            fallback.status = Status::Error;
+            fallback.reason = Some(format!("Invalid status.json: {err}"));
+            fallback
+        }
+    }
+}
+
+pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatus> {
+    let current = read_status(config);
+    let StatusPatch {
+        status,
+        round,
+        implementer,
+        reviewer,
+        mode,
+        last_run_task,
+        reason,
+        rating,
+    } = patch;
+
+    let merged_task_input = match last_run_task.as_deref() {
+        Some(value) => Some(value),
+        None => Some(current.last_run_task.as_str()),
+    };
+    let next_status = status.unwrap_or(current.status);
+    let clear_stale_diagnostics = status.is_some();
+    let next_reason = match reason {
+        Some(value) => Some(value),
+        None if clear_stale_diagnostics => None,
+        None => current.reason,
+    };
+    let next_rating = match rating {
+        Some(value) => Some(value),
+        None if clear_stale_diagnostics => None,
+        None => current.rating,
+    };
+
+    let updated = LoopStatus {
+        status: next_status,
+        round: round.unwrap_or(current.round),
+        implementer: implementer.unwrap_or_else(|| config.implementer.to_string()),
+        reviewer: reviewer.unwrap_or_else(|| config.reviewer.to_string()),
+        mode: mode.unwrap_or_else(|| config.run_mode.to_string()),
+        last_run_task: resolve_last_run_task(merged_task_input, config),
+        reason: next_reason,
+        rating: next_rating,
+        timestamp: timestamp(),
+    };
+
+    let serialized = serde_json::to_string_pretty(&updated).map_err(io::Error::other)?;
+    write_state_file("status.json", &serialized, config)?;
+
+    Ok(updated)
+}
+
+pub fn log(msg: &str, config: &Config) -> io::Result<()> {
+    let line = format!("[{}] {}", timestamp(), msg);
+    println!("{line}");
+
+    let log_path = state_file_path("log.txt", config);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?;
+    writeln!(file, "{line}")
+}
+
+pub fn append_round_summary(
+    round: u32,
+    phase: &str,
+    summary: &str,
+    config: &Config,
+) -> io::Result<()> {
+    let normalized = summarize_task(summary, Some(120));
+    let line = format!("Round {round} {phase}: {normalized}\n");
+    let path = state_file_path("conversation.md", config);
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(line.as_bytes())
+}
+
+pub fn read_recent_history(config: &Config, max_lines: usize) -> String {
+    let content = read_state_file("conversation.md", config);
+    if content.trim().is_empty() {
+        return String::new();
+    }
+
+    let non_empty_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    if non_empty_lines.len() <= max_lines {
+        non_empty_lines.join("\n")
+    } else {
+        non_empty_lines[non_empty_lines.len() - max_lines..].join("\n")
+    }
+}
+
+pub fn init(task: &str, config: &Config, baseline_files: &[String]) -> io::Result<()> {
+    fs::create_dir_all(&config.state_dir)?;
+    // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
+    let _baseline_files = baseline_files;
+
+    write_state_file("task.md", task, config)?;
+    write_state_file("plan.md", "", config)?;
+    write_state_file("review.md", "", config)?;
+    write_state_file("changes.md", "", config)?;
+    write_state_file("conversation.md", "", config)?;
+    write_state_file("log.txt", "", config)?;
+
+    write_status(
+        StatusPatch {
+            status: Some(Status::Pending),
+            round: Some(0),
+            implementer: Some(config.implementer.to_string()),
+            reviewer: Some(config.reviewer.to_string()),
+            mode: Some(config.run_mode.to_string()),
+            ..StatusPatch::default()
+        },
+        config,
+    )?;
+
+    log("Agent loop initialized", config)?;
+    log(
+        &format!("Task: {}", summarize_task(task, Some(100))),
+        config,
+    )?;
+    log(
+        &format!(
+            "Implementer: {} | Reviewer: {}",
+            config.implementer, config.reviewer
+        ),
+        config,
+    )?;
+    log(&format!("Mode: {}", config.run_mode), config)?;
+    log(
+        &format!(
+            "Max rounds: {} | Timeout: {}s",
+            config.max_rounds, config.timeout_seconds
+        ),
+        config,
+    )?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestProject;
+    use serde_json::json;
+    use std::thread;
+
+    fn new_project() -> TestProject {
+        TestProject::builder("agent_loop_state_test").build()
+    }
+
+    fn is_timestamp_shape(value: &str) -> bool {
+        if value.len() != 24 {
+            return false;
+        }
+
+        let bytes = value.as_bytes();
+        let digit_positions = [
+            0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22,
+        ];
+
+        for idx in digit_positions {
+            if !bytes[idx].is_ascii_digit() {
+                return false;
+            }
+        }
+
+        bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && bytes[10] == b'T'
+            && bytes[13] == b':'
+            && bytes[16] == b':'
+            && bytes[19] == b'.'
+            && bytes[23] == b'Z'
+    }
+
+    #[test]
+    fn loop_status_serializes_last_run_task_in_camel_case() {
+        let status = LoopStatus {
+            status: Status::Pending,
+            round: 0,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "task".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
+        };
+
+        let value = serde_json::to_value(status).expect("status should serialize");
+        let object = value.as_object().expect("status should be an object");
+
+        assert!(object.contains_key("lastRunTask"));
+        assert!(!object.contains_key("last_run_task"));
+    }
+
+    #[test]
+    fn normalize_and_summarize_task_helpers_match_expected_boundaries() {
+        assert_eq!(
+            normalize_task_text("  Task 1:\n  build    feature   "),
+            "Task 1: build feature"
+        );
+        assert_eq!(summarize_task("short task", Some(20)), "short task");
+        assert_eq!(
+            summarize_task("12345678901234567890", Some(10)),
+            "1234567..."
+        );
+        assert_eq!(summarize_task("abcdef", Some(3)), "...");
+    }
+
+    #[test]
+    fn timestamp_uses_utc_iso8601_milliseconds_format() {
+        let value = timestamp();
+        assert!(is_timestamp_shape(&value));
+    }
+
+    #[test]
+    fn normalize_status_value_falls_back_per_field_on_bad_types() {
+        let project = new_project();
+        write_state_file("task.md", "  fallback   task  ", &project.config)
+            .expect("task.md should be writable");
+
+        let raw = json!({
+            "status": "REVIEWING",
+            "round": "1",
+            "implementer": "custom-implementer",
+            "reviewer": 42,
+            "mode": "single-agent",
+            "lastRunTask": false,
+            "reason": 12,
+            "timestamp": "2026-02-14T12:30:15.987Z"
+        });
+
+        let normalized = normalize_status_value(&raw, &project.config);
+
+        assert_eq!(normalized.status, Status::Reviewing);
+        assert_eq!(normalized.round, 0);
+        assert_eq!(normalized.implementer, "custom-implementer");
+        assert_eq!(normalized.reviewer, "codex");
+        assert_eq!(normalized.mode, "single-agent");
+        assert_eq!(normalized.last_run_task, "fallback task");
+        assert_eq!(normalized.reason, None);
+        assert_eq!(normalized.timestamp, "2026-02-14T12:30:15.987Z");
+    }
+
+    #[test]
+    fn read_status_uses_defaults_for_missing_empty_and_error_for_invalid_json() {
+        let project = new_project();
+        write_state_file("task.md", "   task from state   ", &project.config)
+            .expect("task.md should be writable");
+
+        let missing = read_status(&project.config);
+        assert_eq!(missing.status, Status::Pending);
+        assert_eq!(missing.round, 0);
+        assert_eq!(missing.last_run_task, "task from state");
+
+        write_state_file("status.json", "   ", &project.config)
+            .expect("empty status.json should be writable");
+        let empty = read_status(&project.config);
+        assert_eq!(empty.status, Status::Pending);
+        assert_eq!(empty.round, 0);
+        assert_eq!(empty.last_run_task, "task from state");
+
+        write_state_file("status.json", "{broken", &project.config)
+            .expect("invalid status.json should be writable");
+        let invalid = read_status(&project.config);
+        assert_eq!(invalid.status, Status::Error);
+        assert_eq!(invalid.round, 0);
+        assert_eq!(invalid.last_run_task, "task from state");
+        assert!(
+            invalid
+                .reason
+                .as_deref()
+                .is_some_and(|value| value.starts_with("Invalid status.json:"))
+        );
+    }
+
+    #[test]
+    fn write_status_round_trip_clears_stale_reason_on_status_transition() {
+        let project = new_project();
+        write_state_file("task.md", "fallback task", &project.config)
+            .expect("task.md should be writable");
+
+        let first = write_status(
+            StatusPatch {
+                status: Some(Status::Planning),
+                round: Some(2),
+                implementer: Some("custom-impl".to_string()),
+                reviewer: Some("custom-reviewer".to_string()),
+                mode: Some("single-agent".to_string()),
+                last_run_task: Some("  direct   task ".to_string()),
+                reason: Some("needs follow-up".to_string()),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("first status write should succeed");
+
+        assert_eq!(first.status, Status::Planning);
+        assert_eq!(first.round, 2);
+        assert_eq!(first.implementer, "custom-impl");
+        assert_eq!(first.reviewer, "custom-reviewer");
+        assert_eq!(first.mode, "single-agent");
+        assert_eq!(first.last_run_task, "direct task");
+        assert_eq!(first.reason, Some("needs follow-up".to_string()));
+
+        let second = write_status(
+            StatusPatch {
+                status: Some(Status::Reviewing),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("second status write should succeed");
+
+        assert_eq!(second.status, Status::Reviewing);
+        assert_eq!(second.round, 2);
+        assert_eq!(second.implementer, "claude");
+        assert_eq!(second.reviewer, "codex");
+        assert_eq!(second.mode, "dual-agent");
+        assert_eq!(second.last_run_task, "direct task");
+        assert_eq!(second.reason, None);
+
+        let reloaded = read_status(&project.config);
+        assert_eq!(reloaded, second);
+    }
+
+    #[test]
+    fn init_creates_expected_files_and_initial_status() {
+        let project = new_project();
+        let baseline_files = vec!["src/main.rs".to_string()];
+
+        init(
+            "  Build\n a   robust  state module ",
+            &project.config,
+            &baseline_files,
+        )
+        .expect("init should succeed");
+
+        for name in [
+            "task.md",
+            "plan.md",
+            "review.md",
+            "changes.md",
+            "log.txt",
+            "status.json",
+        ] {
+            assert!(
+                state_file_path(name, &project.config).exists(),
+                "{name} should exist after init"
+            );
+        }
+
+        let status = read_status(&project.config);
+        assert_eq!(status.status, Status::Pending);
+        assert_eq!(status.round, 0);
+        assert_eq!(status.implementer, "claude");
+        assert_eq!(status.reviewer, "codex");
+        assert_eq!(status.mode, "dual-agent");
+        assert_eq!(status.last_run_task, "Build a robust state module");
+        assert_eq!(status.reason, None);
+        assert_eq!(status.rating, None);
+
+        let log_content = read_state_file("log.txt", &project.config);
+        assert!(log_content.contains("Agent loop initialized"));
+        assert!(log_content.contains("Task: Build a robust state module"));
+    }
+
+    #[test]
+    fn loop_status_serialization_omits_none_rating_and_includes_present_rating() {
+        let without_rating = LoopStatus {
+            status: Status::Approved,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "task".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
+        };
+
+        let json_without = serde_json::to_value(&without_rating).expect("should serialize");
+        assert!(!json_without.as_object().unwrap().contains_key("rating"));
+
+        let with_rating = LoopStatus {
+            rating: Some(4),
+            ..without_rating
+        };
+
+        let json_with = serde_json::to_value(&with_rating).expect("should serialize");
+        assert_eq!(json_with["rating"], 4);
+    }
+
+    #[test]
+    fn normalize_status_value_accepts_valid_ratings_and_rejects_invalid() {
+        let project = new_project();
+
+        // Valid rating: 1
+        let raw = json!({"rating": 1});
+        assert_eq!(
+            normalize_status_value(&raw, &project.config).rating,
+            Some(1)
+        );
+
+        // Valid rating: 5
+        let raw = json!({"rating": 5});
+        assert_eq!(
+            normalize_status_value(&raw, &project.config).rating,
+            Some(5)
+        );
+
+        // Valid rating: 3
+        let raw = json!({"rating": 3});
+        assert_eq!(
+            normalize_status_value(&raw, &project.config).rating,
+            Some(3)
+        );
+
+        // Invalid: 0 (out of range)
+        let raw = json!({"rating": 0});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Invalid: 6 (out of range)
+        let raw = json!({"rating": 6});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Invalid: negative
+        let raw = json!({"rating": -1});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Invalid: float
+        let raw = json!({"rating": 3.5});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Invalid: string
+        let raw = json!({"rating": "4"});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Invalid: null
+        let raw = json!({"rating": null});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+
+        // Missing rating
+        let raw = json!({"status": "APPROVED"});
+        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
+    }
+
+    #[test]
+    fn write_status_clears_stale_rating_on_status_transition_and_allows_explicit_override() {
+        let project = new_project();
+        write_state_file("task.md", "test task", &project.config)
+            .expect("task.md should be writable");
+
+        // Set initial rating
+        let first = write_status(
+            StatusPatch {
+                status: Some(Status::Approved),
+                rating: Some(4),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("first write should succeed");
+        assert_eq!(first.rating, Some(4));
+
+        // Status transition without explicit rating clears stale rating.
+        let second = write_status(
+            StatusPatch {
+                status: Some(Status::Consensus),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("second write should succeed");
+        assert_eq!(second.rating, None);
+
+        // Explicit rating overwrites
+        let third = write_status(
+            StatusPatch {
+                rating: Some(5),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("third write should succeed");
+        assert_eq!(third.rating, Some(5));
+    }
+
+    #[test]
+    fn write_status_preserves_reason_and_rating_when_status_is_unchanged() {
+        let project = new_project();
+        write_state_file("task.md", "test task", &project.config)
+            .expect("task.md should be writable");
+
+        let initial = write_status(
+            StatusPatch {
+                status: Some(Status::NeedsChanges),
+                reason: Some("missing test coverage".to_string()),
+                rating: Some(2),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("initial write should succeed");
+        assert_eq!(initial.reason.as_deref(), Some("missing test coverage"));
+        assert_eq!(initial.rating, Some(2));
+
+        let updated_task = write_status(
+            StatusPatch {
+                last_run_task: Some("  updated task title ".to_string()),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("task-only write should succeed");
+
+        assert_eq!(updated_task.status, Status::NeedsChanges);
+        assert_eq!(
+            updated_task.reason.as_deref(),
+            Some("missing test coverage")
+        );
+        assert_eq!(updated_task.rating, Some(2));
+        assert_eq!(updated_task.last_run_task, "updated task title");
+    }
+
+    #[test]
+    fn status_serde_round_trip_covers_all_variants() {
+        let variants = [
+            Status::Pending,
+            Status::Planning,
+            Status::Implementing,
+            Status::Reviewing,
+            Status::Approved,
+            Status::Consensus,
+            Status::Disputed,
+            Status::NeedsChanges,
+            Status::NeedsRevision,
+            Status::MaxRounds,
+            Status::Error,
+        ];
+
+        for variant in variants {
+            let serialized = serde_json::to_value(variant)
+                .unwrap_or_else(|_| panic!("{variant:?} should serialize"));
+            let deserialized: Status = serde_json::from_value(serialized.clone())
+                .unwrap_or_else(|_| panic!("{variant:?} should deserialize from {serialized}"));
+            assert_eq!(
+                variant, deserialized,
+                "{variant:?} should survive round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn status_display_matches_serde_serialization() {
+        let variants = [
+            Status::Pending,
+            Status::Planning,
+            Status::Implementing,
+            Status::Reviewing,
+            Status::Approved,
+            Status::Consensus,
+            Status::Disputed,
+            Status::NeedsChanges,
+            Status::NeedsRevision,
+            Status::MaxRounds,
+            Status::Error,
+        ];
+
+        for variant in variants {
+            let display_output = variant.to_string();
+            let serde_value = serde_json::to_value(variant)
+                .unwrap_or_else(|_| panic!("{variant:?} should serialize"));
+            let serde_string = serde_value
+                .as_str()
+                .unwrap_or_else(|| panic!("{variant:?} should serialize to a string"));
+            assert_eq!(
+                display_output, serde_string,
+                "Display and serde should produce identical output for {variant:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_status_value_falls_back_for_unknown_status_string() {
+        let project = new_project();
+
+        let raw = json!({
+            "status": "UNKNOWN_STATUS",
+            "round": 3
+        });
+
+        let normalized = normalize_status_value(&raw, &project.config);
+        assert_eq!(
+            normalized.status,
+            Status::Pending,
+            "unrecognized status string should fall back to Pending"
+        );
+        assert_eq!(normalized.round, 3, "other fields should still be parsed");
+    }
+
+    #[test]
+    fn civil_from_days_epoch() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+    }
+
+    #[test]
+    fn civil_from_days_leap_year() {
+        // 2000 is a leap year (divisible by 400)
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn civil_from_days_century_boundary() {
+        // 1900 is NOT a leap year (divisible by 100 but not 400)
+        assert_eq!(civil_from_days(-25_508), (1900, 3, 1));
+    }
+
+    #[test]
+    fn civil_from_days_recent_date() {
+        assert_eq!(civil_from_days(20_254), (2025, 6, 15));
+    }
+
+    #[test]
+    fn write_state_file_writes_valid_json() {
+        let project = new_project();
+        let payload = serde_json::json!({"status": "PENDING", "round": 0});
+        let content = serde_json::to_string_pretty(&payload).unwrap();
+
+        write_state_file("status.json", &content, &project.config).expect("write should succeed");
+
+        let raw = fs::read_to_string(state_file_path("status.json", &project.config))
+            .expect("file should be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("file should contain valid JSON");
+        assert_eq!(parsed["status"], "PENDING");
+        assert_eq!(parsed["round"], 0);
+    }
+
+    #[test]
+    fn write_state_file_creates_parent_directory_when_missing() {
+        use crate::test_support::{TestConfigOptions, create_temp_project_root, make_test_config};
+
+        let root = create_temp_project_root("atomic_write_parent_test");
+        let nested_state_dir = root.join("deep").join("nested").join("state");
+        let config = Config {
+            state_dir: nested_state_dir.clone(),
+            ..make_test_config(&root, TestConfigOptions::default())
+        };
+
+        assert!(!nested_state_dir.exists());
+
+        write_state_file("data.json", "{}", &config)
+            .expect("write with missing parent should succeed");
+
+        assert!(nested_state_dir.exists());
+        assert!(nested_state_dir.join("data.json").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn write_state_file_prevents_partial_reads_via_temp_then_rename() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const WRITE_ITERATIONS: u64 = 200;
+
+        let project = new_project();
+        let status_path = state_file_path("status.json", &project.config);
+
+        // Seed a valid initial file.
+        let initial = serde_json::json!({"version": 0, "data": "x".repeat(512)});
+        write_state_file(
+            "status.json",
+            &serde_json::to_string_pretty(&initial).unwrap(),
+            &project.config,
+        )
+        .expect("seed write should succeed");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_writer = Arc::clone(&done);
+
+        let read_path = status_path.clone();
+        let reader = thread::spawn(move || {
+            let mut reads = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                if let Ok(raw) = fs::read_to_string(&read_path) {
+                    if !raw.trim().is_empty() {
+                        let parsed: serde_json::Value = serde_json::from_str(&raw)
+                            .unwrap_or_else(|_| panic!("reader saw partial/invalid JSON: {raw}"));
+
+                        // Assert the payload is one of the expected versions, not just
+                        // any valid JSON. This catches corruption that happens to produce
+                        // a parseable but unexpected document.
+                        let version = parsed["version"].as_u64().unwrap_or_else(|| {
+                            panic!("missing or non-integer 'version' field: {raw}")
+                        });
+                        assert!(
+                            version <= WRITE_ITERATIONS,
+                            "version {version} out of expected range 0..={WRITE_ITERATIONS}"
+                        );
+
+                        let data = parsed["data"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("missing or non-string 'data' field: {raw}"));
+                        assert_eq!(
+                            data,
+                            "x".repeat(512),
+                            "data field corrupted for version {version}"
+                        );
+                    }
+                }
+                reads += 1;
+            }
+            reads
+        });
+
+        // Writer: repeatedly write full JSON payloads.
+        let config_clone = project.config.clone();
+        let writer = thread::spawn(move || {
+            for i in 1..=WRITE_ITERATIONS {
+                let payload = serde_json::json!({"version": i, "data": "x".repeat(512)});
+                write_state_file(
+                    "status.json",
+                    &serde_json::to_string_pretty(&payload).unwrap(),
+                    &config_clone,
+                )
+                .expect("concurrent write should succeed");
+            }
+            done_writer.store(true, Ordering::Relaxed);
+        });
+
+        writer.join().expect("writer thread should not panic");
+        let total_reads = reader.join().expect("reader thread should not panic");
+        assert!(
+            total_reads > 0,
+            "reader should have performed at least one read"
+        );
+    }
+
+    #[test]
+    fn write_state_file_ignores_stale_tmp_and_overwrites_cleanly() {
+        let project = new_project();
+        let target = state_file_path("status.json", &project.config);
+        let tmp = {
+            let mut s = target.as_os_str().to_os_string();
+            s.push(".tmp");
+            PathBuf::from(s)
+        };
+
+        // Ensure state dir exists and pre-create a stale .tmp file.
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&tmp, "stale leftover").unwrap();
+        assert!(tmp.exists());
+
+        let payload = serde_json::json!({"status": "APPROVED"});
+        write_state_file(
+            "status.json",
+            &serde_json::to_string_pretty(&payload).unwrap(),
+            &project.config,
+        )
+        .expect("write should succeed despite stale .tmp");
+
+        let content = fs::read_to_string(&target).expect("target should be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&content).expect("target should contain valid JSON");
+        assert_eq!(parsed["status"], "APPROVED");
+
+        // The .tmp file should have been cleaned up (renamed to target).
+        assert!(
+            !tmp.exists(),
+            "stale .tmp should not remain after successful write"
+        );
+    }
+
+    #[test]
+    fn is_status_stale_returns_true_when_timestamp_differs() {
+        let status = LoopStatus {
+            status: Status::Approved,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "task".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
+        };
+
+        assert!(is_status_stale("2026-02-14T12:00:00.000Z", &status));
+    }
+
+    #[test]
+    fn is_status_stale_returns_false_when_timestamp_matches() {
+        let status = LoopStatus {
+            status: Status::Approved,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "task".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
+        };
+
+        assert!(!is_status_stale("2026-02-14T00:00:00.000Z", &status));
+    }
+
+    #[test]
+    fn append_round_summary_creates_file_and_appends_lines() {
+        let project = new_project();
+
+        append_round_summary(1, "implementation", "Added auth module", &project.config)
+            .expect("first append should succeed");
+        append_round_summary(
+            1,
+            "review",
+            "NEEDS_CHANGES — missing validation",
+            &project.config,
+        )
+        .expect("second append should succeed");
+        append_round_summary(2, "implementation", "Added validation", &project.config)
+            .expect("third append should succeed");
+
+        let content = read_state_file("conversation.md", &project.config);
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "Round 1 implementation: Added auth module");
+        assert_eq!(
+            lines[1],
+            "Round 1 review: NEEDS_CHANGES — missing validation"
+        );
+        assert_eq!(lines[2], "Round 2 implementation: Added validation");
+    }
+
+    #[test]
+    fn append_round_summary_normalizes_and_truncates_summary() {
+        let project = new_project();
+        let long_summary = "a".repeat(200);
+
+        append_round_summary(1, "implementation", &long_summary, &project.config)
+            .expect("append should succeed");
+
+        let content = read_state_file("conversation.md", &project.config);
+        let line = content.lines().next().expect("should have one line");
+        // 120 char limit + "..." = 120 chars total in the summary part
+        assert!(
+            line.len() <= "Round 1 implementation: ".len() + 120,
+            "line should be bounded, got len={}",
+            line.len()
+        );
+        assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn read_recent_history_returns_last_n_non_empty_lines() {
+        let project = new_project();
+
+        for i in 1..=25 {
+            append_round_summary(i, "impl", &format!("change {i}"), &project.config)
+                .expect("append should succeed");
+        }
+
+        let history = read_recent_history(&project.config, 20);
+        let lines: Vec<&str> = history.lines().collect();
+        assert_eq!(lines.len(), 20);
+        assert!(lines[0].contains("change 6"));
+        assert!(lines[19].contains("change 25"));
+    }
+
+    #[test]
+    fn read_recent_history_returns_empty_for_missing_file() {
+        let project = new_project();
+        let history = read_recent_history(&project.config, 20);
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn read_recent_history_returns_all_lines_when_under_limit() {
+        let project = new_project();
+
+        append_round_summary(1, "impl", "first change", &project.config)
+            .expect("append should succeed");
+        append_round_summary(1, "review", "APPROVED", &project.config)
+            .expect("append should succeed");
+
+        let history = read_recent_history(&project.config, 20);
+        let lines: Vec<&str> = history.lines().collect();
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn read_recent_history_filters_empty_lines() {
+        let project = new_project();
+
+        // Write content with empty lines mixed in
+        let content =
+            "Round 1 impl: change 1\n\nRound 1 review: APPROVED\n\n\nRound 2 impl: change 2\n";
+        write_state_file("conversation.md", content, &project.config)
+            .expect("write should succeed");
+
+        let history = read_recent_history(&project.config, 20);
+        let lines: Vec<&str> = history.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(!lines.iter().any(|l| l.trim().is_empty()));
+    }
+
+    #[test]
+    fn init_creates_conversation_md() {
+        let project = new_project();
+        let baseline_files = vec!["src/main.rs".to_string()];
+
+        init("Test task", &project.config, &baseline_files).expect("init should succeed");
+
+        assert!(
+            state_file_path("conversation.md", &project.config).exists(),
+            "conversation.md should exist after init"
+        );
+        let content = read_state_file("conversation.md", &project.config);
+        assert!(
+            content.is_empty(),
+            "conversation.md should be empty after init"
+        );
+    }
+}
