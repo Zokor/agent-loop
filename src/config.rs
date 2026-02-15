@@ -158,7 +158,7 @@ impl Config {
             file.planning_only.unwrap_or(false)
         };
 
-        Ok(Self {
+        let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
             run_mode: resolve_run_mode(single_agent),
             project_dir,
@@ -173,7 +173,12 @@ impl Config {
             auto_test,
             auto_test_cmd,
             planning_only,
-        })
+        };
+
+        validate_config_bounds(&config)?;
+        emit_config_warnings(&config);
+
+        Ok(config)
     }
 }
 
@@ -284,6 +289,51 @@ pub fn resolve_run_mode(single_agent: bool) -> RunMode {
 
 fn parse_env<T: FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|value| value.parse::<T>().ok())
+}
+
+fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
+    if config.max_rounds == 0 && !config.planning_only {
+        return Err(AgentLoopError::Config(
+            "max_rounds must be > 0 in implementation mode. \
+             Set MAX_ROUNDS or max_rounds in .agent-loop.toml to a positive value, \
+             or use --planning-only."
+                .to_string(),
+        ));
+    }
+
+    if config.planning_max_rounds == 0 {
+        return Err(AgentLoopError::Config(
+            "planning_max_rounds must be > 0. \
+             Set PLANNING_MAX_ROUNDS or planning_max_rounds in .agent-loop.toml to a positive value."
+                .to_string(),
+        ));
+    }
+
+    if config.planning_only && config.decomposition_max_rounds == 0 {
+        return Err(AgentLoopError::Config(
+            "decomposition_max_rounds must be > 0 in planning-only mode. \
+             Set DECOMPOSITION_MAX_ROUNDS or decomposition_max_rounds in .agent-loop.toml to a positive value."
+                .to_string(),
+        ));
+    }
+
+    if config.timeout_seconds == 0 {
+        return Err(AgentLoopError::Config(
+            "timeout must be > 0. \
+             Set TIMEOUT or timeout in .agent-loop.toml to a positive value."
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn emit_config_warnings(config: &Config) {
+    if config.planning_only && config.max_rounds == 0 {
+        eprintln!(
+            "Warning: max_rounds=0 is ignored in planning-only mode (only planning_max_rounds and decomposition_max_rounds apply)."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -565,15 +615,27 @@ planning_only = true
     }
 
     #[test]
-    fn from_cli_preserves_explicit_zero_max_rounds() {
+    fn from_cli_rejects_zero_max_rounds_in_implementation_mode() {
         let _guard = env_lock();
         clear_env();
         set_env("MAX_ROUNDS", "0");
 
         let project_dir = create_temp_project_root("cfg_zero_rounds");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+        let err = Config::from_cli(project_dir.clone(), false, false)
+            .expect_err("max_rounds=0 in implementation mode should fail");
+        assert!(err.to_string().contains("max_rounds must be > 0"));
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
 
+    #[test]
+    fn from_cli_allows_zero_max_rounds_in_planning_only_mode() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("MAX_ROUNDS", "0");
+
+        let project_dir = create_temp_project_root("cfg_zero_rounds_planning");
+        let config = Config::from_cli(project_dir.clone(), false, true)
+            .expect("max_rounds=0 in planning-only mode should succeed");
         assert_eq!(config.max_rounds, 0);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -891,6 +953,66 @@ auto_test_cmd = "make test"
         let dir = create_temp_project_root("cfg_ac_nonzero");
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Config bounds validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_zero_planning_max_rounds() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_MAX_ROUNDS", "0");
+
+        let dir = create_temp_project_root("cfg_zero_planning");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("planning_max_rounds=0 should fail");
+        assert!(err.to_string().contains("planning_max_rounds must be > 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_zero_decomposition_max_rounds_in_planning_only() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECOMPOSITION_MAX_ROUNDS", "0");
+
+        let dir = create_temp_project_root("cfg_zero_decomp_plan");
+        let err = Config::from_cli(dir.clone(), false, true)
+            .expect_err("decomposition_max_rounds=0 in planning-only should fail");
+        assert!(
+            err.to_string()
+                .contains("decomposition_max_rounds must be > 0")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("TIMEOUT", "0");
+
+        let dir = create_temp_project_root("cfg_zero_timeout");
+        let err =
+            Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
+        assert!(err.to_string().contains("timeout must be > 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_passes_for_valid_defaults() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_valid_defaults");
+        let config =
+            Config::from_cli(dir.clone(), false, false).expect("default config should be valid");
+        assert!(config.max_rounds > 0);
+        assert!(config.planning_max_rounds > 0);
+        assert!(config.timeout_seconds > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
