@@ -147,6 +147,7 @@ mod tests {
     use super::*;
     use crate::test_support::{TestProject, env_lock};
 
+    #[cfg(unix)]
     #[test]
     fn check_binary_available_finds_existing_binary() {
         // `/bin/sh` is the POSIX-mandated shell and is reliably available on all
