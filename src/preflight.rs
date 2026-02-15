@@ -1,7 +1,13 @@
 use std::process::Command;
+use std::time::Duration;
 
 use crate::config::{Agent, Config};
 use crate::error::AgentLoopError;
+
+/// Maximum time to wait for a `--version` probe before assuming the binary is
+/// unresponsive.  This prevents preflight from stalling startup indefinitely
+/// if a CLI hangs.
+const BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn install_hint(binary: &str) -> &str {
     match binary {
@@ -13,16 +19,32 @@ fn install_hint(binary: &str) -> &str {
 }
 
 fn check_binary_available(binary: &str) -> bool {
-    Command::new(binary)
+    let mut child = match Command::new(binary)
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|mut child| {
-            let _ = child.wait();
-            true
-        })
-        .unwrap_or(false)
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    // Wait with a timeout so a hanging binary doesn't block startup.
+    let deadline = std::time::Instant::now() + BINARY_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 fn required_agent_binaries(config: &Config) -> Vec<&'static str> {
@@ -80,7 +102,20 @@ fn repo_requires_git(config: &Config) -> bool {
         return true;
     }
 
-    config.project_dir.join(".git").exists()
+    // Use `git rev-parse` to detect git-backed projects even when running from
+    // a subdirectory (where `.git` may not exist directly under project_dir).
+    is_inside_git_work_tree(config)
+}
+
+fn is_inside_git_work_tree(config: &Config) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(&config.project_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
 }
 
 fn check_git_when_required(config: &Config) -> Result<(), AgentLoopError> {
@@ -111,8 +146,10 @@ mod tests {
 
     #[test]
     fn check_binary_available_finds_existing_binary() {
-        // `echo` or `true` should always be available
-        assert!(check_binary_available("echo"));
+        // `/bin/sh` is the POSIX-mandated shell and is reliably available on all
+        // Unix-like systems (macOS, Linux).  Using it avoids portability issues
+        // with `echo` which is a shell built-in on some platforms.
+        assert!(check_binary_available("/bin/sh"));
     }
 
     #[test]
@@ -179,13 +216,34 @@ mod tests {
     }
 
     #[test]
-    fn repo_requires_git_true_when_dot_git_exists() {
+    fn repo_requires_git_true_when_git_initialized() {
         let _guard = env_lock();
         let project = TestProject::builder("preflight_git_dir")
             .auto_commit(false)
             .with_git()
             .build();
         assert!(repo_requires_git(&project.config));
+    }
+
+    #[test]
+    fn repo_requires_git_true_for_subdirectory_of_git_repo() {
+        let _guard = env_lock();
+        let project = TestProject::builder("preflight_git_subdir")
+            .auto_commit(false)
+            .with_git()
+            .build();
+
+        // Create a subdirectory and build a config pointing to it.
+        let subdir = project.root.join("nested").join("subdir");
+        std::fs::create_dir_all(&subdir).expect("subdir should be created");
+        let sub_config = Config {
+            project_dir: subdir,
+            ..project.config.clone()
+        };
+
+        // Even though `.git` is not directly in `subdir`, the project is
+        // still inside a git work tree and should be detected.
+        assert!(repo_requires_git(&sub_config));
     }
 
     #[test]
