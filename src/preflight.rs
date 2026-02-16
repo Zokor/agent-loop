@@ -165,7 +165,9 @@ mod tests {
 
     #[test]
     fn required_agent_binaries_single_agent_returns_one() {
-        let project = TestProject::builder("preflight_single").single_agent(true).build();
+        let project = TestProject::builder("preflight_single")
+            .single_agent(true)
+            .build();
         let binaries = required_agent_binaries(&project.config);
         assert_eq!(binaries.len(), 1);
         assert_eq!(binaries[0], "claude");
@@ -267,8 +269,7 @@ mod tests {
 
         // Even with broken PATH, should pass since git is not required
         let _path_override = project.with_path_override();
-        check_git_when_required(&project.config)
-            .expect("should skip git check when not required");
+        check_git_when_required(&project.config).expect("should skip git check when not required");
     }
 
     #[test]
@@ -375,8 +376,7 @@ mod tests {
             .build();
 
         // Create a bare `.git` directory (no real git init needed).
-        std::fs::create_dir_all(project.root.join(".git"))
-            .expect(".git dir should be created");
+        std::fs::create_dir_all(project.root.join(".git")).expect(".git dir should be created");
 
         let subdir = project.root.join("deep").join("nested");
         std::fs::create_dir_all(&subdir).expect("subdir should be created");

@@ -585,8 +585,8 @@ planning_context_excerpt_lines = 80
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_defaults");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
 
         assert_eq!(config.project_dir, project_dir);
         assert_eq!(config.state_dir, project_dir.join(".agent-loop/state"));
@@ -625,8 +625,8 @@ planning_context_excerpt_lines = 80
         set_env("TIMEOUT", "900");
 
         let project_dir = create_temp_project_root("cfg_env_overrides");
-        let config =
-            Config::from_cli(project_dir.clone(), false, true, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, true, false)
+            .expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 42);
         assert_eq!(config.planning_max_rounds, 7);
@@ -651,8 +651,8 @@ planning_context_excerpt_lines = 80
         set_env("TIMEOUT", "-1");
 
         let project_dir = create_temp_project_root("cfg_invalid_env");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, DEFAULT_MAX_ROUNDS);
         assert_eq!(config.planning_max_rounds, DEFAULT_PLANNING_MAX_ROUNDS);
@@ -696,8 +696,8 @@ planning_context_excerpt_lines = 80
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_auto_test_off");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -710,8 +710,8 @@ planning_context_excerpt_lines = 80
         set_env("AUTO_TEST", "1");
 
         let project_dir = create_temp_project_root("cfg_auto_test_on");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
         assert!(config.auto_test);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -724,13 +724,13 @@ planning_context_excerpt_lines = 80
         set_env("AUTO_TEST_CMD", "make test");
 
         let project_dir = create_temp_project_root("cfg_auto_test_cmd");
-        let config =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
         assert_eq!(config.auto_test_cmd, Some("make test".to_string()));
 
         set_env("AUTO_TEST_CMD", "   ");
-        let config2 =
-            Config::from_cli(project_dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config2 = Config::from_cli(project_dir.clone(), false, false, false)
+            .expect("from_cli should succeed");
         assert_eq!(config2.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -743,8 +743,8 @@ planning_context_excerpt_lines = 80
         set_env("IMPLEMENTER", "codex");
 
         let project_dir = create_temp_project_root("cfg_cli_flag");
-        let config =
-            Config::from_cli(project_dir.clone(), true, false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(project_dir.clone(), true, false, false)
+            .expect("from_cli should succeed");
 
         assert!(config.single_agent);
         assert_eq!(config.reviewer, Agent::Codex);
@@ -779,7 +779,8 @@ planning_only = true
 "#,
         );
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
@@ -826,7 +827,8 @@ auto_test_cmd = "make test"
         set_env("AUTO_TEST", "1");
         set_env("AUTO_TEST_CMD", "npm test");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
@@ -851,7 +853,8 @@ auto_test_cmd = "make test"
         write_toml(&dir, "single_agent = false\n");
         set_env("SINGLE_AGENT", "false");
 
-        let config = Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
         assert!(config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -864,7 +867,8 @@ auto_test_cmd = "make test"
         let dir = create_temp_project_root("cfg_cli_planning");
         write_toml(&dir, "planning_only = false\n");
 
-        let config = Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
         assert!(config.planning_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -882,7 +886,8 @@ auto_test_cmd = "make test"
         write_toml(&dir, "single_agent = true\n");
         set_env("SINGLE_AGENT", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(!config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -896,7 +901,8 @@ auto_test_cmd = "make test"
         write_toml(&dir, "auto_test = true\n");
         set_env("AUTO_TEST", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(!config.auto_test);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -910,7 +916,8 @@ auto_test_cmd = "make test"
         write_toml(&dir, "auto_commit = true\n");
         set_env("AUTO_COMMIT", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(!config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -927,7 +934,8 @@ auto_test_cmd = "make test"
         let dir = create_temp_project_root("cfg_reviewer_toml");
         write_toml(&dir, "reviewer = \"claude\"\nimplementer = \"claude\"\n");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         // Both claude -> explicit reviewer override honored
         assert_eq!(config.implementer, Agent::Claude);
         assert_eq!(config.reviewer, Agent::Claude);
@@ -943,7 +951,8 @@ auto_test_cmd = "make test"
         write_toml(&dir, "reviewer = \"claude\"\n");
         set_env("REVIEWER", "codex");
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Codex);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -959,7 +968,8 @@ auto_test_cmd = "make test"
             "implementer = \"codex\"\nreviewer = \"claude\"\nsingle_agent = true\n",
         );
 
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(config.single_agent);
         assert_eq!(config.implementer, Agent::Codex);
         assert_eq!(config.reviewer, Agent::Codex);
@@ -974,7 +984,8 @@ auto_test_cmd = "make test"
         set_env("IMPLEMENTER", "claude");
 
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
-        let config = Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Claude);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -989,7 +1000,8 @@ auto_test_cmd = "make test"
         clear_env();
 
         let dir = create_temp_project_root("cfg_ac_default");
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1001,7 +1013,8 @@ auto_test_cmd = "make test"
         set_env("AUTO_COMMIT", "anything");
 
         let dir = create_temp_project_root("cfg_ac_nonzero");
-        let config = Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1058,8 +1071,8 @@ auto_test_cmd = "make test"
         clear_env();
 
         let dir = create_temp_project_root("cfg_valid_defaults");
-        let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("default config should be valid");
+        let config = Config::from_cli(dir.clone(), false, false, false)
+            .expect("default config should be valid");
         assert!(config.max_rounds > 0);
         assert!(config.planning_max_rounds > 0);
         assert!(config.timeout_seconds > 0);
@@ -1104,7 +1117,10 @@ planning_context_excerpt_lines = 75
         assert_eq!(config.planning_context_excerpt_lines, None);
         // Effective helpers still return defaults
         assert_eq!(config.effective_diff_max_lines(), DEFAULT_DIFF_MAX_LINES);
-        assert_eq!(config.effective_context_line_cap(), DEFAULT_CONTEXT_LINE_CAP);
+        assert_eq!(
+            config.effective_context_line_cap(),
+            DEFAULT_CONTEXT_LINE_CAP
+        );
         assert_eq!(
             config.effective_planning_context_excerpt_lines(),
             DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES
