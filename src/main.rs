@@ -77,6 +77,8 @@ struct RunTasksArgs {
     single_agent: bool,
     #[arg(long)]
     continue_on_fail: bool,
+    /// Explicit opt-in to fail-fast mode (the default). Exists for CLI
+    /// discoverability and to conflict-check with `--continue-on-fail`.
     #[arg(long)]
     fail_fast: bool,
     #[arg(long)]
@@ -569,12 +571,16 @@ fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<Ta
     let persisted_entries = persisted.status_file.tasks;
 
     // Positional reconciliation: match by index, not by title.
+    // Always use the current parsed title so edits between runs are reflected.
     parsed_tasks
         .iter()
         .enumerate()
         .map(|(i, task)| {
             if let Some(entry) = persisted_entries.get(i) {
-                entry.clone()
+                TaskStatusEntry {
+                    title: task.title.clone(),
+                    ..entry.clone()
+                }
             } else {
                 TaskStatusEntry {
                     title: task.title.clone(),
@@ -591,12 +597,16 @@ fn reconcile_task_metrics(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<T
     let persisted = state::read_task_metrics(config);
     let persisted_entries = persisted.tasks;
 
+    // Always use the current parsed title so edits between runs are reflected.
     parsed_tasks
         .iter()
         .enumerate()
         .map(|(i, task)| {
             if let Some(entry) = persisted_entries.get(i) {
-                entry.clone()
+                TaskMetricsEntry {
+                    title: task.title.clone(),
+                    ..entry.clone()
+                }
             } else {
                 TaskMetricsEntry {
                     title: task.title.clone(),
@@ -754,14 +764,14 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
 
         loop {
             let is_resume = !first_attempt || is_resume_initial;
-            if is_resume && !first_attempt {
-                println!(
-                    "Resuming with MAX_ROUNDS={} (retry {}/{})",
-                    current_max_rounds, retry, args.max_retries
-                );
-            } else if !first_attempt {
+            if !first_attempt {
                 println!(
                     "Retrying with MAX_ROUNDS={} (retry {}/{})",
+                    current_max_rounds, retry, args.max_retries
+                );
+            } else if is_resume_initial {
+                println!(
+                    "Resuming with MAX_ROUNDS={} (retry {}/{})",
                     current_max_rounds, retry, args.max_retries
                 );
             } else {
