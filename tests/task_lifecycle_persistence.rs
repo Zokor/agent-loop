@@ -1317,10 +1317,22 @@ fn skipped_task_with_old_metrics_preserves_reconciled_timing() {
     );
 
     // Task 2 preserves old reconciled timing (since it wasn't re-executed,
-    // its old timing stays from reconciliation)
-    assert!(
-        tasks[1]["task_started_at"].is_string(),
-        "Task 2 should preserve reconciled timing"
+    // its old timing stays from reconciliation). Assert the exact seeded
+    // values are preserved, not just that they are strings.
+    assert_eq!(
+        tasks[1]["task_started_at"].as_str(),
+        Some("2026-01-01T00:00:00.000Z"),
+        "Task 2 should preserve seeded task_started_at"
+    );
+    assert_eq!(
+        tasks[1]["task_ended_at"].as_str(),
+        Some("2026-01-01T00:05:00.000Z"),
+        "Task 2 should preserve seeded task_ended_at"
+    );
+    assert_eq!(
+        tasks[1]["duration_ms"].as_u64(),
+        Some(300_000),
+        "Task 2 should preserve seeded duration_ms"
     );
 
     let _ = fs::remove_dir_all(&project_dir);
