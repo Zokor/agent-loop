@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn error_source_returns_inner_for_io_variant() {
-        let io_err = io::Error::new(io::ErrorKind::Other, "test");
+        let io_err = io::Error::other("test");
         let err = AgentLoopError::Io(io_err);
         assert!(std::error::Error::source(&err).is_some());
     }
