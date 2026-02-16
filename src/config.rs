@@ -182,7 +182,7 @@ impl Config {
                 .unwrap_or_else(|| opposite_agent(implementer))
         };
 
-        // --- numeric: env > TOML > default ---
+        // --- numeric: override > env > TOML > default ---
         let max_rounds = max_rounds_override.unwrap_or_else(|| {
             parse_env("MAX_ROUNDS")
                 .or(file.max_rounds)
