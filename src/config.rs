@@ -14,6 +14,7 @@ pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const DEFAULT_DIFF_MAX_LINES: u32 = 500;
 pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 200;
 pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
+pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 
 const CONFIG_FILE_NAME: &str = ".agent-loop.toml";
 
@@ -52,6 +53,8 @@ struct FileConfig {
     context_line_cap: Option<u32>,
     /// Maximum lines per file excerpt in planning context.
     planning_context_excerpt_lines: Option<u32>,
+    /// Maximum parallel task execution (future-safe plumbing).
+    max_parallel: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,7 @@ pub struct Config {
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
     pub planning_context_excerpt_lines: Option<u32>,
+    pub max_parallel: u32,
     pub verbose: bool,
 }
 
@@ -184,6 +188,9 @@ impl Config {
         let planning_context_excerpt_lines =
             parse_env("PLANNING_CONTEXT_EXCERPT_LINES").or(file.planning_context_excerpt_lines);
 
+        // --- max_parallel: TOML > default ---
+        let max_parallel = file.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
@@ -212,6 +219,7 @@ impl Config {
             diff_max_lines,
             context_line_cap,
             planning_context_excerpt_lines,
+            max_parallel,
             verbose,
         };
 
@@ -361,6 +369,14 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         return Err(AgentLoopError::Config(
             "timeout must be > 0. \
              Set TIMEOUT or timeout in .agent-loop.toml to a positive value."
+                .to_string(),
+        ));
+    }
+
+    if config.max_parallel == 0 {
+        return Err(AgentLoopError::Config(
+            "max_parallel must be >= 1. \
+             Set max_parallel in .agent-loop.toml to a positive value."
                 .to_string(),
         ));
     }
@@ -517,6 +533,7 @@ planning_only = true
 diff_max_lines = 250
 context_line_cap = 150
 planning_context_excerpt_lines = 80
+max_parallel = 4
 "#,
         );
         let config = load_file_config(&dir).expect("valid full file should parse");
@@ -534,6 +551,7 @@ planning_context_excerpt_lines = 80
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(150));
         assert_eq!(config.planning_context_excerpt_lines, Some(80));
+        assert_eq!(config.max_parallel, Some(4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1248,6 +1266,58 @@ planning_context_excerpt_lines = 75
         let config =
             Config::from_cli(dir.clone(), false, false, true).expect("from_cli should succeed");
         assert!(config.verbose);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // max_parallel config field
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_file_config_parses_max_parallel() {
+        let dir = create_temp_project_root("toml_max_parallel");
+        write_toml(&dir, "max_parallel = 4\n");
+        let config = load_file_config(&dir).expect("max_parallel should parse");
+        assert_eq!(config.max_parallel, Some(4));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_max_parallel_defaults_to_1() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_max_parallel_default");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        assert_eq!(config.max_parallel, DEFAULT_MAX_PARALLEL);
+        assert_eq!(config.max_parallel, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_toml_overrides_max_parallel() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_toml_max_parallel");
+        write_toml(&dir, "max_parallel = 4\n");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        assert_eq!(config.max_parallel, 4);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_zero_max_parallel_in_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_zero_max_parallel");
+        write_toml(&dir, "max_parallel = 0\n");
+        let err = Config::from_cli(dir.clone(), false, false, false)
+            .expect_err("max_parallel=0 should fail");
+        assert!(err.to_string().contains("max_parallel must be >= 1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

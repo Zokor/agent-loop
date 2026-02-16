@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::config::{
-    Agent, Config, DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_ROUNDS,
+    Agent, Config, DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS,
     DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS, RunMode,
 };
 
@@ -31,6 +31,7 @@ pub struct TestConfigOptions {
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
     pub planning_context_excerpt_lines: Option<u32>,
+    pub max_parallel: u32,
     pub verbose: bool,
 }
 
@@ -50,6 +51,7 @@ impl Default for TestConfigOptions {
             diff_max_lines: None,
             context_line_cap: None,
             planning_context_excerpt_lines: None,
+            max_parallel: DEFAULT_MAX_PARALLEL,
             verbose: false,
         }
     }
@@ -87,6 +89,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         diff_max_lines: options.diff_max_lines,
         context_line_cap: options.context_line_cap,
         planning_context_excerpt_lines: options.planning_context_excerpt_lines,
+        max_parallel: options.max_parallel,
         verbose: options.verbose,
     }
 }

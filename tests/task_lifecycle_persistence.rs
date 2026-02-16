@@ -755,7 +755,126 @@ fn task_status_json_schema_matches_contract() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 13: Duplicate title handling in task_status.json
+// Test 13: --max-parallel 1 works normally (no warning)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn max_parallel_1_works_normally() {
+    let project_dir = create_project_dir("max_parallel_1");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: First\nContent\n\n### Task 2: Second\nContent\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &["--max-parallel", "1"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={stdout}, stderr={stderr}"
+    );
+    assert!(
+        stdout.contains("All tasks completed"),
+        "should report all tasks completed: {stdout}"
+    );
+
+    // Should NOT print the "not yet supported" warning
+    assert!(
+        !stderr.contains("not yet supported"),
+        "should not warn about parallel execution: {stderr}"
+    );
+
+    // Verify all done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert!(tasks.iter().all(|t| t["status"] == "done"));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: --max-parallel 2 prints warning and falls back to sequential
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn max_parallel_2_prints_warning_and_runs_sequentially() {
+    let project_dir = create_project_dir("max_parallel_2");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: First\nContent\n\n### Task 2: Second\nContent\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &["--max-parallel", "2"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed (falls back to sequential)
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={stdout}, stderr={stderr}"
+    );
+
+    // Should print the "not yet supported" warning
+    assert!(
+        stderr.contains("Parallel task execution is not yet supported; running sequentially with max_parallel=1"),
+        "should warn about unsupported parallel execution: {stderr}"
+    );
+
+    // All tasks should still complete sequentially
+    assert!(
+        stdout.contains("All tasks completed"),
+        "should report all tasks completed: {stdout}"
+    );
+
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert!(tasks.iter().all(|t| t["status"] == "done"));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: --max-parallel 0 exits non-zero with validation error
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn max_parallel_0_rejected_with_validation_error() {
+    let project_dir = create_project_dir("max_parallel_0");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Test\nContent\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &["--max-parallel", "0"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "should fail with --max-parallel 0"
+    );
+    assert!(
+        stderr.contains("--max-parallel must be at least 1"),
+        "should report validation error: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: Duplicate title handling in task_status.json
 // ---------------------------------------------------------------------------
 
 #[test]
