@@ -117,12 +117,10 @@ impl Config {
         self.diff_max_lines.unwrap_or(DEFAULT_DIFF_MAX_LINES)
     }
 
-    #[allow(dead_code)]
     pub fn effective_context_line_cap(&self) -> u32 {
         self.context_line_cap.unwrap_or(DEFAULT_CONTEXT_LINE_CAP)
     }
 
-    #[allow(dead_code)]
     pub fn effective_planning_context_excerpt_lines(&self) -> u32 {
         self.planning_context_excerpt_lines
             .unwrap_or(DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES)

@@ -4,15 +4,20 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".agent-loop"];
-const LINE_CAP: usize = 200;
-const EXCERPT_MAX_LINES: usize = 100;
 
 /// Build a project structure overview for injection into planning prompts.
 ///
 /// Walks the directory tree up to depth 2, excludes common noise directories,
-/// and appends the first ~100 lines of README.md / CLAUDE.md when present.
-/// Total output is capped at [`LINE_CAP`] lines.
-pub(crate) fn gather_project_context(project_dir: &Path) -> String {
+/// and appends the first `excerpt_max_lines` lines of README.md / CLAUDE.md when present.
+/// Total output is capped at `line_cap` lines.
+///
+/// `line_cap` and `excerpt_max_lines` correspond to the Config fields
+/// `context_line_cap` and `planning_context_excerpt_lines`.
+pub(crate) fn gather_project_context(
+    project_dir: &Path,
+    line_cap: usize,
+    excerpt_max_lines: usize,
+) -> String {
     if !project_dir.is_dir() {
         return String::new();
     }
@@ -20,15 +25,15 @@ pub(crate) fn gather_project_context(project_dir: &Path) -> String {
     let mut lines: Vec<String> = vec!["PROJECT STRUCTURE:".to_string()];
 
     // Collect the tree (depth 0 = direct children, depth 1 = grandchildren).
-    collect_tree(project_dir, 0, &mut lines);
+    collect_tree(project_dir, 0, &mut lines, line_cap);
 
     // Append README.md excerpt if budget remains.
-    append_file_excerpt(project_dir, "README.md", &mut lines);
+    append_file_excerpt(project_dir, "README.md", &mut lines, line_cap, excerpt_max_lines);
     // Append CLAUDE.md excerpt if budget remains.
-    append_file_excerpt(project_dir, "CLAUDE.md", &mut lines);
+    append_file_excerpt(project_dir, "CLAUDE.md", &mut lines, line_cap, excerpt_max_lines);
 
     // Enforce the global line cap (the header counts as line 1).
-    lines.truncate(LINE_CAP);
+    lines.truncate(line_cap);
 
     lines.join("\n")
 }
@@ -36,8 +41,8 @@ pub(crate) fn gather_project_context(project_dir: &Path) -> String {
 /// Recursively collect directory entries into `lines` as an indented tree.
 /// `depth` starts at 0 for the project root's immediate children and goes up to 1
 /// (i.e. two levels below the project root).
-fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>) {
-    if lines.len() >= LINE_CAP {
+fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>, line_cap: usize) {
+    if lines.len() >= line_cap {
         return;
     }
 
@@ -51,7 +56,7 @@ fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>) {
     let indent = "  ".repeat(depth);
 
     for entry in entries {
-        if lines.len() >= LINE_CAP {
+        if lines.len() >= line_cap {
             return;
         }
 
@@ -67,7 +72,7 @@ fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>) {
         if is_dir {
             lines.push(format!("{indent}{name}/"));
             if depth < 1 {
-                collect_tree(&entry.path(), depth + 1, lines);
+                collect_tree(&entry.path(), depth + 1, lines, line_cap);
             }
         } else {
             lines.push(format!("{indent}{name}"));
@@ -75,10 +80,16 @@ fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>) {
     }
 }
 
-/// Append the first `EXCERPT_MAX_LINES` lines of a file as a labeled section.
+/// Append the first `excerpt_max_lines` lines of a file as a labeled section.
 /// Lines count toward the global budget tracked by `lines.len()`.
-fn append_file_excerpt(project_dir: &Path, filename: &str, lines: &mut Vec<String>) {
-    if lines.len() >= LINE_CAP {
+fn append_file_excerpt(
+    project_dir: &Path,
+    filename: &str,
+    lines: &mut Vec<String>,
+    line_cap: usize,
+    excerpt_max_lines: usize,
+) {
+    if lines.len() >= line_cap {
         return;
     }
 
@@ -88,15 +99,15 @@ fn append_file_excerpt(project_dir: &Path, filename: &str, lines: &mut Vec<Strin
     };
 
     // Blank separator + header consume 2 lines.
-    if lines.len() + 2 >= LINE_CAP {
+    if lines.len() + 2 >= line_cap {
         return;
     }
 
     lines.push(String::new());
-    lines.push(format!("{filename} (first {EXCERPT_MAX_LINES} lines):"));
+    lines.push(format!("{filename} (first {excerpt_max_lines} lines):"));
 
-    let remaining = LINE_CAP.saturating_sub(lines.len());
-    let max_excerpt = remaining.min(EXCERPT_MAX_LINES);
+    let remaining = line_cap.saturating_sub(lines.len());
+    let max_excerpt = remaining.min(excerpt_max_lines);
 
     for line in content.lines().take(max_excerpt) {
         lines.push(line.to_string());
@@ -415,8 +426,12 @@ pub(crate) fn implementation_adversarial_review_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{DEFAULT_CONTEXT_LINE_CAP, DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES};
     use crate::test_support::unique_temp_path;
     use std::fs;
+
+    const LINE_CAP: usize = DEFAULT_CONTEXT_LINE_CAP as usize;
+    const EXCERPT_MAX_LINES: usize = DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES as usize;
 
     fn make_temp_dir() -> PathBuf {
         let dir = unique_temp_path("prompts_test");
@@ -450,7 +465,7 @@ mod tests {
         fs::create_dir_all(dir.join("src/utils")).unwrap();
         fs::write(dir.join("src/utils/helper.rs"), "").unwrap();
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
         assert!(output.starts_with("PROJECT STRUCTURE:"));
         assert!(output.contains("Cargo.toml"));
@@ -478,7 +493,7 @@ mod tests {
         fs::create_dir_all(dir.join("src")).unwrap();
         fs::write(dir.join("src/lib.rs"), "").unwrap();
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
         assert!(!output.contains(".git"));
         assert!(!output.contains("target/"));
@@ -497,7 +512,7 @@ mod tests {
             fs::write(dir.join(format!("file_{i:04}.txt")), "").unwrap();
         }
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
         let line_count = output.lines().count();
 
         assert!(
@@ -515,7 +530,7 @@ mod tests {
         let readme_lines: Vec<String> = (1..=150).map(|i| format!("readme line {i}")).collect();
         fs::write(dir.join("README.md"), readme_lines.join("\n")).unwrap();
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
         assert!(output.contains("README.md (first 100 lines):"));
         assert!(output.contains("readme line 1"));
@@ -530,7 +545,7 @@ mod tests {
 
         fs::write(dir.join("CLAUDE.md"), "agent conventions here\nsecond line").unwrap();
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
         assert!(output.contains("CLAUDE.md (first 100 lines):"));
         assert!(output.contains("agent conventions here"));
@@ -544,7 +559,7 @@ mod tests {
 
         fs::write(dir.join("Cargo.toml"), "").unwrap();
 
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
         assert!(output.starts_with("PROJECT STRUCTURE:"));
         assert!(output.contains("Cargo.toml"));
@@ -555,8 +570,43 @@ mod tests {
     #[test]
     fn gather_project_context_returns_empty_for_nonexistent_dir() {
         let dir = PathBuf::from("/tmp/definitely_does_not_exist_xyzzy_42");
-        let output = gather_project_context(&dir);
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn gather_project_context_respects_custom_line_cap() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        // Create 50 files — with a line cap of 10, only 9 entries fit (header takes line 1).
+        for i in 0..50 {
+            fs::write(dir.join(format!("file_{i:04}.txt")), "").unwrap();
+        }
+
+        let output = gather_project_context(&dir, 10, EXCERPT_MAX_LINES);
+        let line_count = output.lines().count();
+        assert!(
+            line_count <= 10,
+            "custom line cap of 10 should be respected, got {line_count}"
+        );
+    }
+
+    #[test]
+    fn gather_project_context_respects_custom_excerpt_lines() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        // Create a README.md with 50 lines; limit excerpt to 5.
+        let readme_lines: Vec<String> = (1..=50).map(|i| format!("line {i}")).collect();
+        fs::write(dir.join("README.md"), readme_lines.join("\n")).unwrap();
+
+        let output = gather_project_context(&dir, LINE_CAP, 5);
+
+        assert!(output.contains("README.md (first 5 lines):"));
+        assert!(output.contains("line 1"));
+        assert!(output.contains("line 5"));
+        assert!(!output.contains("line 6"));
     }
 
     #[test]
