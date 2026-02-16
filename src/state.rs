@@ -627,6 +627,95 @@ fn cap_conversation_file(config: &Config) -> io::Result<()> {
     fs::write(&path, capped)
 }
 
+// ---------------------------------------------------------------------------
+// Task lifecycle persistence (task_status.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskRunStatus {
+    Pending,
+    Running,
+    Done,
+    Failed,
+    Skipped,
+}
+
+impl fmt::Display for TaskRunStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        };
+        write!(f, "{label}")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStatusEntry {
+    pub title: String,
+    pub status: TaskRunStatus,
+    pub retries: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskStatusFile {
+    pub tasks: Vec<TaskStatusEntry>,
+}
+
+impl Default for TaskStatusFile {
+    fn default() -> Self {
+        Self { tasks: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TaskStatusReadResult {
+    pub status_file: TaskStatusFile,
+    pub warnings: Vec<String>,
+}
+
+pub fn read_task_status_with_warnings(config: &Config) -> TaskStatusReadResult {
+    let raw = read_state_file("task_status.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return TaskStatusReadResult {
+            status_file: TaskStatusFile::default(),
+            warnings: Vec::new(),
+        };
+    }
+
+    match serde_json::from_str::<TaskStatusFile>(trimmed) {
+        Ok(status_file) => TaskStatusReadResult {
+            status_file,
+            warnings: Vec::new(),
+        },
+        Err(err) => {
+            let warning = format!("invalid task_status.json: {err}; starting fresh");
+            eprintln!("\u{26a0} {warning}");
+            TaskStatusReadResult {
+                status_file: TaskStatusFile::default(),
+                warnings: vec![warning],
+            }
+        }
+    }
+}
+
+pub fn read_task_status(config: &Config) -> TaskStatusFile {
+    read_task_status_with_warnings(config).status_file
+}
+
+pub fn write_task_status(status: &TaskStatusFile, config: &Config) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(status).map_err(io::Error::other)?;
+    write_state_file("task_status.json", &serialized, config)
+}
+
 pub fn read_recent_history(config: &Config, max_lines: usize) -> String {
     let content = read_state_file("conversation.md", config);
     if content.trim().is_empty() {
@@ -1875,5 +1964,172 @@ mod tests {
             mode_warning.contains('\u{FFFD}'),
             "warning should contain replacement char, got: {mode_warning}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Task status persistence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_status_round_trip_read_write() {
+        let project = new_project();
+        let status_file = TaskStatusFile {
+            tasks: vec![
+                TaskStatusEntry {
+                    title: "Task 1: Build parser".to_string(),
+                    status: TaskRunStatus::Done,
+                    retries: 1,
+                    last_error: None,
+                },
+                TaskStatusEntry {
+                    title: "Task 2: Add retries".to_string(),
+                    status: TaskRunStatus::Failed,
+                    retries: 2,
+                    last_error: Some("MAX_ROUNDS reached".to_string()),
+                },
+                TaskStatusEntry {
+                    title: "Task 3: Cleanup".to_string(),
+                    status: TaskRunStatus::Pending,
+                    retries: 0,
+                    last_error: None,
+                },
+            ],
+        };
+
+        write_task_status(&status_file, &project.config)
+            .expect("write_task_status should succeed");
+
+        let reloaded = read_task_status(&project.config);
+        assert_eq!(reloaded, status_file);
+    }
+
+    #[test]
+    fn task_status_missing_or_empty_returns_default() {
+        let project = new_project();
+
+        // Missing file
+        let result = read_task_status(&project.config);
+        assert_eq!(result, TaskStatusFile::default());
+        assert!(result.tasks.is_empty());
+
+        // Empty file
+        write_state_file("task_status.json", "", &project.config)
+            .expect("empty write should succeed");
+        let result = read_task_status(&project.config);
+        assert_eq!(result, TaskStatusFile::default());
+
+        // Whitespace-only file
+        write_state_file("task_status.json", "   \n\t  ", &project.config)
+            .expect("whitespace write should succeed");
+        let result = read_task_status(&project.config);
+        assert_eq!(result, TaskStatusFile::default());
+    }
+
+    #[test]
+    fn task_status_corrupt_json_recovers_with_warning() {
+        let project = new_project();
+        write_state_file("task_status.json", "{broken json", &project.config)
+            .expect("corrupt write should succeed");
+
+        let result = read_task_status_with_warnings(&project.config);
+        assert_eq!(result.status_file, TaskStatusFile::default());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("invalid task_status.json"),
+            "warning should mention corruption, got: {}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn task_status_invalid_entry_types_recovers_with_warning() {
+        let project = new_project();
+        // "tasks" contains invalid entries (wrong type for status)
+        let invalid_json = r#"{"tasks": [{"title": "Task 1", "status": "INVALID_STATUS", "retries": 0}]}"#;
+        write_state_file("task_status.json", invalid_json, &project.config)
+            .expect("invalid write should succeed");
+
+        let result = read_task_status_with_warnings(&project.config);
+        assert_eq!(result.status_file, TaskStatusFile::default());
+        assert!(!result.warnings.is_empty());
+    }
+
+    #[test]
+    fn task_status_serde_round_trip_all_variants() {
+        let variants = [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Running,
+            TaskRunStatus::Done,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Skipped,
+        ];
+
+        for variant in variants {
+            let serialized = serde_json::to_value(variant)
+                .unwrap_or_else(|_| panic!("{variant:?} should serialize"));
+            let deserialized: TaskRunStatus = serde_json::from_value(serialized.clone())
+                .unwrap_or_else(|_| panic!("{variant:?} should deserialize from {serialized}"));
+            assert_eq!(variant, deserialized);
+        }
+    }
+
+    #[test]
+    fn task_status_display_matches_serde() {
+        let variants = [
+            (TaskRunStatus::Pending, "pending"),
+            (TaskRunStatus::Running, "running"),
+            (TaskRunStatus::Done, "done"),
+            (TaskRunStatus::Failed, "failed"),
+            (TaskRunStatus::Skipped, "skipped"),
+        ];
+
+        for (variant, expected) in variants {
+            assert_eq!(variant.to_string(), expected);
+            let serde_value = serde_json::to_value(variant).unwrap();
+            assert_eq!(serde_value.as_str().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn task_status_omits_none_last_error() {
+        let entry = TaskStatusEntry {
+            title: "Task 1".to_string(),
+            status: TaskRunStatus::Done,
+            retries: 0,
+            last_error: None,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("last_error"));
+
+        let with_error = TaskStatusEntry {
+            last_error: Some("timeout".to_string()),
+            ..entry
+        };
+        let json = serde_json::to_value(&with_error).unwrap();
+        assert_eq!(json["last_error"], "timeout");
+    }
+
+    #[test]
+    fn task_status_write_uses_atomic_state_file() {
+        let project = new_project();
+        let status_file = TaskStatusFile {
+            tasks: vec![TaskStatusEntry {
+                title: "Task 1".to_string(),
+                status: TaskRunStatus::Running,
+                retries: 0,
+                last_error: None,
+            }],
+        };
+
+        write_task_status(&status_file, &project.config).expect("write should succeed");
+
+        // Verify the file exists and is valid JSON
+        let raw = fs::read_to_string(state_file_path("task_status.json", &project.config))
+            .expect("file should be readable");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&raw).expect("file should contain valid JSON");
+        assert_eq!(parsed["tasks"][0]["status"], "running");
+        assert_eq!(parsed["tasks"][0]["title"], "Task 1");
     }
 }
