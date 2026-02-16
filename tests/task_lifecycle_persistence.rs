@@ -874,6 +874,58 @@ fn max_parallel_0_rejected_with_validation_error() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 15b: Config-driven max_parallel > 1 prints warning without CLI flag
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn config_driven_max_parallel_prints_warning() {
+    let project_dir = create_project_dir("config_max_parallel");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: First\nContent\n\n### Task 2: Second\nContent\n",
+    );
+
+    // Write .agent-loop.toml with max_parallel = 4 (no CLI override)
+    fs::write(
+        project_dir.join(".agent-loop.toml"),
+        "max_parallel = 4\n",
+    )
+    .expect("should write config");
+
+    // Run without --max-parallel flag — config value should trigger warning
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "should succeed with config-driven max_parallel: stdout={stdout}, stderr={stderr}"
+    );
+
+    // Should print the "not yet supported" warning from config value
+    assert!(
+        stderr.contains("Parallel task execution is not yet supported; running sequentially with max_parallel=1"),
+        "should warn about unsupported parallel execution from config: {stderr}"
+    );
+
+    // All tasks should still complete sequentially
+    assert!(
+        stdout.contains("All tasks completed"),
+        "should report all tasks completed: {stdout}"
+    );
+
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert!(tasks.iter().all(|t| t["status"] == "done"));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
 // Test 16: Duplicate title handling in task_status.json
 // ---------------------------------------------------------------------------
 
