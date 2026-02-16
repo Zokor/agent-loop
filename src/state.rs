@@ -716,6 +716,74 @@ pub fn write_task_status(status: &TaskStatusFile, config: &Config) -> io::Result
     write_state_file("task_status.json", &serialized, config)
 }
 
+// ---------------------------------------------------------------------------
+// Task timing metrics (task_metrics.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskMetricsEntry {
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_started_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_ended_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskMetricsFile {
+    pub tasks: Vec<TaskMetricsEntry>,
+}
+
+impl Default for TaskMetricsFile {
+    fn default() -> Self {
+        Self { tasks: Vec::new() }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct TaskMetricsReadResult {
+    pub metrics_file: TaskMetricsFile,
+    pub warnings: Vec<String>,
+}
+
+pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult {
+    let raw = read_state_file("task_metrics.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return TaskMetricsReadResult {
+            metrics_file: TaskMetricsFile::default(),
+            warnings: Vec::new(),
+        };
+    }
+
+    match serde_json::from_str::<TaskMetricsFile>(trimmed) {
+        Ok(metrics_file) => TaskMetricsReadResult {
+            metrics_file,
+            warnings: Vec::new(),
+        },
+        Err(err) => {
+            let warning = format!("invalid task_metrics.json: {err}; starting fresh");
+            eprintln!("\u{26a0} {warning}");
+            TaskMetricsReadResult {
+                metrics_file: TaskMetricsFile::default(),
+                warnings: vec![warning],
+            }
+        }
+    }
+}
+
+pub fn read_task_metrics(config: &Config) -> TaskMetricsFile {
+    read_task_metrics_with_warnings(config).metrics_file
+}
+
+pub fn write_task_metrics(metrics: &TaskMetricsFile, config: &Config) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(metrics).map_err(io::Error::other)?;
+    write_state_file("task_metrics.json", &serialized, config)
+}
+
 pub fn read_recent_history(config: &Config, max_lines: usize) -> String {
     let content = read_state_file("conversation.md", config);
     if content.trim().is_empty() {
@@ -2131,5 +2199,105 @@ mod tests {
             serde_json::from_str(&raw).expect("file should contain valid JSON");
         assert_eq!(parsed["tasks"][0]["status"], "running");
         assert_eq!(parsed["tasks"][0]["title"], "Task 1");
+    }
+
+    // -----------------------------------------------------------------------
+    // Task metrics persistence tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn task_metrics_round_trip_read_write() {
+        let project = new_project();
+        let metrics = TaskMetricsFile {
+            tasks: vec![
+                TaskMetricsEntry {
+                    title: "Task 1: Build parser".to_string(),
+                    task_started_at: Some("2026-02-16T10:00:00.000Z".to_string()),
+                    task_ended_at: Some("2026-02-16T10:05:30.000Z".to_string()),
+                    duration_ms: Some(330_000),
+                },
+                TaskMetricsEntry {
+                    title: "Task 2: Add retries".to_string(),
+                    task_started_at: Some("2026-02-16T10:06:00.000Z".to_string()),
+                    task_ended_at: Some("2026-02-16T10:10:15.000Z".to_string()),
+                    duration_ms: Some(255_000),
+                },
+            ],
+        };
+
+        write_task_metrics(&metrics, &project.config)
+            .expect("write_task_metrics should succeed");
+
+        let reloaded = read_task_metrics(&project.config);
+        assert_eq!(reloaded, metrics);
+    }
+
+    #[test]
+    fn task_metrics_missing_or_empty_returns_default() {
+        let project = new_project();
+
+        // Missing file
+        let result = read_task_metrics(&project.config);
+        assert_eq!(result, TaskMetricsFile::default());
+        assert!(result.tasks.is_empty());
+
+        // Empty file
+        write_state_file("task_metrics.json", "", &project.config)
+            .expect("empty write should succeed");
+        let result = read_task_metrics(&project.config);
+        assert_eq!(result, TaskMetricsFile::default());
+
+        // Whitespace-only file
+        write_state_file("task_metrics.json", "   \n\t  ", &project.config)
+            .expect("whitespace write should succeed");
+        let result = read_task_metrics(&project.config);
+        assert_eq!(result, TaskMetricsFile::default());
+    }
+
+    #[test]
+    fn task_metrics_corrupt_json_recovers_with_warning() {
+        let project = new_project();
+        write_state_file("task_metrics.json", "{broken json", &project.config)
+            .expect("corrupt write should succeed");
+
+        let result = read_task_metrics_with_warnings(&project.config);
+        assert_eq!(result.metrics_file, TaskMetricsFile::default());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("invalid task_metrics.json"),
+            "warning should mention corruption, got: {}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn task_metrics_omits_none_fields() {
+        let entry = TaskMetricsEntry {
+            title: "Task 1".to_string(),
+            task_started_at: None,
+            task_ended_at: None,
+            duration_ms: None,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        let obj = json.as_object().unwrap();
+        assert!(obj.contains_key("title"));
+        assert!(!obj.contains_key("task_started_at"));
+        assert!(!obj.contains_key("task_ended_at"));
+        assert!(!obj.contains_key("duration_ms"));
+
+        // With values set
+        let entry_with_values = TaskMetricsEntry {
+            title: "Task 1".to_string(),
+            task_started_at: Some("2026-02-16T10:00:00.000Z".to_string()),
+            task_ended_at: Some("2026-02-16T10:05:00.000Z".to_string()),
+            duration_ms: Some(300_000),
+        };
+
+        let json = serde_json::to_value(&entry_with_values).unwrap();
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj["task_started_at"], "2026-02-16T10:00:00.000Z");
+        assert_eq!(obj["task_ended_at"], "2026-02-16T10:05:00.000Z");
+        assert_eq!(obj["duration_ms"], 300_000);
     }
 }

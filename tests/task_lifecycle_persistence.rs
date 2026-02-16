@@ -993,3 +993,216 @@ fn all_tasks_succeed_exit_zero() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Task metrics helper
+// ---------------------------------------------------------------------------
+
+fn read_task_metrics(project_dir: &Path) -> serde_json::Value {
+    let raw = read_state_file(project_dir, "task_metrics.json");
+    if raw.trim().is_empty() {
+        return serde_json::json!({"tasks": []});
+    }
+    serde_json::from_str(&raw).expect("task_metrics.json should be valid JSON")
+}
+
+// ---------------------------------------------------------------------------
+// Test: task_metrics.json is persisted after successful multi-task run
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn task_metrics_persisted_after_successful_multi_task_run() {
+    let project_dir = create_project_dir("metrics_multi_task");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Setup\nSetup content\n\n### Task 2: Build\nBuild content\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify task_metrics.json exists and has correct structure
+    let metrics = read_task_metrics(&project_dir);
+    let tasks = metrics["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2, "should have metrics for 2 tasks");
+
+    for (i, task) in tasks.iter().enumerate() {
+        assert!(
+            task["task_started_at"].is_string(),
+            "task {} should have task_started_at string",
+            i + 1
+        );
+        assert!(
+            task["task_ended_at"].is_string(),
+            "task {} should have task_ended_at string",
+            i + 1
+        );
+        let duration = task["duration_ms"].as_u64();
+        assert!(
+            duration.is_some(),
+            "task {} should have numeric duration_ms",
+            i + 1
+        );
+    }
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: run-tasks prints task duration summary table
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn run_tasks_prints_task_duration_summary_table() {
+    let project_dir = create_project_dir("metrics_summary_table");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Setup\nSetup content\n\n### Task 2: Build\nBuild content\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify summary table is printed
+    assert!(
+        stdout.contains("Task Durations:"),
+        "should contain 'Task Durations:' header: {stdout}"
+    );
+    assert!(
+        stdout.contains("Task 1: Setup"),
+        "summary should include Task 1 title: {stdout}"
+    );
+    assert!(
+        stdout.contains("Task 2: Build"),
+        "summary should include Task 2 title: {stdout}"
+    );
+    assert!(
+        stdout.contains("Total"),
+        "summary should include Total line: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: skipped/unexecuted tasks show n/a and no timing
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn skipped_or_unexecuted_tasks_show_na_and_no_timing() {
+    let project_dir = create_project_dir("metrics_skipped");
+    create_failing_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Failing\nThis will fail\n\n### Task 2: Never reached\nShould not run\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should fail (fail-fast)
+    assert!(!output.status.success(), "should exit non-zero");
+
+    // Verify summary table shows n/a for unexecuted task
+    assert!(
+        stdout.contains("Task Durations:"),
+        "should contain summary header: {stdout}"
+    );
+    assert!(
+        stdout.contains("n/a"),
+        "unexecuted task should show n/a: {stdout}"
+    );
+
+    // Verify task_metrics.json — unexecuted task has null timing fields
+    let metrics = read_task_metrics(&project_dir);
+    let tasks = metrics["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+
+    // Task 1 was executed (and failed) — should have timing
+    assert!(
+        tasks[0]["task_started_at"].is_string(),
+        "executed task should have task_started_at"
+    );
+
+    // Task 2 was never executed — should have null timing
+    assert!(
+        tasks[1].get("task_started_at").is_none()
+            || tasks[1]["task_started_at"].is_null(),
+        "unexecuted task should have null/missing task_started_at"
+    );
+    assert!(
+        tasks[1].get("task_ended_at").is_none()
+            || tasks[1]["task_ended_at"].is_null(),
+        "unexecuted task should have null/missing task_ended_at"
+    );
+    assert!(
+        tasks[1].get("duration_ms").is_none()
+            || tasks[1]["duration_ms"].is_null(),
+        "unexecuted task should have null/missing duration_ms"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: init command resets task_metrics.json
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn init_command_resets_task_metrics_json() {
+    let project_dir = create_project_dir("init_reset_metrics");
+    create_succeeding_agents(&project_dir);
+
+    // Write existing task_metrics.json with data
+    let existing = r#"{"tasks":[{"title":"Task 1","task_started_at":"2026-02-16T10:00:00.000Z","task_ended_at":"2026-02-16T10:05:00.000Z","duration_ms":300000}]}"#;
+    write_state_file(&project_dir, "task_metrics.json", existing);
+
+    let output = std::process::Command::new(agent_loop_bin())
+        .args(["init"])
+        .env("PATH", test_path(&project_dir))
+        .env("AUTO_COMMIT", "0")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop init should run");
+
+    assert!(
+        output.status.success(),
+        "init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify task_metrics.json is reset (empty)
+    let content = read_state_file(&project_dir, "task_metrics.json");
+    assert!(
+        content.trim().is_empty(),
+        "task_metrics.json should be empty after init, got: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
