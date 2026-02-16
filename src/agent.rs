@@ -46,6 +46,28 @@ fn resolve_command(agent: Agent, prompt: &str) -> (&'static str, Vec<String>) {
 
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const FORCE_KILL_GRACE_MS: u64 = 2_000;
+const RESPONSE_BLOCK_MAX_LINES: usize = 500;
+
+/// Truncate `output` to at most `max_lines` lines using a ring-buffer approach.
+/// Returns `(kept_output, dropped_count)`.
+fn truncate_response_lines(output: &str, max_lines: usize) -> (String, usize) {
+    use std::collections::VecDeque;
+
+    let mut ring = VecDeque::with_capacity(max_lines);
+    let mut total_lines = 0usize;
+
+    for line in output.lines() {
+        if ring.len() == max_lines {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+        total_lines += 1;
+    }
+
+    let dropped = total_lines.saturating_sub(max_lines);
+    let kept: Vec<&str> = ring.into_iter().collect();
+    (kept.join("\n"), dropped)
+}
 
 fn append_response_block(agent: Agent, output: &str, config: &Config) -> std::io::Result<()> {
     if output.trim().is_empty() {
@@ -57,9 +79,26 @@ fn append_response_block(agent: Agent, output: &str, config: &Config) -> std::io
         fs::create_dir_all(parent)?;
     }
 
+    let (kept_output, dropped) = truncate_response_lines(output, RESPONSE_BLOCK_MAX_LINES);
+    if dropped > 0 {
+        let total = dropped + RESPONSE_BLOCK_MAX_LINES;
+        let _ = log(
+            &format!(
+                "⚠ Response block truncated: {total} lines -> {RESPONSE_BLOCK_MAX_LINES} lines"
+            ),
+            config,
+        );
+    }
+
+    let truncation_marker = if dropped > 0 {
+        format!("[... {dropped} lines truncated ...]\n")
+    } else {
+        String::new()
+    };
+
     let separator = "─".repeat(60);
     let block = format!(
-        "\n{separator}\n[{}] {} response:\n{separator}\n{output}\n{separator}\n\n",
+        "\n{separator}\n[{}] {} response:\n{separator}\n{truncation_marker}{kept_output}\n{separator}\n\n",
         timestamp(),
         agent
     );
@@ -694,5 +733,81 @@ mod tests {
         let output = "plain text output".to_string();
         let normalized = normalize_agent_output(Agent::Claude, output.clone());
         assert_eq!(normalized, output);
+    }
+
+    #[test]
+    fn truncate_response_lines_keeps_last_n_lines_when_over_cap() {
+        let lines: Vec<String> = (1..=600).map(|i| format!("line {i}")).collect();
+        let input = lines.join("\n");
+
+        let (kept, dropped) = truncate_response_lines(&input, 500);
+        assert_eq!(dropped, 100);
+
+        let kept_lines: Vec<&str> = kept.lines().collect();
+        assert_eq!(kept_lines.len(), 500);
+        assert_eq!(kept_lines[0], "line 101");
+        assert_eq!(kept_lines[499], "line 600");
+    }
+
+    #[test]
+    fn truncate_response_lines_does_not_truncate_within_cap() {
+        let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        let input = lines.join("\n");
+
+        let (kept, dropped) = truncate_response_lines(&input, 500);
+        assert_eq!(dropped, 0);
+
+        let kept_lines: Vec<&str> = kept.lines().collect();
+        assert_eq!(kept_lines.len(), 100);
+        assert_eq!(kept_lines[0], "line 1");
+        assert_eq!(kept_lines[99], "line 100");
+    }
+
+    #[test]
+    fn append_response_block_truncates_output_exceeding_line_cap() {
+        let project = new_project(5);
+        // Ensure state dir exists for log file
+        std::fs::create_dir_all(&project.config.state_dir)
+            .expect("state dir should be created");
+
+        let lines: Vec<String> = (1..=600).map(|i| format!("line {i}")).collect();
+        let output = lines.join("\n");
+
+        append_response_block(Agent::Claude, &output, &project.config)
+            .expect("append should succeed");
+
+        let logs = project.read_log();
+        assert!(
+            logs.contains("[... 100 lines truncated ...]"),
+            "block should contain truncation marker"
+        );
+        assert!(
+            logs.contains("⚠ Response block truncated: 600 lines -> 500 lines"),
+            "log should contain truncation warning"
+        );
+        assert!(logs.contains("line 600"), "should keep last lines");
+        assert!(logs.contains("line 101"), "should keep line 101");
+        assert!(!logs.contains("\nline 100\n"), "should not keep line 100 as a distinct line");
+    }
+
+    #[test]
+    fn append_response_block_does_not_truncate_output_within_cap() {
+        let project = new_project(5);
+        std::fs::create_dir_all(&project.config.state_dir)
+            .expect("state dir should be created");
+
+        let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
+        let output = lines.join("\n");
+
+        append_response_block(Agent::Claude, &output, &project.config)
+            .expect("append should succeed");
+
+        let logs = project.read_log();
+        assert!(
+            !logs.contains("truncated"),
+            "no truncation marker or warning expected"
+        );
+        assert!(logs.contains("line 1"), "should contain first line");
+        assert!(logs.contains("line 100"), "should contain last line");
     }
 }

@@ -11,6 +11,9 @@ use serde_json::Value;
 
 use crate::config::Config;
 
+const LAST_RUN_TASK_MAX_CHARS: usize = 500;
+const CONVERSATION_MAX_LINES: usize = 200;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
@@ -347,13 +350,25 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
         None => current.rating,
     };
 
+    let resolved_task = resolve_last_run_task(merged_task_input, config);
+    let original_task_len = resolved_task.chars().count();
+    let truncated_task = summarize_task(&resolved_task, Some(LAST_RUN_TASK_MAX_CHARS));
+    if original_task_len > LAST_RUN_TASK_MAX_CHARS {
+        let _ = log(
+            &format!(
+                "⚠ last_run_task truncated: {original_task_len} chars -> {LAST_RUN_TASK_MAX_CHARS} chars"
+            ),
+            config,
+        );
+    }
+
     let updated = LoopStatus {
         status: next_status,
         round: round.unwrap_or(current.round),
         implementer: implementer.unwrap_or_else(|| config.implementer.to_string()),
         reviewer: reviewer.unwrap_or_else(|| config.reviewer.to_string()),
         mode: mode.unwrap_or_else(|| config.run_mode.to_string()),
-        last_run_task: resolve_last_run_task(merged_task_input, config),
+        last_run_task: truncated_task,
         reason: next_reason,
         rating: next_rating,
         timestamp: timestamp(),
@@ -396,7 +411,32 @@ pub fn append_round_summary(
     }
 
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(line.as_bytes())
+    file.write_all(line.as_bytes())?;
+
+    cap_conversation_file(config)
+}
+
+fn cap_conversation_file(config: &Config) -> io::Result<()> {
+    let path = state_file_path("conversation.md", config);
+    let content = fs::read_to_string(&path)?;
+    let lines: Vec<&str> = content.lines().collect();
+    let original_count = lines.len();
+
+    if original_count <= CONVERSATION_MAX_LINES {
+        return Ok(());
+    }
+
+    let _ = log(
+        &format!(
+            "⚠ conversation.md capped: {original_count} lines -> {CONVERSATION_MAX_LINES} lines"
+        ),
+        config,
+    );
+
+    let kept = &lines[original_count - CONVERSATION_MAX_LINES..];
+    let mut capped = kept.join("\n");
+    capped.push('\n');
+    fs::write(&path, capped)
 }
 
 pub fn read_recent_history(config: &Config, max_lines: usize) -> String {
@@ -1250,6 +1290,149 @@ mod tests {
         assert!(
             content.is_empty(),
             "conversation.md should be empty after init"
+        );
+    }
+
+    #[test]
+    fn write_status_truncates_long_last_run_task() {
+        let project = new_project();
+        write_state_file("task.md", "", &project.config)
+            .expect("task.md should be writable");
+
+        let long_task = "a".repeat(1000);
+        let result = write_status(
+            StatusPatch {
+                status: Some(Status::Implementing),
+                last_run_task: Some(long_task),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("write_status should succeed");
+
+        assert!(
+            result.last_run_task.chars().count() <= LAST_RUN_TASK_MAX_CHARS,
+            "last_run_task should be bounded to {LAST_RUN_TASK_MAX_CHARS} chars, got {}",
+            result.last_run_task.chars().count()
+        );
+        assert!(
+            result.last_run_task.ends_with("..."),
+            "truncated task should end with ellipsis"
+        );
+
+        let logs = read_state_file("log.txt", &project.config);
+        assert!(
+            logs.contains("⚠ last_run_task truncated: 1000 chars -> 500 chars"),
+            "log should contain truncation warning"
+        );
+    }
+
+    #[test]
+    fn write_status_preserves_short_last_run_task_without_warning() {
+        let project = new_project();
+        write_state_file("task.md", "", &project.config)
+            .expect("task.md should be writable");
+
+        let short_task = "short task description";
+        let result = write_status(
+            StatusPatch {
+                status: Some(Status::Implementing),
+                last_run_task: Some(short_task.to_string()),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("write_status should succeed");
+
+        assert_eq!(result.last_run_task, short_task);
+
+        let logs = read_state_file("log.txt", &project.config);
+        assert!(
+            !logs.contains("last_run_task truncated"),
+            "no truncation warning expected for short task"
+        );
+    }
+
+    #[test]
+    fn append_round_summary_caps_conversation_to_last_200_lines() {
+        let project = new_project();
+
+        // Append 250 summaries (each produces one line)
+        for i in 1..=250 {
+            append_round_summary(i, "impl", &format!("change {i}"), &project.config)
+                .expect("append should succeed");
+        }
+
+        let content = read_state_file("conversation.md", &project.config);
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            CONVERSATION_MAX_LINES,
+            "conversation.md should be capped to {CONVERSATION_MAX_LINES} lines"
+        );
+        // Should retain newest lines
+        assert!(
+            lines[0].contains("change 51"),
+            "first kept line should be change 51, got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[CONVERSATION_MAX_LINES - 1].contains("change 250"),
+            "last kept line should be change 250, got: {}",
+            lines[CONVERSATION_MAX_LINES - 1]
+        );
+    }
+
+    #[test]
+    fn cap_conversation_file_counts_raw_lines_including_empty() {
+        let project = new_project();
+
+        // Seed file with 250 raw lines including empty ones
+        let mut content = String::new();
+        for i in 1..=250 {
+            if i % 3 == 0 {
+                content.push('\n'); // empty line
+            } else {
+                content.push_str(&format!("line {i}\n"));
+            }
+        }
+        write_state_file("conversation.md", &content, &project.config)
+            .expect("write should succeed");
+
+        cap_conversation_file(&project.config).expect("cap should succeed");
+
+        let capped = read_state_file("conversation.md", &project.config);
+        let lines: Vec<&str> = capped.lines().collect();
+        assert_eq!(
+            lines.len(),
+            CONVERSATION_MAX_LINES,
+            "capped file should have exactly {CONVERSATION_MAX_LINES} raw lines"
+        );
+
+        let logs = read_state_file("log.txt", &project.config);
+        assert!(
+            logs.contains("⚠ conversation.md capped: 250 lines -> 200 lines"),
+            "log should contain cap warning"
+        );
+    }
+
+    #[test]
+    fn cap_conversation_file_does_not_truncate_within_limit() {
+        let project = new_project();
+
+        let mut content = String::new();
+        for i in 1..=50 {
+            content.push_str(&format!("line {i}\n"));
+        }
+        write_state_file("conversation.md", &content, &project.config)
+            .expect("write should succeed");
+
+        cap_conversation_file(&project.config).expect("cap should succeed");
+
+        let result = read_state_file("conversation.md", &project.config);
+        assert_eq!(
+            result, content,
+            "file within limit should not be modified"
         );
     }
 }
