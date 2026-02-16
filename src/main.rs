@@ -2,6 +2,7 @@ mod agent;
 mod config;
 mod error;
 mod git;
+mod interrupt;
 mod phases;
 mod prompts;
 mod state;
@@ -368,7 +369,7 @@ fn resolve_tasks_file_path(args: &RunTasksArgs, project_dir: &Path) -> PathBuf {
 }
 
 fn read_current_status(project_dir: &Path, single_agent: bool) -> Option<LoopStatus> {
-    let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false).ok()?;
+    let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false, false).ok()?;
     if !config.state_dir.join("status.json").is_file() {
         return None;
     }
@@ -477,7 +478,7 @@ fn run_command_with_max_rounds(
     max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let mut config = Config::from_cli(project_dir, args.single_agent, args.planning_only)?;
+    let mut config = Config::from_cli(project_dir, args.single_agent, args.planning_only, false)?;
     if let Some(max_rounds) = max_rounds_override {
         config.max_rounds = max_rounds;
     }
@@ -531,7 +532,7 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
     })?;
     let parsed_tasks = parse_tasks_markdown(&raw_tasks)?;
     let base_max_rounds =
-        Config::from_cli(project_dir.clone(), args.single_agent, false)?.max_rounds;
+        Config::from_cli(project_dir.clone(), args.single_agent, false, false)?.max_rounds;
 
     println!(
         "Found {} tasks in {}",
@@ -620,7 +621,7 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
 
 fn init_command() -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, false, false)?;
+    let config = Config::from_cli(project_dir, false, false, false)?;
 
     for file in [
         "task.md",
@@ -653,7 +654,7 @@ fn init_command() -> Result<i32, AgentLoopError> {
 
 fn status_command() -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, false, false)?;
+    let config = Config::from_cli(project_dir, false, false, false)?;
     let status_path = config.state_dir.join("status.json");
 
     if !config.state_dir.is_dir() || !status_path.is_file() {

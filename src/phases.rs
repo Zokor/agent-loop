@@ -166,6 +166,7 @@ fn transition_label(patch: &StatusPatch) -> &'static str {
             Status::NeedsRevision => "NEEDS_REVISION",
             Status::MaxRounds => "MAX_ROUNDS",
             Status::Error => "ERROR",
+            Status::Interrupted => "INTERRUPTED",
         },
         None => {
             if patch.rating.is_some() {
@@ -763,7 +764,11 @@ pub fn planning_phase(config: &Config) -> bool {
 
     let task = read_state_file("task.md", config);
     let paths = phase_paths(config);
-    let project_context = gather_project_context(&config.project_dir);
+    let project_context = gather_project_context(
+        &config.project_dir,
+        config.effective_context_line_cap() as usize,
+        config.effective_planning_context_excerpt_lines() as usize,
+    );
 
     let _ = log("📝 Implementer proposing plan...", config);
     if !run_agent_or_record_error(
@@ -1064,7 +1069,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         if round == 1 {
             let _ = log("📋 Implementer breaking down plan into tasks...", config);
-            let project_context = gather_project_context(&config.project_dir);
+            let project_context = gather_project_context(
+                &config.project_dir,
+                config.effective_context_line_cap() as usize,
+                config.effective_planning_context_excerpt_lines() as usize,
+            );
             if !run_agent_or_record_error(
                 config,
                 config.implementer,
