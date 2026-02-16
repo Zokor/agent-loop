@@ -1468,10 +1468,7 @@ planning_context_excerpt_lines = 75
     #[test]
     fn load_file_config_accepts_valid_agent_values() {
         let dir = create_temp_project_root("toml_valid_agents");
-        write_toml(
-            &dir,
-            "implementer = \"claude\"\nreviewer = \"codex\"\n",
-        );
+        write_toml(&dir, "implementer = \"claude\"\nreviewer = \"codex\"\n");
         let config = load_file_config(&dir).expect("valid agents should parse");
         assert_eq!(config.implementer.as_deref(), Some("claude"));
         assert_eq!(config.reviewer.as_deref(), Some("codex"));
@@ -1519,15 +1516,9 @@ planning_context_excerpt_lines = 75
         // max_rounds=0 during validation, not after.
         write_toml(&dir, "planning_only = true\nmax_rounds = 0\n");
 
-        let err = Config::from_cli_with_overrides(
-            dir.clone(),
-            false,
-            false,
-            false,
-            None,
-            Some(false),
-        )
-        .expect_err("max_rounds=0 with planning_only override false should fail");
+        let err =
+            Config::from_cli_with_overrides(dir.clone(), false, false, false, None, Some(false))
+                .expect_err("max_rounds=0 with planning_only override false should fail");
         assert!(err.to_string().contains("max_rounds must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1538,15 +1529,9 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_override_mr");
-        let config = Config::from_cli_with_overrides(
-            dir.clone(),
-            false,
-            false,
-            false,
-            Some(42),
-            None,
-        )
-        .expect("override max_rounds should succeed");
+        let config =
+            Config::from_cli_with_overrides(dir.clone(), false, false, false, Some(42), None)
+                .expect("override max_rounds should succeed");
         assert_eq!(config.max_rounds, 42);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1558,15 +1543,9 @@ planning_context_excerpt_lines = 75
         set_env("PLANNING_ONLY", "1");
 
         let dir = create_temp_project_root("cfg_override_env_po");
-        let config = Config::from_cli_with_overrides(
-            dir.clone(),
-            false,
-            false,
-            false,
-            None,
-            Some(false),
-        )
-        .expect("override should force implementation mode");
+        let config =
+            Config::from_cli_with_overrides(dir.clone(), false, false, false, None, Some(false))
+                .expect("override should force implementation mode");
         assert!(!config.planning_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1580,15 +1559,9 @@ planning_context_excerpt_lines = 75
         let dir = create_temp_project_root("cfg_override_mr_env");
         write_toml(&dir, "max_rounds = 50\n");
 
-        let config = Config::from_cli_with_overrides(
-            dir.clone(),
-            false,
-            false,
-            false,
-            Some(7),
-            None,
-        )
-        .expect("override max_rounds should win");
+        let config =
+            Config::from_cli_with_overrides(dir.clone(), false, false, false, Some(7), None)
+                .expect("override max_rounds should win");
         assert_eq!(config.max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }

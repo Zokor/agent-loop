@@ -1543,9 +1543,7 @@ where
                         StatusPatch {
                             status: Some(Status::Reviewing),
                             round: Some(round),
-                            reason: Some(
-                                "Awaiting adversarial second review".to_string(),
-                            ),
+                            reason: Some("Awaiting adversarial second review".to_string()),
                             ..StatusPatch::default()
                         },
                         config,
@@ -4822,7 +4820,10 @@ CRITICAL INSTRUCTIONS:
             false,
         );
 
-        assert!(!result, "should NOT reach consensus when adversarial agent didn't write status");
+        assert!(
+            !result,
+            "should NOT reach consensus when adversarial agent didn't write status"
+        );
 
         // Should NOT have Consensus in status patches
         assert!(
@@ -4849,7 +4850,10 @@ CRITICAL INSTRUCTIONS:
             "should have adversarial-review history entry"
         );
         assert!(
-            !adversarial_entry.unwrap().2.contains("APPROVED (adversarial)"),
+            !adversarial_entry
+                .unwrap()
+                .2
+                .contains("APPROVED (adversarial)"),
             "adversarial history should NOT show APPROVED when agent didn't write status"
         );
     }
