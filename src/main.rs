@@ -510,14 +510,14 @@ fn run_command_with_max_rounds(
     planning_only_override: Option<bool>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let planning_only_flag = planning_only_override.unwrap_or(args.planning_only);
-    let mut config = Config::from_cli(project_dir, args.single_agent, planning_only_flag, false)?;
-    if let Some(max_rounds) = max_rounds_override {
-        config.max_rounds = max_rounds;
-    }
-    if let Some(po) = planning_only_override {
-        config.planning_only = po;
-    }
+    let config = Config::from_cli_with_overrides(
+        project_dir,
+        args.single_agent,
+        args.planning_only,
+        false,
+        max_rounds_override,
+        planning_only_override,
+    )?;
 
     let task = if args.resume {
         validate_resume_args(&args)?;
@@ -661,7 +661,17 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
         AgentLoopError::Config(format!("Failed to read '{}': {err}", tasks_file.display()))
     })?;
     let parsed_tasks = parse_tasks_markdown(&raw_tasks)?;
-    let config = Config::from_cli(project_dir.clone(), args.single_agent, false, false)?;
+    // Force implementation mode: run-tasks always runs in implementation mode,
+    // so override planning_only to false before validation. This ensures
+    // max_rounds=0 (valid only in planning-only mode) is rejected early.
+    let config = Config::from_cli_with_overrides(
+        project_dir.clone(),
+        args.single_agent,
+        false,
+        false,
+        None,
+        Some(false),
+    )?;
     let base_max_rounds = config.max_rounds;
 
     // Resolve effective max_parallel: CLI > config > default(1).

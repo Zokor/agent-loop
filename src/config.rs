@@ -132,6 +132,31 @@ impl Config {
         planning_only_flag: bool,
         verbose_flag: bool,
     ) -> Result<Self, AgentLoopError> {
+        Self::from_cli_with_overrides(
+            project_dir,
+            single_agent_flag,
+            planning_only_flag,
+            verbose_flag,
+            None,
+            None,
+        )
+    }
+
+    /// Build config with optional overrides applied **before** validation.
+    ///
+    /// `max_rounds_override` and `planning_only_override` take highest precedence
+    /// (above CLI flags, env vars, and TOML) and are validated together with the
+    /// rest of the config. This avoids post-hoc mutation that could bypass bounds
+    /// checks (e.g. forcing implementation mode after validation allowed
+    /// `max_rounds = 0` in planning-only mode).
+    pub fn from_cli_with_overrides(
+        project_dir: PathBuf,
+        single_agent_flag: bool,
+        planning_only_flag: bool,
+        verbose_flag: bool,
+        max_rounds_override: Option<u32>,
+        planning_only_override: Option<bool>,
+    ) -> Result<Self, AgentLoopError> {
         let file = load_file_config(&project_dir)?;
 
         // --- single_agent: CLI > env > TOML > default ---
@@ -158,9 +183,11 @@ impl Config {
         };
 
         // --- numeric: env > TOML > default ---
-        let max_rounds = parse_env("MAX_ROUNDS")
-            .or(file.max_rounds)
-            .unwrap_or(DEFAULT_MAX_ROUNDS);
+        let max_rounds = max_rounds_override.unwrap_or_else(|| {
+            parse_env("MAX_ROUNDS")
+                .or(file.max_rounds)
+                .unwrap_or(DEFAULT_MAX_ROUNDS)
+        });
         let planning_max_rounds = parse_env("PLANNING_MAX_ROUNDS")
             .or(file.planning_max_rounds)
             .unwrap_or(DEFAULT_PLANNING_MAX_ROUNDS);
@@ -196,8 +223,10 @@ impl Config {
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
-        // --- planning_only: CLI > env > TOML > default ---
-        let planning_only = if planning_only_flag {
+        // --- planning_only: override > CLI > env > TOML > default ---
+        let planning_only = if let Some(po) = planning_only_override {
+            po
+        } else if planning_only_flag {
             true
         } else {
             env_bool("PLANNING_ONLY")
@@ -234,27 +263,23 @@ impl Config {
     }
 }
 
-const VALID_AGENT_VALUES: [&str; 2] = ["claude", "codex"];
-
 /// Validate that agent string fields in the config contain known values.
 fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoopError> {
     if let Some(ref value) = config.implementer {
-        if !VALID_AGENT_VALUES.contains(&value.as_str()) {
+        if parse_agent(Some(value.as_str())).is_none() {
             return Err(AgentLoopError::Config(format!(
-                "invalid implementer '{}' in {}: must be one of {:?}",
+                "invalid implementer '{}' in {}: must be one of [\"claude\", \"codex\"]",
                 value,
                 path.display(),
-                VALID_AGENT_VALUES
             )));
         }
     }
     if let Some(ref value) = config.reviewer {
-        if !VALID_AGENT_VALUES.contains(&value.as_str()) {
+        if parse_agent(Some(value.as_str())).is_none() {
             return Err(AgentLoopError::Config(format!(
-                "invalid reviewer '{}' in {}: must be one of {:?}",
+                "invalid reviewer '{}' in {}: must be one of [\"claude\", \"codex\"]",
                 value,
                 path.display(),
-                VALID_AGENT_VALUES
             )));
         }
     }
@@ -1463,6 +1488,108 @@ planning_context_excerpt_lines = 75
         let err = Config::from_cli(dir.clone(), false, false, false)
             .expect_err("invalid implementer should fail from_cli");
         assert!(err.to_string().contains("invalid implementer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_rejects_invalid_reviewer_in_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_invalid_rev");
+        write_toml(&dir, "reviewer = \"gpt4\"\n");
+        let err = Config::from_cli(dir.clone(), false, false, false)
+            .expect_err("invalid reviewer should fail from_cli");
+        assert!(err.to_string().contains("invalid reviewer"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // from_cli_with_overrides — pre-validation override semantics
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overrides_planning_only_false_rejects_zero_max_rounds() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_override_po_false");
+        // TOML sets planning_only=true and max_rounds=0, which is valid in
+        // planning-only mode. Overriding planning_only to false must reject
+        // max_rounds=0 during validation, not after.
+        write_toml(&dir, "planning_only = true\nmax_rounds = 0\n");
+
+        let err = Config::from_cli_with_overrides(
+            dir.clone(),
+            false,
+            false,
+            false,
+            None,
+            Some(false),
+        )
+        .expect_err("max_rounds=0 with planning_only override false should fail");
+        assert!(err.to_string().contains("max_rounds must be > 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overrides_max_rounds_applied_before_validation() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_override_mr");
+        let config = Config::from_cli_with_overrides(
+            dir.clone(),
+            false,
+            false,
+            false,
+            Some(42),
+            None,
+        )
+        .expect("override max_rounds should succeed");
+        assert_eq!(config.max_rounds, 42);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overrides_planning_only_false_with_env_planning_only_true() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_ONLY", "1");
+
+        let dir = create_temp_project_root("cfg_override_env_po");
+        let config = Config::from_cli_with_overrides(
+            dir.clone(),
+            false,
+            false,
+            false,
+            None,
+            Some(false),
+        )
+        .expect("override should force implementation mode");
+        assert!(!config.planning_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overrides_max_rounds_wins_over_env_and_toml() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("MAX_ROUNDS", "100");
+
+        let dir = create_temp_project_root("cfg_override_mr_env");
+        write_toml(&dir, "max_rounds = 50\n");
+
+        let config = Config::from_cli_with_overrides(
+            dir.clone(),
+            false,
+            false,
+            false,
+            Some(7),
+            None,
+        )
+        .expect("override max_rounds should win");
+        assert_eq!(config.max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
