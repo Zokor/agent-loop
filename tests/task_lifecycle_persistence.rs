@@ -513,12 +513,12 @@ fn failed_task_with_exhausted_retries_is_not_reexecuted() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: Running task with exhausted retries is not re-executed
+// Test 9: Running task beyond retry boundary is not re-executed
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
 #[test]
-fn running_task_with_exhausted_retries_fails_immediately() {
+fn running_task_beyond_retry_boundary_fails_immediately() {
     let project_dir = create_project_dir("running_exhausted");
     create_succeeding_agents(&project_dir);
 
@@ -528,8 +528,9 @@ fn running_task_with_exhausted_retries_fails_immediately() {
         "### Task 1: Exhausted running\nContent\n",
     );
 
-    // Pre-seed: running with retries=2, max_retries default is 2
-    let status_json = r#"{"tasks":[{"title":"Task 1: Exhausted running","status":"running","retries":2,"last_error":"MAX_ROUNDS"}]}"#;
+    // Pre-seed: running with retries=3, max_retries default is 2.
+    // Since retries > max_retries (3 > 2), this is truly exhausted.
+    let status_json = r#"{"tasks":[{"title":"Task 1: Exhausted running","status":"running","retries":3,"last_error":"MAX_ROUNDS"}]}"#;
     write_state_file(&project_dir, "task_status.json", status_json);
 
     let output = run_tasks_cmd(&project_dir, &[]);
@@ -541,6 +542,55 @@ fn running_task_with_exhausted_retries_fails_immediately() {
     let status = read_task_status(&project_dir);
     let tasks = status["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks[0]["status"], "failed", "Task should be failed");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9b: Running task at retry boundary gets one final attempt
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn running_task_at_retry_boundary_gets_final_attempt() {
+    let project_dir = create_project_dir("running_boundary");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: At boundary\nContent\n",
+    );
+
+    // Pre-seed: running with retries=2, max_retries default is 2.
+    // Since retries == max_retries, the interrupted attempt hasn't completed
+    // yet, so the task should get one final resume attempt.
+    let status_json = r#"{"tasks":[{"title":"Task 1: At boundary","status":"running","retries":2,"last_error":"timeout"}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    // Pre-seed resume state files (needed for --resume mode)
+    write_state_file(&project_dir, "task.md", "### Task 1: At boundary\nContent");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"INTERRUPTED","round":1,"implementer":"claude","reviewer":"codex","mode":"single-agent","lastRunTask":"","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should succeed — the task gets its final attempt and completes
+    assert!(
+        output.status.success(),
+        "should succeed with final attempt: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Task should be done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "done", "Task should complete on final attempt");
 
     let _ = fs::remove_dir_all(&project_dir);
 }
