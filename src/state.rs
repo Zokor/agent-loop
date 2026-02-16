@@ -25,6 +25,7 @@ pub enum Status {
     NeedsRevision,
     MaxRounds,
     Error,
+    Interrupted,
 }
 
 impl fmt::Display for Status {
@@ -41,6 +42,7 @@ impl fmt::Display for Status {
             Self::NeedsRevision => "NEEDS_REVISION",
             Self::MaxRounds => "MAX_ROUNDS",
             Self::Error => "ERROR",
+            Self::Interrupted => "INTERRUPTED",
         };
 
         write!(f, "{label}")
@@ -861,6 +863,7 @@ mod tests {
             Status::NeedsRevision,
             Status::MaxRounds,
             Status::Error,
+            Status::Interrupted,
         ];
 
         for variant in variants {
@@ -889,6 +892,7 @@ mod tests {
             Status::NeedsRevision,
             Status::MaxRounds,
             Status::Error,
+            Status::Interrupted,
         ];
 
         for variant in variants {

@@ -17,6 +17,8 @@ pub enum AgentLoopError {
     Config(String),
     /// State management error (status.json parse, missing files, etc.).
     State(String),
+    /// Process was interrupted by a signal (SIGINT/SIGTERM).
+    Interrupted(String),
 }
 
 impl fmt::Display for AgentLoopError {
@@ -27,6 +29,7 @@ impl fmt::Display for AgentLoopError {
             Self::Agent(msg) => write!(f, "Agent error: {msg}"),
             Self::Config(msg) => write!(f, "Config error: {msg}"),
             Self::State(msg) => write!(f, "State error: {msg}"),
+            Self::Interrupted(msg) => write!(f, "Interrupted: {msg}"),
         }
     }
 }
@@ -35,7 +38,11 @@ impl std::error::Error for AgentLoopError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::Git(_) | Self::Agent(_) | Self::Config(_) | Self::State(_) => None,
+            Self::Git(_)
+            | Self::Agent(_)
+            | Self::Config(_)
+            | Self::State(_)
+            | Self::Interrupted(_) => None,
         }
     }
 }
@@ -143,6 +150,7 @@ mod tests {
             AgentLoopError::Agent("msg".to_string()),
             AgentLoopError::Config("msg".to_string()),
             AgentLoopError::State("msg".to_string()),
+            AgentLoopError::Interrupted("msg".to_string()),
         ];
         for err in &variants {
             assert!(

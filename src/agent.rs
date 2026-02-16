@@ -254,6 +254,7 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
     let mut timed_out_at_ms = None;
     let mut force_kill_attempted = false;
     let mut run_error = None::<String>;
+    let mut interrupted = false;
 
     loop {
         match child.try_wait() {
@@ -262,9 +263,17 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
                 break;
             }
             Ok(None) => {
+                // Check for interrupt signal before anything else.
+                if !interrupted && crate::interrupt::is_interrupted() {
+                    let _ = log("Interrupted by signal — terminating child process", config);
+                    terminate_for_timeout(&mut child);
+                    interrupted = true;
+                    timed_out_at_ms = Some(start.elapsed().as_millis() as u64);
+                }
+
                 let now_ms = start.elapsed().as_millis() as u64;
                 let idle_ms = now_ms.saturating_sub(last_output_ms.load(Ordering::Relaxed));
-                if !timed_out && idle_ms > config.timeout_seconds.saturating_mul(1000) {
+                if !timed_out && !interrupted && idle_ms > config.timeout_seconds.saturating_mul(1000) {
                     let _ = log(
                         &format!("⏱️ Idle timeout: no output for {}s", config.timeout_seconds),
                         config,
@@ -274,7 +283,7 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
                     timed_out_at_ms = Some(now_ms);
                 }
 
-                if timed_out
+                if (timed_out || interrupted)
                     && !force_kill_attempted
                     && let Some(timeout_started_ms) = timed_out_at_ms
                     && now_ms.saturating_sub(timeout_started_ms) >= FORCE_KILL_GRACE_MS
@@ -326,6 +335,12 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
     let normalized_output = normalize_agent_output(agent, combined_output);
     if let Err(err) = append_response_block(agent, &normalized_output, config) {
         let _ = log(&format!("⚠ {agent} error: {err}"), config);
+    }
+
+    if interrupted {
+        let reason = "Interrupted by signal".to_string();
+        let _ = log(&format!("⚠ {reason}"), config);
+        return Err(AgentLoopError::Interrupted(reason));
     }
 
     if timed_out {
