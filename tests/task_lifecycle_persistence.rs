@@ -2,7 +2,8 @@
 //!
 //! These tests verify resume-after-interrupt, `--continue-on-fail`,
 //! fail-fast default behavior, corruption recovery, and retry-history
-//! resume correctness by manipulating `task_status.json` directly.
+//! resume correctness by exercising the `run-tasks` binary with mock
+//! agent binaries.
 
 use std::fs;
 use std::path::Path;
@@ -36,47 +37,163 @@ fn read_state_file(project_dir: &Path, name: &str) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
+fn read_task_status(project_dir: &Path) -> serde_json::Value {
+    let raw = read_state_file(project_dir, "task_status.json");
+    if raw.trim().is_empty() {
+        return serde_json::json!({"tasks": []});
+    }
+    serde_json::from_str(&raw).expect("task_status.json should be valid JSON")
+}
+
 #[cfg(unix)]
-fn create_mock_binaries(project_dir: &Path) {
+fn create_mock_agent(project_dir: &Path, name: &str, script: &str) {
     use std::os::unix::fs::PermissionsExt;
 
     let bin_dir = project_dir.join("bin");
     fs::create_dir_all(&bin_dir).expect("bin dir should be created");
 
-    // Mock claude that succeeds for --version and fails for normal invocation
-    // (exits 1 to simulate a failing task).
-    let claude_script = r#"#!/bin/sh
+    let path = bin_dir.join(name);
+    fs::write(&path, script).expect("mock agent should be written");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+        .expect("mock agent should be executable");
+}
+
+/// Shell snippet to read the current timestamp from status.json and write
+/// it back as part of the updated status. This is needed because the
+/// implementation loop uses stale-timestamp detection.
+const READ_TIMESTAMP_SNIPPET: &str = r#"
+STATE_DIR="$(pwd)/.agent-loop/state"
+mkdir -p "$STATE_DIR"
+STATUS_FILE="$STATE_DIR/status.json"
+# Extract the current timestamp so the stale-detection does not fire
+CURRENT_TS=""
+if [ -f "$STATUS_FILE" ]; then
+    # Simple grep to extract timestamp value
+    CURRENT_TS=$(sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATUS_FILE" | head -1)
+fi
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+"#;
+
+/// Create mock agents that succeed for --version and write APPROVED status
+/// (with correct timestamp) for all task runs.
+#[cfg(unix)]
+fn create_succeeding_agents(project_dir: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+{READ_TIMESTAMP_SNIPPET}
+# Write APPROVED status with the current timestamp to pass stale detection
+printf '{{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
+exit 0
+"#
+    );
+    create_mock_agent(project_dir, "claude", &script);
+    create_mock_agent(project_dir, "codex", &script);
+}
+
+/// Create mock agents where claude fails (non-retryable) for task runs.
+#[cfg(unix)]
+fn create_failing_agents(project_dir: &Path) {
+    let claude_script = format!(
+        r#"#!/bin/sh
 for arg in "$@"; do
     case "$arg" in
         --version) echo "claude mock 1.0.0"; exit 0 ;;
     esac
 done
+{READ_TIMESTAMP_SNIPPET}
+# Write NEEDS_CHANGES status (non-retryable)
+printf '{{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"tests failing","timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
 exit 1
-"#;
+"#
+    );
+    create_mock_agent(project_dir, "claude", &claude_script);
 
-    let claude_path = bin_dir.join("claude");
-    fs::write(&claude_path, claude_script).expect("mock claude should be written");
-    fs::set_permissions(&claude_path, fs::Permissions::from_mode(0o755))
-        .expect("mock claude should be executable");
-
-    // Mock codex for preflight
     let codex_script = r#"#!/bin/sh
 echo "codex mock 1.0.0"
 exit 0
 "#;
-    let codex_path = bin_dir.join("codex");
-    fs::write(&codex_path, codex_script).expect("mock codex should be written");
-    fs::set_permissions(&codex_path, fs::Permissions::from_mode(0o755))
-        .expect("mock codex should be executable");
+    create_mock_agent(project_dir, "codex", codex_script);
+}
+
+/// Create mock agent that succeeds on the Nth invocation (tracked via a counter file).
+#[cfg(unix)]
+fn create_agent_succeeds_on_nth(project_dir: &Path, succeed_on: u32) {
+    let claude_script = format!(
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "claude mock 1.0.0"; exit 0 ;;
+    esac
+done
+{READ_TIMESTAMP_SNIPPET}
+COUNTER_FILE="$STATE_DIR/.invoke_counter"
+COUNT=0
+if [ -f "$COUNTER_FILE" ]; then
+    COUNT=$(cat "$COUNTER_FILE")
+fi
+COUNT=$((COUNT + 1))
+echo "$COUNT" > "$COUNTER_FILE"
+if [ "$COUNT" -ge {succeed_on} ]; then
+    printf '{{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
+    exit 0
+else
+    printf '{{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"not ready yet","timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
+    exit 1
+fi
+"#
+    );
+    create_mock_agent(project_dir, "claude", &claude_script);
+
+    let codex_script = r#"#!/bin/sh
+echo "codex mock 1.0.0"
+exit 0
+"#;
+    create_mock_agent(project_dir, "codex", codex_script);
+}
+
+/// Build a PATH that includes the project's bin dir first, followed by
+/// system directories so shell builtins like `cat`, `mkdir`, `echo` work.
+fn test_path(project_dir: &Path) -> String {
+    let bin_dir = project_dir.join("bin");
+    format!(
+        "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+        bin_dir.display()
+    )
+}
+
+fn run_tasks_cmd(
+    project_dir: &Path,
+    extra_args: &[&str],
+) -> std::process::Output {
+    std::process::Command::new(agent_loop_bin())
+        .arg("run-tasks")
+        .arg("--single-agent")
+        .args(extra_args)
+        .env("PATH", test_path(project_dir))
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("MAX_ROUNDS", "1")
+        .current_dir(project_dir)
+        .output()
+        .expect("agent-loop should run")
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: Resume-after-interrupt skips done tasks and resumes running task
+// Test 1: Resume-after-interrupt skips done tasks and resumes running tasks
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
-fn resume_after_interrupt_skips_done_tasks() {
+fn resume_after_interrupt_skips_done_resumes_running() {
     let project_dir = create_project_dir("resume_skip");
+    create_succeeding_agents(&project_dir);
 
     // Write tasks file with 3 tasks
     write_state_file(
@@ -85,60 +202,446 @@ fn resume_after_interrupt_skips_done_tasks() {
         "### Task 1: Setup\nSetup content\n\n### Task 2: Build\nBuild content\n\n### Task 3: Test\nTest content\n",
     );
 
-    // Write task_status.json: task1=done, task2=running, task3=pending
+    // Pre-seed task_status.json: task1=done, task2=running, task3=pending
     let status_json = r#"{
   "tasks": [
     { "title": "Task 1: Setup", "status": "done", "retries": 0 },
-    { "title": "Task 2: Build", "status": "running", "retries": 1, "last_error": "timeout" },
+    { "title": "Task 2: Build", "status": "running", "retries": 0 },
     { "title": "Task 3: Test", "status": "pending", "retries": 0 }
   ]
 }"#;
     write_state_file(&project_dir, "task_status.json", status_json);
 
-    // Parse task_status.json and verify the reconciliation logic:
-    // We can verify the file was written correctly.
-    let raw = read_state_file(&project_dir, "task_status.json");
-    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("should be valid JSON");
-    assert_eq!(parsed["tasks"][0]["status"], "done");
-    assert_eq!(parsed["tasks"][1]["status"], "running");
-    assert_eq!(parsed["tasks"][1]["retries"], 1);
-    assert_eq!(parsed["tasks"][2]["status"], "pending");
+    // Pre-seed resume state files (needed because Task 2 is "running" so
+    // the code will use --resume mode which requires task.md and status.json)
+    write_state_file(&project_dir, "task.md", "### Task 2: Build\nBuild content");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"INTERRUPTED","round":1,"implementer":"claude","reviewer":"codex","mode":"single-agent","lastRunTask":"","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Task 1 should be skipped (already done)
+    assert!(
+        stdout.contains("already done, skipping"),
+        "Task 1 should be skipped: {stdout}"
+    );
+
+    // Verify final task_status.json
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "done", "Task 1 remains done");
+    assert_eq!(tasks[1]["status"], "done", "Task 2 should complete");
+    assert_eq!(tasks[2]["status"], "done", "Task 3 should complete");
 
     let _ = fs::remove_dir_all(&project_dir);
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Corruption recovery — corrupt task_status.json treated as all-pending
+// Test 2: --continue-on-fail skips failing tasks and continues
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
-fn corrupt_task_status_json_treated_as_all_pending() {
-    let project_dir = create_project_dir("corrupt_recovery");
+fn continue_on_fail_skips_failing_and_continues() {
+    let project_dir = create_project_dir("continue_on_fail");
+
+    // Create agent that fails on 1st invocation but succeeds on 2nd+
+    // Task 1 fails, Task 2 succeeds
+    create_agent_succeeds_on_nth(&project_dir, 2);
 
     write_state_file(
         &project_dir,
         "tasks.md",
-        "### Task 1: Setup\nContent\n\n### Task 2: Build\nContent\n",
+        "### Task 1: Failing\nThis will fail\n\n### Task 2: Passing\nThis will pass\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &["--continue-on-fail"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should complete with failures (exit code 1)
+    assert!(
+        !output.status.success(),
+        "should exit non-zero with failures"
+    );
+    assert!(
+        stdout.contains("Tasks completed with failures"),
+        "should report failures: {stdout}"
+    );
+
+    // Verify final state
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0]["status"], "failed", "Task 1 should be failed");
+    assert_eq!(tasks[1]["status"], "done", "Task 2 should be done");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: Fail-fast default stops on first failure
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn fail_fast_default_stops_on_first_failure() {
+    let project_dir = create_project_dir("fail_fast");
+    create_failing_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Failing\nThis will fail\n\n### Task 2: Never reached\nShould not run\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+
+    // Should fail
+    assert!(!output.status.success(), "should exit non-zero");
+
+    // Verify task 2 remains pending (never executed)
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[0]["status"], "failed", "Task 1 should be failed");
+    assert_eq!(tasks[1]["status"], "pending", "Task 2 should remain pending");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: Corruption recovery — corrupt task_status.json treated as all-pending
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn corrupt_task_status_json_treated_as_all_pending() {
+    let project_dir = create_project_dir("corrupt_recovery");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Setup\nContent\n",
     );
 
     // Write corrupt task_status.json
     write_state_file(&project_dir, "task_status.json", "{corrupted json data!!!");
 
-    // The binary can't be run without mock agents, so test the file
-    // directly by reading and verifying the recovery behavior would produce
-    // an empty default.
-    let raw = read_state_file(&project_dir, "task_status.json");
-    let result = serde_json::from_str::<serde_json::Value>(&raw);
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Should succeed (treats all as pending)
     assert!(
-        result.is_err(),
-        "corrupt JSON should fail to parse"
+        output.status.success(),
+        "should succeed after recovery: stdout={}, stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr
+    );
+
+    // Should have printed a warning
+    assert!(
+        stderr.contains("invalid task_status.json"),
+        "should warn about corruption: {stderr}"
+    );
+
+    // Task should be completed
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "done");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: CLI flag validation via binary
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn cli_rejects_conflicting_fail_flags() {
+    let project_dir = create_project_dir("conflicting_flags");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Test\nContent\n",
+    );
+
+    let output = std::process::Command::new(agent_loop_bin())
+        .args([
+            "run-tasks",
+            "--continue-on-fail",
+            "--fail-fast",
+            "--single-agent",
+        ])
+        .env("PATH", test_path(&project_dir))
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "10")
+        .env("MAX_ROUNDS", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop should run");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "should fail with conflicting flags"
+    );
+    assert!(
+        stderr.contains("cannot be used together"),
+        "error should mention conflicting flags, got: {stderr}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: task_status.json schema matches contract
+// Test 6: init command resets task_status.json
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn init_command_resets_task_status_json() {
+    let project_dir = create_project_dir("init_reset");
+    create_succeeding_agents(&project_dir);
+
+    // Write existing task_status.json with data
+    let existing = r#"{"tasks":[{"title":"Task 1","status":"done","retries":0}]}"#;
+    write_state_file(&project_dir, "task_status.json", existing);
+
+    let output = std::process::Command::new(agent_loop_bin())
+        .args(["init"])
+        .env("PATH", test_path(&project_dir))
+        .env("AUTO_COMMIT", "0")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop init should run");
+
+    assert!(
+        output.status.success(),
+        "init should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify task_status.json is reset (empty)
+    let content = read_state_file(&project_dir, "task_status.json");
+    assert!(
+        content.trim().is_empty(),
+        "task_status.json should be empty after init, got: {content}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: Skipped tasks from prior --continue-on-fail are re-executed
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn skipped_tasks_are_reexecuted_on_subsequent_runs() {
+    let project_dir = create_project_dir("skipped_reexecute");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Previously skipped\nContent\n",
+    );
+
+    // Pre-seed with a skipped task from a previous run
+    let status_json = r#"{"tasks":[{"title":"Task 1: Previously skipped","status":"skipped","retries":0}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should succeed — skipped task should be re-executed
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Task should now be done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "done", "Previously skipped task should now be done");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Failed task with exhausted retries is not re-executed
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn failed_task_with_exhausted_retries_is_not_reexecuted() {
+    let project_dir = create_project_dir("retry_exhausted");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Exhausted\nContent\n",
+    );
+
+    // Pre-seed: failed with retries=2, max_retries default is 2
+    let status_json = r#"{"tasks":[{"title":"Task 1: Exhausted","status":"failed","retries":2,"last_error":"MAX_ROUNDS"}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    // Run with default max-retries=2 — retries already exhausted
+    let output = run_tasks_cmd(&project_dir, &[]);
+
+    // Should fail without re-executing the task
+    assert!(!output.status.success(), "should fail due to exhausted retries");
+
+    // Task should remain failed (not re-executed to done)
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "failed", "Task should remain failed");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Running task with exhausted retries is not re-executed
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn running_task_with_exhausted_retries_fails_immediately() {
+    let project_dir = create_project_dir("running_exhausted");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Exhausted running\nContent\n",
+    );
+
+    // Pre-seed: running with retries=2, max_retries default is 2
+    let status_json = r#"{"tasks":[{"title":"Task 1: Exhausted running","status":"running","retries":2,"last_error":"MAX_ROUNDS"}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+
+    // Should fail without re-executing
+    assert!(!output.status.success(), "should fail due to exhausted retries");
+
+    // Task should be marked failed
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "failed", "Task should be failed");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Retry-history resume — persisted retries affect behavior
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn retry_history_resume_with_remaining_budget() {
+    let project_dir = create_project_dir("retry_budget");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Resumable\nContent\n",
+    );
+
+    // Pre-seed: running with retries=1, max_retries default is 2
+    // Should still have budget remaining (1 < 2)
+    let status_json = r#"{"tasks":[{"title":"Task 1: Resumable","status":"running","retries":1,"last_error":"timeout"}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    // Pre-seed resume state files (needed for --resume mode)
+    write_state_file(&project_dir, "task.md", "### Task 1: Resumable\nContent");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"INTERRUPTED","round":1,"implementer":"claude","reviewer":"codex","mode":"single-agent","lastRunTask":"","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should succeed (agent completes successfully on resume)
+    assert!(
+        output.status.success(),
+        "should succeed with remaining budget: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify task completed
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "done", "Task should complete");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: --continue-on-fail with pre-failed task skips it
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn continue_on_fail_with_prefailed_task_skips_it() {
+    let project_dir = create_project_dir("prefailed_skip");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Previously failed\nContent\n\n### Task 2: New task\nContent\n",
+    );
+
+    // Pre-seed: task1=failed, task2=pending
+    let status_json = r#"{
+  "tasks": [
+    { "title": "Task 1: Previously failed", "status": "failed", "retries": 1, "last_error": "error" },
+    { "title": "Task 2: New task", "status": "pending", "retries": 0 }
+  ]
+}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let output = run_tasks_cmd(&project_dir, &["--continue-on-fail"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should complete with failures (exit code 1 due to skipped failed task)
+    assert!(
+        !output.status.success(),
+        "should exit non-zero"
+    );
+    assert!(
+        stdout.contains("previously failed, skipping"),
+        "should report skipping failed task: {stdout}"
+    );
+
+    // Verify final state
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks[0]["status"], "skipped", "Failed task should be skipped");
+    assert_eq!(tasks[1]["status"], "done", "Task 2 should complete");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: task_status.json schema matches contract
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -202,164 +705,7 @@ fn task_status_json_schema_matches_contract() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: CLI flag validation via binary
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-#[test]
-fn cli_rejects_conflicting_fail_flags() {
-    let project_dir = create_project_dir("conflicting_flags");
-    create_mock_binaries(&project_dir);
-
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Test\nContent\n",
-    );
-
-    let output = std::process::Command::new(agent_loop_bin())
-        .args([
-            "run-tasks",
-            "--continue-on-fail",
-            "--fail-fast",
-            "--single-agent",
-        ])
-        .env("PATH", project_dir.join("bin"))
-        .env("AUTO_COMMIT", "0")
-        .env("TIMEOUT", "10")
-        .env("MAX_ROUNDS", "1")
-        .current_dir(&project_dir)
-        .output()
-        .expect("agent-loop should run");
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "should fail with conflicting flags"
-    );
-    assert!(
-        stderr.contains("cannot be used together"),
-        "error should mention conflicting flags, got: {stderr}"
-    );
-
-    let _ = fs::remove_dir_all(&project_dir);
-}
-
-// ---------------------------------------------------------------------------
-// Test 5: init command resets task_status.json
-// ---------------------------------------------------------------------------
-
-#[cfg(unix)]
-#[test]
-fn init_command_resets_task_status_json() {
-    let project_dir = create_project_dir("init_reset");
-    create_mock_binaries(&project_dir);
-
-    // Write existing task_status.json with data
-    let existing = r#"{"tasks":[{"title":"Task 1","status":"done","retries":0}]}"#;
-    write_state_file(&project_dir, "task_status.json", existing);
-
-    let output = std::process::Command::new(agent_loop_bin())
-        .args(["init"])
-        .env("PATH", project_dir.join("bin"))
-        .env("AUTO_COMMIT", "0")
-        .current_dir(&project_dir)
-        .output()
-        .expect("agent-loop init should run");
-
-    assert!(
-        output.status.success(),
-        "init should succeed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    // Verify task_status.json is reset (empty)
-    let content = read_state_file(&project_dir, "task_status.json");
-    assert!(
-        content.trim().is_empty(),
-        "task_status.json should be empty after init, got: {content}"
-    );
-
-    let _ = fs::remove_dir_all(&project_dir);
-}
-
-// ---------------------------------------------------------------------------
-// Test 6: Retry history round-trip — persisted retries count is preserved
-// ---------------------------------------------------------------------------
-
-#[test]
-fn retry_history_persisted_across_file_operations() {
-    let project_dir = create_project_dir("retry_history");
-
-    // Simulate a task_status.json with retry history
-    let status_json = r#"{
-  "tasks": [
-    {
-      "title": "Task 1: Complex",
-      "status": "running",
-      "retries": 1,
-      "last_error": "MAX_ROUNDS"
-    }
-  ]
-}"#;
-    write_state_file(&project_dir, "task_status.json", status_json);
-
-    // Read it back and verify
-    let raw = read_state_file(&project_dir, "task_status.json");
-    let parsed: serde_json::Value = serde_json::from_str(&raw).expect("should be valid JSON");
-    assert_eq!(parsed["tasks"][0]["retries"], 1);
-    assert_eq!(parsed["tasks"][0]["status"], "running");
-    assert_eq!(parsed["tasks"][0]["last_error"], "MAX_ROUNDS");
-
-    // Modify and write back (simulating what run_tasks_command does)
-    let mut modified = parsed.clone();
-    modified["tasks"][0]["retries"] = serde_json::json!(2);
-    modified["tasks"][0]["status"] = serde_json::json!("failed");
-    modified["tasks"][0]["last_error"] = serde_json::json!("Retry limit exhausted");
-
-    let serialized =
-        serde_json::to_string_pretty(&modified).expect("serialization should succeed");
-    write_state_file(&project_dir, "task_status.json", &serialized);
-
-    // Read back and verify persistence
-    let raw2 = read_state_file(&project_dir, "task_status.json");
-    let parsed2: serde_json::Value = serde_json::from_str(&raw2).expect("should be valid JSON");
-    assert_eq!(parsed2["tasks"][0]["retries"], 2);
-    assert_eq!(parsed2["tasks"][0]["status"], "failed");
-    assert_eq!(parsed2["tasks"][0]["last_error"], "Retry limit exhausted");
-
-    let _ = fs::remove_dir_all(&project_dir);
-}
-
-// ---------------------------------------------------------------------------
-// Test 7: Empty/missing task_status.json produces fresh start
-// ---------------------------------------------------------------------------
-
-#[test]
-fn missing_task_status_json_produces_empty_default() {
-    let project_dir = create_project_dir("missing_status");
-
-    // Don't write task_status.json at all
-    let raw = read_state_file(&project_dir, "task_status.json");
-    assert!(raw.is_empty(), "missing file should read as empty string");
-
-    let _ = fs::remove_dir_all(&project_dir);
-}
-
-#[test]
-fn empty_task_status_json_produces_empty_default() {
-    let project_dir = create_project_dir("empty_status");
-
-    write_state_file(&project_dir, "task_status.json", "");
-
-    let raw = read_state_file(&project_dir, "task_status.json");
-    assert!(raw.is_empty(), "empty file should read as empty string");
-
-    let _ = fs::remove_dir_all(&project_dir);
-}
-
-// ---------------------------------------------------------------------------
-// Test 8: Duplicate title handling in task_status.json
+// Test 13: Duplicate title handling in task_status.json
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -385,6 +731,44 @@ fn duplicate_titles_preserve_distinct_status_per_occurrence() {
     assert_eq!(tasks[1]["status"], "failed");
     assert_eq!(tasks[1]["retries"], 2);
     assert_eq!(tasks[2]["status"], "pending");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: All tasks succeed — exit code 0
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn all_tasks_succeed_exit_zero() {
+    let project_dir = create_project_dir("all_succeed");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: First\nContent\n\n### Task 2: Second\nContent\n",
+    );
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should exit 0: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("All tasks completed"),
+        "should report all tasks completed: {stdout}"
+    );
+
+    // Verify all done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert!(tasks.iter().all(|t| t["status"] == "done"));
 
     let _ = fs::remove_dir_all(&project_dir);
 }
