@@ -15,6 +15,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process,
+    time::Instant,
 };
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
@@ -23,7 +24,10 @@ use config::{
     DEFAULT_TIMEOUT_SECONDS,
 };
 use error::AgentLoopError;
-use state::{LoopStatus, Status, StatusPatch};
+use state::{
+    LoopStatus, Status, StatusPatch, TaskMetricsEntry, TaskMetricsFile, TaskRunStatus,
+    TaskStatusEntry, TaskStatusFile,
+};
 
 const KNOWN_SUBCOMMANDS: [&str; 6] = ["run", "run-tasks", "init", "status", "version", "help"];
 
@@ -71,6 +75,12 @@ struct RunTasksArgs {
     round_step: u32,
     #[arg(long)]
     single_agent: bool,
+    #[arg(long)]
+    continue_on_fail: bool,
+    #[arg(long)]
+    fail_fast: bool,
+    #[arg(long)]
+    max_parallel: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +108,10 @@ enum ParseOutcome {
 fn main() {
     let exit_code = match run() {
         Ok(code) => code,
+        Err(AgentLoopError::Interrupted(msg)) => {
+            eprintln!("Interrupted: {msg}");
+            130
+        }
         Err(err) => {
             eprintln!("{err}");
             1
@@ -108,6 +122,7 @@ fn main() {
 }
 
 fn run() -> Result<i32, AgentLoopError> {
+    interrupt::register_signal_handlers();
     let parse_outcome = parse_cli_from(std::env::args_os())?;
     match parse_outcome {
         ParseOutcome::Exit(code) => Ok(code),
@@ -356,6 +371,20 @@ fn validate_run_tasks_args(args: &RunTasksArgs) -> Result<(), AgentLoopError> {
         ));
     }
 
+    if args.continue_on_fail && args.fail_fast {
+        return Err(AgentLoopError::Config(
+            "--continue-on-fail and --fail-fast cannot be used together.".to_string(),
+        ));
+    }
+
+    if let Some(max_parallel) = args.max_parallel
+        && max_parallel == 0
+    {
+        return Err(AgentLoopError::Config(
+            "--max-parallel must be at least 1.".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -515,11 +544,97 @@ fn run_command_with_max_rounds(
     };
     persist_last_run_task(task.as_str(), &config)?;
 
+    // Check if the loop was interrupted by a signal and propagate as the
+    // Interrupted error variant so main() can exit with code 130.
+    if exit_code != 0 {
+        let final_status = state::read_status(&config);
+        if final_status.status == state::Status::Interrupted {
+            return Err(AgentLoopError::Interrupted(
+                final_status
+                    .reason
+                    .unwrap_or_else(|| "Interrupted by signal".to_string()),
+            ));
+        }
+    }
+
     Ok(exit_code)
 }
 
 fn run_command(args: RunArgs) -> Result<i32, AgentLoopError> {
     run_command_with_max_rounds(args, None)
+}
+
+fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<TaskStatusEntry> {
+    let persisted = state::read_task_status_with_warnings(config);
+    let persisted_entries = persisted.status_file.tasks;
+
+    // Positional reconciliation: match by index, not by title.
+    parsed_tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| {
+            if let Some(entry) = persisted_entries.get(i) {
+                entry.clone()
+            } else {
+                TaskStatusEntry {
+                    title: task.title.clone(),
+                    status: TaskRunStatus::Pending,
+                    retries: 0,
+                    last_error: None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn reconcile_task_metrics(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<TaskMetricsEntry> {
+    let persisted = state::read_task_metrics(config);
+    let persisted_entries = persisted.tasks;
+
+    parsed_tasks
+        .iter()
+        .enumerate()
+        .map(|(i, task)| {
+            if let Some(entry) = persisted_entries.get(i) {
+                entry.clone()
+            } else {
+                TaskMetricsEntry {
+                    title: task.title.clone(),
+                    task_started_at: None,
+                    task_ended_at: None,
+                    duration_ms: None,
+                }
+            }
+        })
+        .collect()
+}
+
+fn format_duration_ms(ms: u64) -> String {
+    let total_seconds = ms / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn print_task_duration_summary(metrics: &[TaskMetricsEntry]) {
+    println!();
+    println!("Task Durations:");
+    let mut total_ms: u64 = 0;
+    for entry in metrics {
+        let duration_str = match entry.duration_ms {
+            Some(ms) => {
+                total_ms += ms;
+                format_duration_ms(ms)
+            }
+            None => "n/a".to_string(),
+        };
+        println!("  {} — {}", entry.title, duration_str);
+    }
+    println!("  Total — {}", format_duration_ms(total_ms));
 }
 
 fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
@@ -531,8 +646,20 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
         AgentLoopError::Config(format!("Failed to read '{}': {err}", tasks_file.display()))
     })?;
     let parsed_tasks = parse_tasks_markdown(&raw_tasks)?;
-    let base_max_rounds =
-        Config::from_cli(project_dir.clone(), args.single_agent, false, false)?.max_rounds;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false, false)?;
+    let base_max_rounds = config.max_rounds;
+
+    // Resolve effective max_parallel: CLI > config > default(1).
+    let effective_max_parallel = args.max_parallel.unwrap_or(config.max_parallel);
+    if effective_max_parallel > 1 {
+        eprintln!(
+            "Parallel task execution is not yet supported; running sequentially with max_parallel=1"
+        );
+    }
+
+    // Reconcile persisted task status and metrics with current task list.
+    let mut task_statuses = reconcile_task_status(&parsed_tasks, &config);
+    let mut task_metrics = reconcile_task_metrics(&parsed_tasks, &config);
 
     println!(
         "Found {} tasks in {}",
@@ -540,17 +667,101 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
         tasks_file.display()
     );
 
+    let mut had_failures = false;
+
     for (index, task) in parsed_tasks.iter().enumerate() {
         println!();
         println!("[{}/{}] {}", index + 1, parsed_tasks.len(), task.title);
 
-        let mut retry = 0;
-        let mut current_max_rounds = base_max_rounds;
+        // Copy entry fields to avoid borrow conflicts.
+        let entry_status = task_statuses[index].status;
+        let persisted_retries = task_statuses[index].retries;
+
+        // Skip tasks that are already done.
+        if entry_status == TaskRunStatus::Done {
+            println!("{} — already done, skipping", task.title);
+            continue;
+        }
+
+        // In continue-on-fail mode, skip previously failed tasks.
+        if args.continue_on_fail && entry_status == TaskRunStatus::Failed {
+            println!("{} — previously failed, skipping", task.title);
+            task_statuses[index].status = TaskRunStatus::Skipped;
+            persist_task_state(&task_statuses, &task_metrics, &config)?;
+            had_failures = true;
+            continue;
+        }
+
+        // Check retry budget: for failed tasks, retries >= max_retries means exhausted.
+        // For running tasks, retries > max_retries means truly exhausted (beyond boundary).
+        // retries == max_retries for running means final attempt allowed.
+        if entry_status == TaskRunStatus::Failed && persisted_retries >= args.max_retries {
+            // Exhausted — do not re-execute.
+            if args.continue_on_fail {
+                println!("{} — retries exhausted, skipping", task.title);
+                task_statuses[index].status = TaskRunStatus::Skipped;
+                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                had_failures = true;
+                continue;
+            } else {
+                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                return Err(AgentLoopError::Agent(format!(
+                    "Task '{}' failed with retries exhausted ({persisted_retries}/{}).",
+                    task.title, args.max_retries
+                )));
+            }
+        }
+
+        if entry_status == TaskRunStatus::Running && persisted_retries > args.max_retries {
+            // Running task beyond retry boundary — mark failed immediately.
+            task_statuses[index].status = TaskRunStatus::Failed;
+            persist_task_state(&task_statuses, &task_metrics, &config)?;
+            if args.continue_on_fail {
+                had_failures = true;
+                continue;
+            } else {
+                return Err(AgentLoopError::Agent(format!(
+                    "Task '{}' failed with retries exhausted ({persisted_retries}/{}).",
+                    task.title, args.max_retries
+                )));
+            }
+        }
+
+        // Mark as running and clear stale metrics for re-execution.
+        task_statuses[index].status = TaskRunStatus::Running;
+        let start_ts = state::timestamp();
+        task_metrics[index] = TaskMetricsEntry {
+            title: task.title.clone(),
+            task_started_at: Some(start_ts),
+            task_ended_at: None,
+            duration_ms: None,
+        };
+        persist_task_state(&task_statuses, &task_metrics, &config)?;
+
+        let timer = Instant::now();
+
+        // Determine initial retry count from persisted state.
+        let mut retry = persisted_retries;
+        let is_resume_initial = entry_status == TaskRunStatus::Running;
+        let mut current_max_rounds = if is_resume_initial {
+            base_max_rounds.saturating_add(args.round_step.saturating_mul(retry))
+        } else {
+            base_max_rounds
+        };
+
+        let mut task_succeeded = false;
+        let mut first_attempt = true;
+
         loop {
-            let is_resume = retry > 0;
-            if is_resume {
+            let is_resume = !first_attempt || is_resume_initial;
+            if is_resume && !first_attempt {
                 println!(
                     "Resuming with MAX_ROUNDS={} (retry {}/{})",
+                    current_max_rounds, retry, args.max_retries
+                );
+            } else if !first_attempt {
+                println!(
+                    "Retrying with MAX_ROUNDS={} (retry {}/{})",
                     current_max_rounds, retry, args.max_retries
                 );
             } else {
@@ -578,25 +789,19 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
             let exit_code = run_command_with_max_rounds(run_args, Some(current_max_rounds))?;
             if exit_code == 0 {
                 println!("Task completed: {}", task.title);
+                task_succeeded = true;
                 break;
             }
 
             let status = read_current_status(&project_dir, args.single_agent);
             if !is_retryable_run_tasks_status(status.as_ref()) {
-                return Err(AgentLoopError::Agent(format!(
-                    "Task '{}' failed with status {}.",
-                    task.title,
-                    format_status_reason(status.as_ref())
-                )));
+                // Non-retryable failure.
+                break;
             }
 
             if retry >= args.max_retries {
-                return Err(AgentLoopError::Agent(format!(
-                    "Task '{}' reached retry limit after {} attempt(s). Last status: {}.",
-                    task.title,
-                    retry + 1,
-                    format_status_reason(status.as_ref())
-                )));
+                // Retry budget exhausted.
+                break;
             }
 
             if let Some(status_value) = status.as_ref()
@@ -610,13 +815,74 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
             }
 
             retry += 1;
+            first_attempt = false;
             current_max_rounds = current_max_rounds.saturating_add(args.round_step);
+
+            // Persist updated retry count.
+            task_statuses[index].retries = retry;
+            persist_task_state(&task_statuses, &task_metrics, &config)?;
         }
+
+        let elapsed = timer.elapsed();
+        let end_ts = state::timestamp();
+        task_metrics[index].task_ended_at = Some(end_ts);
+        task_metrics[index].duration_ms = Some(elapsed.as_millis() as u64);
+
+        if task_succeeded {
+            task_statuses[index].status = TaskRunStatus::Done;
+            task_statuses[index].retries = retry;
+            task_statuses[index].last_error = None;
+        } else {
+            task_statuses[index].status = TaskRunStatus::Failed;
+            task_statuses[index].retries = retry;
+            let status = read_current_status(&project_dir, args.single_agent);
+            task_statuses[index].last_error = Some(format_status_reason(status.as_ref()));
+            had_failures = true;
+
+            if !args.continue_on_fail {
+                // Fail-fast: persist and exit.
+                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                print_task_duration_summary(&task_metrics);
+                return Err(AgentLoopError::Agent(format!(
+                    "Task '{}' failed with status {}.",
+                    task.title,
+                    format_status_reason(status.as_ref())
+                )));
+            }
+        }
+
+        persist_task_state(&task_statuses, &task_metrics, &config)?;
     }
 
+    print_task_duration_summary(&task_metrics);
     println!();
-    println!("All tasks completed.");
-    Ok(0)
+    if had_failures {
+        println!("Tasks completed with failures.");
+        Ok(1)
+    } else {
+        println!("All tasks completed.");
+        Ok(0)
+    }
+}
+
+fn persist_task_state(
+    statuses: &[TaskStatusEntry],
+    metrics: &[TaskMetricsEntry],
+    config: &Config,
+) -> Result<(), AgentLoopError> {
+    state::write_task_status(
+        &TaskStatusFile {
+            tasks: statuses.to_vec(),
+        },
+        config,
+    )?;
+    state::write_task_metrics(
+        &TaskMetricsFile {
+            tasks: metrics.to_vec(),
+        },
+        config,
+    )?;
+    Ok(())
 }
 
 fn init_command() -> Result<i32, AgentLoopError> {
@@ -631,6 +897,8 @@ fn init_command() -> Result<i32, AgentLoopError> {
         "review.md",
         "log.txt",
         "status.json",
+        "task_status.json",
+        "task_metrics.json",
     ] {
         state::write_state_file(file, "", &config)?;
     }
@@ -652,6 +920,22 @@ fn init_command() -> Result<i32, AgentLoopError> {
     Ok(0)
 }
 
+fn is_terminal_status(status: &state::Status) -> bool {
+    matches!(
+        status,
+        state::Status::MaxRounds | state::Status::Error | state::Status::Interrupted
+    )
+}
+
+fn has_stale_reason(reason: Option<&str>) -> bool {
+    reason
+        .map(|r| {
+            let lower = r.to_ascii_lowercase();
+            lower.contains("stale") || lower.contains("timestamp")
+        })
+        .unwrap_or(false)
+}
+
 fn status_command() -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
     let config = Config::from_cli(project_dir, false, false, false)?;
@@ -662,7 +946,10 @@ fn status_command() -> Result<i32, AgentLoopError> {
         return Ok(0);
     }
 
-    let current_status = state::read_status(&config);
+    let result = state::read_status_with_warnings(&config);
+    let current_status = result.status;
+    let warnings = result.warnings;
+
     println!("status: {}", current_status.status);
     println!("round: {}", current_status.round);
     println!("implementer: {}", current_status.implementer);
@@ -674,11 +961,36 @@ fn status_command() -> Result<i32, AgentLoopError> {
     }
     if let Some(reason) = current_status
         .reason
+        .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
         println!("reason: {reason}");
     }
     println!("timestamp: {}", current_status.timestamp);
+
+    // Print warnings section if there were parse/validation issues.
+    if !warnings.is_empty() {
+        println!();
+        println!("Warnings:");
+        for w in &warnings {
+            println!("  - {w}");
+        }
+        println!();
+        println!("Hint: status.json may be corrupted. Run `agent-loop init` to reset state.");
+    }
+
+    // Print resume/init hints for terminal or stale statuses.
+    let show_resume = is_terminal_status(&current_status.status)
+        || has_stale_reason(current_status.reason.as_deref());
+
+    if show_resume {
+        if warnings.is_empty() {
+            println!();
+        }
+        println!(
+            "Hint: run `agent-loop run --resume` to continue, or `agent-loop init` to start fresh."
+        );
+    }
 
     Ok(0)
 }
@@ -728,6 +1040,9 @@ mod tests {
             max_retries: 2,
             round_step: 2,
             single_agent: false,
+            continue_on_fail: false,
+            fail_fast: false,
+            max_parallel: None,
         }
     }
 

@@ -28,9 +28,21 @@ pub(crate) fn gather_project_context(
     collect_tree(project_dir, 0, &mut lines, line_cap);
 
     // Append README.md excerpt if budget remains.
-    append_file_excerpt(project_dir, "README.md", &mut lines, line_cap, excerpt_max_lines);
+    append_file_excerpt(
+        project_dir,
+        "README.md",
+        &mut lines,
+        line_cap,
+        excerpt_max_lines,
+    );
     // Append CLAUDE.md excerpt if budget remains.
-    append_file_excerpt(project_dir, "CLAUDE.md", &mut lines, line_cap, excerpt_max_lines);
+    append_file_excerpt(
+        project_dir,
+        "CLAUDE.md",
+        &mut lines,
+        line_cap,
+        excerpt_max_lines,
+    );
 
     // Enforce the global line cap (the header counts as line 1).
     lines.truncate(line_cap);

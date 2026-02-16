@@ -177,6 +177,14 @@ fn transition_label(patch: &StatusPatch) -> &'static str {
     }
 }
 
+fn status_for_error(err: &AgentLoopError) -> Status {
+    if matches!(err, AgentLoopError::Interrupted(_)) {
+        Status::Interrupted
+    } else {
+        Status::Error
+    }
+}
+
 fn write_error_status(config: &Config, round: Option<u32>, reason: String) {
     let _ = log(&format!("❌ {reason}"), config);
     warn_on_status_write(
@@ -206,6 +214,18 @@ fn run_agent_or_record_error(
 ) -> bool {
     match run_agent(agent, prompt, config) {
         Ok(_) => true,
+        Err(AgentLoopError::Interrupted(reason)) => {
+            let _ = write_status(
+                StatusPatch {
+                    status: Some(Status::Interrupted),
+                    round,
+                    reason: Some(reason),
+                    ..StatusPatch::default()
+                },
+                config,
+            );
+            false
+        }
         Err(err) => {
             write_error_status(config, round, err.to_string());
             false
@@ -1383,11 +1403,12 @@ where
             ),
             config,
         ) {
+            let status = status_for_error(&err);
             let reason = err.to_string();
             log_fn(&format!("❌ {reason}"), config);
             write_status_fn(
                 StatusPatch {
-                    status: Some(Status::Error),
+                    status: Some(status),
                     round: Some(round),
                     reason: Some(reason),
                     ..StatusPatch::default()
@@ -1435,11 +1456,12 @@ where
             ),
             config,
         ) {
+            let status = status_for_error(&err);
             let reason = err.to_string();
             log_fn(&format!("❌ {reason}"), config);
             write_status_fn(
                 StatusPatch {
-                    status: Some(Status::Error),
+                    status: Some(status),
                     round: Some(round),
                     reason: Some(reason),
                     ..StatusPatch::default()
@@ -1530,11 +1552,12 @@ where
                         ),
                         config,
                     ) {
+                        let status = status_for_error(&err);
                         let reason = err.to_string();
                         log_fn(&format!("❌ {reason}"), config);
                         write_status_fn(
                             StatusPatch {
-                                status: Some(Status::Error),
+                                status: Some(status),
                                 round: Some(round),
                                 reason: Some(reason),
                                 ..StatusPatch::default()
@@ -1655,11 +1678,12 @@ where
                         ),
                         config,
                     ) {
+                        let status = status_for_error(&err);
                         let reason = err.to_string();
                         log_fn(&format!("❌ {reason}"), config);
                         write_status_fn(
                             StatusPatch {
-                                status: Some(Status::Error),
+                                status: Some(status),
                                 round: Some(round),
                                 reason: Some(reason),
                                 ..StatusPatch::default()

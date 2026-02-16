@@ -670,13 +670,12 @@ pub struct TaskStatusFile {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TaskStatusReadResult {
     pub status_file: TaskStatusFile,
+    #[allow(dead_code)]
     pub warnings: Vec<String>,
 }
 
-#[allow(dead_code)]
 pub fn read_task_status_with_warnings(config: &Config) -> TaskStatusReadResult {
     let raw = read_state_file("task_status.json", config);
     let trimmed = raw.trim();
@@ -708,7 +707,6 @@ pub fn read_task_status(config: &Config) -> TaskStatusFile {
     read_task_status_with_warnings(config).status_file
 }
 
-#[allow(dead_code)]
 pub fn write_task_status(status: &TaskStatusFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(status).map_err(io::Error::other)?;
     write_state_file("task_status.json", &serialized, config)
@@ -735,13 +733,12 @@ pub struct TaskMetricsFile {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct TaskMetricsReadResult {
     pub metrics_file: TaskMetricsFile,
+    #[allow(dead_code)]
     pub warnings: Vec<String>,
 }
 
-#[allow(dead_code)]
 pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult {
     let raw = read_state_file("task_metrics.json", config);
     let trimmed = raw.trim();
@@ -768,12 +765,10 @@ pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult
     }
 }
 
-#[allow(dead_code)]
 pub fn read_task_metrics(config: &Config) -> TaskMetricsFile {
     read_task_metrics_with_warnings(config).metrics_file
 }
 
-#[allow(dead_code)]
 pub fn write_task_metrics(metrics: &TaskMetricsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(metrics).map_err(io::Error::other)?;
     write_state_file("task_metrics.json", &serialized, config)

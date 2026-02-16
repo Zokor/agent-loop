@@ -332,31 +332,6 @@ impl TestProjectBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// ScopedCurrentDir — safely change cwd for tests
-// ---------------------------------------------------------------------------
-
-pub struct ScopedCurrentDir {
-    previous: PathBuf,
-}
-
-impl ScopedCurrentDir {
-    /// Change the process working directory, returning a guard that restores
-    /// it on drop.  **Must** be used under `env_lock()` since cwd is
-    /// process-global state.
-    pub fn set(dir: &Path) -> Self {
-        let previous = env::current_dir().expect("should be able to read cwd");
-        env::set_current_dir(dir).expect("should be able to change cwd");
-        Self { previous }
-    }
-}
-
-impl Drop for ScopedCurrentDir {
-    fn drop(&mut self) {
-        let _ = env::set_current_dir(&self.previous);
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared git command helpers (used by TestProject and git.rs tests)
 // ---------------------------------------------------------------------------
 
