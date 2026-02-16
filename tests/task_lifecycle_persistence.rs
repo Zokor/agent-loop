@@ -58,19 +58,21 @@ fn create_mock_agent(project_dir: &Path, name: &str, script: &str) {
         .expect("mock agent should be executable");
 }
 
-/// Shell snippet to read the current timestamp from status.json and write
-/// it back as part of the updated status. This is needed because the
-/// implementation loop uses stale-timestamp detection.
+/// Shell snippet that extracts the prompt_timestamp from the CLI arguments
+/// (where the agent-loop embeds it) and sets up the STATE_DIR / STATUS_FILE
+/// variables. The implementation loop generates a fresh timestamp before each
+/// agent call, embeds it in the prompt as `"timestamp": "<value>"`, and checks
+/// whether the agent wrote that exact timestamp into status.json. The mock
+/// agent must therefore extract the timestamp from its arguments — reading
+/// the old value from status.json would leave it stale.
 const READ_TIMESTAMP_SNIPPET: &str = r#"
 STATE_DIR="$(pwd)/.agent-loop/state"
 mkdir -p "$STATE_DIR"
 STATUS_FILE="$STATE_DIR/status.json"
-# Extract the current timestamp so the stale-detection does not fire
-CURRENT_TS=""
-if [ -f "$STATUS_FILE" ]; then
-    # Simple grep to extract timestamp value
-    CURRENT_TS=$(sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$STATUS_FILE" | head -1)
-fi
+# Extract the prompt_timestamp embedded in the CLI arguments by the agent-loop.
+# The prompt contains: "timestamp": "<ISO8601>" — we grab the last occurrence.
+ALL_ARGS="$*"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
 if [ -z "$CURRENT_TS" ]; then
     CURRENT_TS="2026-02-16T00:00:00.000Z"
 fi
