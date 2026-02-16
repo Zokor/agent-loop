@@ -265,23 +265,23 @@ impl Config {
 
 /// Validate that agent string fields in the config contain known values.
 fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoopError> {
-    if let Some(ref value) = config.implementer {
-        if parse_agent(Some(value.as_str())).is_none() {
-            return Err(AgentLoopError::Config(format!(
-                "invalid implementer '{}' in {}: must be one of [\"claude\", \"codex\"]",
-                value,
-                path.display(),
-            )));
-        }
+    if let Some(ref value) = config.implementer
+        && parse_agent(Some(value.as_str())).is_none()
+    {
+        return Err(AgentLoopError::Config(format!(
+            "invalid implementer '{}' in {}: must be one of [\"claude\", \"codex\"]",
+            value,
+            path.display(),
+        )));
     }
-    if let Some(ref value) = config.reviewer {
-        if parse_agent(Some(value.as_str())).is_none() {
-            return Err(AgentLoopError::Config(format!(
-                "invalid reviewer '{}' in {}: must be one of [\"claude\", \"codex\"]",
-                value,
-                path.display(),
-            )));
-        }
+    if let Some(ref value) = config.reviewer
+        && parse_agent(Some(value.as_str())).is_none()
+    {
+        return Err(AgentLoopError::Config(format!(
+            "invalid reviewer '{}' in {}: must be one of [\"claude\", \"codex\"]",
+            value,
+            path.display(),
+        )));
     }
     Ok(())
 }
