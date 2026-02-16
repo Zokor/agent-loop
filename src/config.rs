@@ -234,6 +234,33 @@ impl Config {
     }
 }
 
+const VALID_AGENT_VALUES: [&str; 2] = ["claude", "codex"];
+
+/// Validate that agent string fields in the config contain known values.
+fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoopError> {
+    if let Some(ref value) = config.implementer {
+        if !VALID_AGENT_VALUES.contains(&value.as_str()) {
+            return Err(AgentLoopError::Config(format!(
+                "invalid implementer '{}' in {}: must be one of {:?}",
+                value,
+                path.display(),
+                VALID_AGENT_VALUES
+            )));
+        }
+    }
+    if let Some(ref value) = config.reviewer {
+        if !VALID_AGENT_VALUES.contains(&value.as_str()) {
+            return Err(AgentLoopError::Config(format!(
+                "invalid reviewer '{}' in {}: must be one of {:?}",
+                value,
+                path.display(),
+                VALID_AGENT_VALUES
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load `.agent-loop.toml` from `project_dir`. Returns default on missing file.
 /// Returns an error on I/O failures (other than not-found) or parse failures.
 fn load_file_config(project_dir: &Path) -> Result<FileConfig, AgentLoopError> {
@@ -252,6 +279,7 @@ fn load_file_config(project_dir: &Path) -> Result<FileConfig, AgentLoopError> {
     let config = toml::from_str::<FileConfig>(&content).map_err(|err| {
         AgentLoopError::Config(format!("failed to parse {}: {err}", path.display()))
     })?;
+    validate_file_config(&config, &path)?;
     Ok(config)
 }
 
@@ -1383,6 +1411,58 @@ planning_context_excerpt_lines = 75
         let err = Config::from_cli(dir.clone(), false, false, false)
             .expect_err("max_parallel=0 should fail");
         assert!(err.to_string().contains("max_parallel must be >= 1"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Invalid agent string validation in TOML
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_file_config_rejects_invalid_implementer() {
+        let dir = create_temp_project_root("toml_invalid_implementer");
+        write_toml(&dir, "implementer = \"invalid-agent\"\n");
+        let err = load_file_config(&dir).expect_err("invalid implementer should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid implementer"), "got: {msg}");
+        assert!(msg.contains("invalid-agent"), "got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_file_config_rejects_invalid_reviewer() {
+        let dir = create_temp_project_root("toml_invalid_reviewer");
+        write_toml(&dir, "reviewer = \"gpt4\"\n");
+        let err = load_file_config(&dir).expect_err("invalid reviewer should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid reviewer"), "got: {msg}");
+        assert!(msg.contains("gpt4"), "got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_file_config_accepts_valid_agent_values() {
+        let dir = create_temp_project_root("toml_valid_agents");
+        write_toml(
+            &dir,
+            "implementer = \"claude\"\nreviewer = \"codex\"\n",
+        );
+        let config = load_file_config(&dir).expect("valid agents should parse");
+        assert_eq!(config.implementer.as_deref(), Some("claude"));
+        assert_eq!(config.reviewer.as_deref(), Some("codex"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_rejects_invalid_implementer_in_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_invalid_impl");
+        write_toml(&dir, "implementer = \"typo-agent\"\n");
+        let err = Config::from_cli(dir.clone(), false, false, false)
+            .expect_err("invalid implementer should fail from_cli");
+        assert!(err.to_string().contains("invalid implementer"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

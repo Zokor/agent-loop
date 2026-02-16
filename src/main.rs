@@ -507,11 +507,16 @@ fn execute_resume_phases(
 fn run_command_with_max_rounds(
     args: RunArgs,
     max_rounds_override: Option<u32>,
+    planning_only_override: Option<bool>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let mut config = Config::from_cli(project_dir, args.single_agent, args.planning_only, false)?;
+    let planning_only_flag = planning_only_override.unwrap_or(args.planning_only);
+    let mut config = Config::from_cli(project_dir, args.single_agent, planning_only_flag, false)?;
     if let Some(max_rounds) = max_rounds_override {
         config.max_rounds = max_rounds;
+    }
+    if let Some(po) = planning_only_override {
+        config.planning_only = po;
     }
 
     let task = if args.resume {
@@ -563,7 +568,7 @@ fn run_command_with_max_rounds(
 }
 
 fn run_command(args: RunArgs) -> Result<i32, AgentLoopError> {
-    run_command_with_max_rounds(args, None)
+    run_command_with_max_rounds(args, None, None)
 }
 
 fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<TaskStatusEntry> {
@@ -796,7 +801,8 @@ fn run_tasks_command(args: RunTasksArgs) -> Result<i32, AgentLoopError> {
                 }
             };
 
-            let exit_code = run_command_with_max_rounds(run_args, Some(current_max_rounds))?;
+            let exit_code =
+                run_command_with_max_rounds(run_args, Some(current_max_rounds), Some(false))?;
             if exit_code == 0 {
                 println!("Task completed: {}", task.title);
                 task_succeeded = true;
