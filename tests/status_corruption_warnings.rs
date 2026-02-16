@@ -251,3 +251,107 @@ fn status_with_valid_active_status_shows_no_warnings_or_hints() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+#[test]
+fn status_with_stale_timestamp_reason_on_non_terminal_status_shows_resume_hint() {
+    let project_dir = setup_project("stale_reason_non_terminal");
+    write_status_json(
+        &project_dir,
+        r#"{
+            "status": "NEEDS_CHANGES",
+            "round": 3,
+            "implementer": "claude",
+            "reviewer": "codex",
+            "mode": "dual-agent",
+            "lastRunTask": "implement auth",
+            "reason": "stale timestamp detected during recovery",
+            "timestamp": "2026-02-14T00:00:00.000Z"
+        }"#,
+    );
+
+    let (stdout, _stderr, code) = run_status(&project_dir);
+
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("NEEDS_CHANGES"),
+        "stdout should show NEEDS_CHANGES status, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--resume"),
+        "stdout should contain --resume hint for stale reason, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("agent-loop init"),
+        "stdout should contain init hint for stale reason, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("stale"),
+        "stdout should mention stale in hint, got:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn status_with_timestamp_in_reason_on_non_terminal_status_shows_resume_hint() {
+    let project_dir = setup_project("timestamp_reason_non_terminal");
+    write_status_json(
+        &project_dir,
+        r#"{
+            "status": "DISPUTED",
+            "round": 2,
+            "implementer": "claude",
+            "reviewer": "codex",
+            "mode": "dual-agent",
+            "lastRunTask": "fix bug",
+            "reason": "timestamp mismatch — external modification detected",
+            "timestamp": "2026-02-14T00:00:00.000Z"
+        }"#,
+    );
+
+    let (stdout, _stderr, code) = run_status(&project_dir);
+
+    assert_eq!(code, 0);
+    assert!(
+        stdout.contains("DISPUTED"),
+        "stdout should show DISPUTED status, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("--resume"),
+        "stdout should contain --resume hint for timestamp reason, got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("agent-loop init"),
+        "stdout should contain init hint for timestamp reason, got:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn status_with_non_stale_reason_on_non_terminal_status_shows_no_hints() {
+    let project_dir = setup_project("normal_reason_non_terminal");
+    write_status_json(
+        &project_dir,
+        r#"{
+            "status": "NEEDS_CHANGES",
+            "round": 2,
+            "implementer": "claude",
+            "reviewer": "codex",
+            "mode": "dual-agent",
+            "lastRunTask": "fix bug",
+            "reason": "missing test coverage",
+            "timestamp": "2026-02-14T00:00:00.000Z"
+        }"#,
+    );
+
+    let (stdout, _stderr, code) = run_status(&project_dir);
+
+    assert_eq!(code, 0);
+    assert!(
+        !stdout.contains("--resume"),
+        "non-stale non-terminal status should not show resume hint, got:\n{stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}

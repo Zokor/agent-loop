@@ -179,6 +179,19 @@ pub fn normalize_status_value(raw: &Value, config: &Config) -> LoopStatus {
     normalize_status_value_with_warnings(raw, config).status
 }
 
+/// Escape control characters in a string for safe terminal output.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\r' && c != '\t' {
+                '\u{FFFD}' // Unicode replacement character
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> StatusReadResult {
     let fallback = default_status(config);
     let mut warnings = Vec::new();
@@ -289,7 +302,8 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
             Some(s) => {
                 warnings.push(format!(
                     "field 'mode': unsupported value '{}'; falling back to '{}'",
-                    s, fallback.mode
+                    sanitize_for_display(s),
+                    fallback.mode
                 ));
                 fallback.mode.clone()
             }
@@ -1817,5 +1831,49 @@ mod tests {
         let result = read_status_with_warnings(&project.config);
         assert!(result.warnings.is_empty());
         assert_eq!(result.status.status, Status::Pending);
+    }
+
+    #[test]
+    fn sanitize_for_display_replaces_control_characters() {
+        assert_eq!(sanitize_for_display("normal text"), "normal text");
+        assert_eq!(sanitize_for_display("tab\there"), "tab\there");
+        assert_eq!(sanitize_for_display("line\nbreak"), "line\nbreak");
+        // ESC (0x1B) and BEL (0x07) should be replaced
+        assert_eq!(
+            sanitize_for_display("evil\x1b[31mred\x1b[0m"),
+            "evil\u{FFFD}[31mred\u{FFFD}[0m"
+        );
+        assert_eq!(sanitize_for_display("bell\x07here"), "bell\u{FFFD}here");
+        assert_eq!(sanitize_for_display("null\x00byte"), "null\u{FFFD}byte");
+    }
+
+    #[test]
+    fn warnings_mode_with_control_chars_are_sanitized() {
+        let project = new_project();
+        let raw = json!({
+            "status": "PENDING",
+            "round": 0,
+            "implementer": "a",
+            "reviewer": "b",
+            "mode": "evil\x1b[31m-mode",
+            "timestamp": "t"
+        });
+
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        let mode_warning = result
+            .warnings
+            .iter()
+            .find(|w| w.contains("'mode'"))
+            .expect("should have mode warning");
+
+        // The ESC byte should be replaced with U+FFFD
+        assert!(
+            !mode_warning.contains('\x1b'),
+            "warning should not contain raw ESC, got: {mode_warning}"
+        );
+        assert!(
+            mode_warning.contains('\u{FFFD}'),
+            "warning should contain replacement char, got: {mode_warning}"
+        );
     }
 }
