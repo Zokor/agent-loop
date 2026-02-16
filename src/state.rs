@@ -337,9 +337,7 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
             }
         },
         None => {
-            warnings.push(
-                "field 'timestamp': missing; falling back to current time".to_string(),
-            );
+            warnings.push("field 'timestamp': missing; falling back to current time".to_string());
             fallback.timestamp.clone()
         }
     };
@@ -375,7 +373,10 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
     // --- rating (optional — warn only when present but invalid) ---
     let rating = match map.get("rating") {
         Some(Value::Number(value)) => {
-            match value.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| (1..=5).contains(v))
+            match value
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| (1..=5).contains(v))
             {
                 Some(r) => Some(r),
                 None => {
@@ -663,15 +664,9 @@ pub struct TaskStatusEntry {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskStatusFile {
     pub tasks: Vec<TaskStatusEntry>,
-}
-
-impl Default for TaskStatusFile {
-    fn default() -> Self {
-        Self { tasks: Vec::new() }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +676,7 @@ pub struct TaskStatusReadResult {
     pub warnings: Vec<String>,
 }
 
+#[allow(dead_code)]
 pub fn read_task_status_with_warnings(config: &Config) -> TaskStatusReadResult {
     let raw = read_state_file("task_status.json", config);
     let trimmed = raw.trim();
@@ -707,10 +703,12 @@ pub fn read_task_status_with_warnings(config: &Config) -> TaskStatusReadResult {
     }
 }
 
+#[allow(dead_code)]
 pub fn read_task_status(config: &Config) -> TaskStatusFile {
     read_task_status_with_warnings(config).status_file
 }
 
+#[allow(dead_code)]
 pub fn write_task_status(status: &TaskStatusFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(status).map_err(io::Error::other)?;
     write_state_file("task_status.json", &serialized, config)
@@ -731,15 +729,9 @@ pub struct TaskMetricsEntry {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskMetricsFile {
     pub tasks: Vec<TaskMetricsEntry>,
-}
-
-impl Default for TaskMetricsFile {
-    fn default() -> Self {
-        Self { tasks: Vec::new() }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -749,6 +741,7 @@ pub struct TaskMetricsReadResult {
     pub warnings: Vec<String>,
 }
 
+#[allow(dead_code)]
 pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult {
     let raw = read_state_file("task_metrics.json", config);
     let trimmed = raw.trim();
@@ -775,10 +768,12 @@ pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult
     }
 }
 
+#[allow(dead_code)]
 pub fn read_task_metrics(config: &Config) -> TaskMetricsFile {
     read_task_metrics_with_warnings(config).metrics_file
 }
 
+#[allow(dead_code)]
 pub fn write_task_metrics(metrics: &TaskMetricsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(metrics).map_err(io::Error::other)?;
     write_state_file("task_metrics.json", &serialized, config)
@@ -1641,8 +1636,7 @@ mod tests {
     #[test]
     fn write_status_truncates_long_last_run_task() {
         let project = new_project();
-        write_state_file("task.md", "", &project.config)
-            .expect("task.md should be writable");
+        write_state_file("task.md", "", &project.config).expect("task.md should be writable");
 
         let long_task = "a".repeat(1000);
         let result = write_status(
@@ -1675,8 +1669,7 @@ mod tests {
     #[test]
     fn write_status_preserves_short_last_run_task_without_warning() {
         let project = new_project();
-        write_state_file("task.md", "", &project.config)
-            .expect("task.md should be writable");
+        write_state_file("task.md", "", &project.config).expect("task.md should be writable");
 
         let short_task = "short task description";
         let result = write_status(
@@ -1775,10 +1768,7 @@ mod tests {
         cap_conversation_file(&project.config).expect("cap should succeed");
 
         let result = read_state_file("conversation.md", &project.config);
-        assert_eq!(
-            result, content,
-            "file within limit should not be modified"
-        );
+        assert_eq!(result, content, "file within limit should not be modified");
     }
 
     // -----------------------------------------------------------------------
@@ -1788,13 +1778,17 @@ mod tests {
     #[test]
     fn warnings_invalid_json_produces_error_status_and_parse_warning() {
         let project = new_project();
-        write_state_file("status.json", "{broken", &project.config)
-            .expect("write should succeed");
+        write_state_file("status.json", "{broken", &project.config).expect("write should succeed");
 
         let result = read_status_with_warnings(&project.config);
         assert_eq!(result.status.status, Status::Error);
         assert!(
-            result.status.reason.as_deref().unwrap().starts_with("Invalid status.json:"),
+            result
+                .status
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("Invalid status.json:"),
             "reason should contain parse error"
         );
         assert_eq!(result.warnings.len(), 1);
@@ -1827,10 +1821,20 @@ mod tests {
         let result = normalize_status_value_with_warnings(&raw, &project.config);
 
         // Should produce warnings for: status, round, implementer, reviewer, mode, timestamp
-        let required_fields = ["status", "round", "implementer", "reviewer", "mode", "timestamp"];
+        let required_fields = [
+            "status",
+            "round",
+            "implementer",
+            "reviewer",
+            "mode",
+            "timestamp",
+        ];
         for field in required_fields {
             assert!(
-                result.warnings.iter().any(|w| w.contains(&format!("'{field}'")) && w.contains("missing")),
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("'{field}'")) && w.contains("missing")),
                 "expected missing warning for field '{field}', got: {:?}",
                 result.warnings
             );
@@ -1856,9 +1860,19 @@ mod tests {
 
         let result = normalize_status_value_with_warnings(&raw, &project.config);
 
-        for field in ["status", "round", "implementer", "reviewer", "mode", "timestamp"] {
+        for field in [
+            "status",
+            "round",
+            "implementer",
+            "reviewer",
+            "mode",
+            "timestamp",
+        ] {
             assert!(
-                result.warnings.iter().any(|w| w.contains(&format!("'{field}'"))),
+                result
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains(&format!("'{field}'"))),
                 "expected warning for field '{field}', got: {:?}",
                 result.warnings
             );
@@ -1873,7 +1887,10 @@ mod tests {
         let raw = json!({"status": "UNKNOWN_VALUE", "round": 1, "implementer": "a", "reviewer": "b", "mode": "single-agent", "timestamp": "t"});
         let result = normalize_status_value_with_warnings(&raw, &project.config);
         assert!(
-            result.warnings.iter().any(|w| w.contains("'status'") && w.contains("invalid")),
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("'status'") && w.contains("invalid")),
             "expected warning for unknown status, got: {:?}",
             result.warnings
         );
@@ -1882,7 +1899,10 @@ mod tests {
         let raw = json!({"status": "PENDING", "round": 1, "implementer": "a", "reviewer": "b", "mode": "triple-agent", "timestamp": "t"});
         let result = normalize_status_value_with_warnings(&raw, &project.config);
         assert!(
-            result.warnings.iter().any(|w| w.contains("'mode'") && w.contains("unsupported")),
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("'mode'") && w.contains("unsupported")),
             "expected warning for unsupported mode, got: {:?}",
             result.warnings
         );
@@ -1943,7 +1963,10 @@ mod tests {
         });
         let result = normalize_status_value_with_warnings(&raw, &project.config);
         assert!(
-            result.warnings.iter().any(|w| w.contains("'rating'") && w.contains("out of range")),
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("'rating'") && w.contains("out of range")),
             "expected out-of-range rating warning, got: {:?}",
             result.warnings
         );
@@ -2064,8 +2087,7 @@ mod tests {
             ],
         };
 
-        write_task_status(&status_file, &project.config)
-            .expect("write_task_status should succeed");
+        write_task_status(&status_file, &project.config).expect("write_task_status should succeed");
 
         let reloaded = read_task_status(&project.config);
         assert_eq!(reloaded, status_file);
@@ -2113,7 +2135,8 @@ mod tests {
     fn task_status_invalid_entry_types_recovers_with_warning() {
         let project = new_project();
         // "tasks" contains invalid entries (wrong type for status)
-        let invalid_json = r#"{"tasks": [{"title": "Task 1", "status": "INVALID_STATUS", "retries": 0}]}"#;
+        let invalid_json =
+            r#"{"tasks": [{"title": "Task 1", "status": "INVALID_STATUS", "retries": 0}]}"#;
         write_state_file("task_status.json", invalid_json, &project.config)
             .expect("invalid write should succeed");
 
@@ -2225,8 +2248,7 @@ mod tests {
             ],
         };
 
-        write_task_metrics(&metrics, &project.config)
-            .expect("write_task_metrics should succeed");
+        write_task_metrics(&metrics, &project.config).expect("write_task_metrics should succeed");
 
         let reloaded = read_task_metrics(&project.config);
         assert_eq!(reloaded, metrics);

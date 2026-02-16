@@ -312,7 +312,10 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
 
                 let now_ms = start.elapsed().as_millis() as u64;
                 let idle_ms = now_ms.saturating_sub(last_output_ms.load(Ordering::Relaxed));
-                if !timed_out && !interrupted && idle_ms > config.timeout_seconds.saturating_mul(1000) {
+                if !timed_out
+                    && !interrupted
+                    && idle_ms > config.timeout_seconds.saturating_mul(1000)
+                {
                     let _ = log(
                         &format!("⏱️ Idle timeout: no output for {}s", config.timeout_seconds),
                         config,
@@ -767,8 +770,7 @@ mod tests {
     fn append_response_block_truncates_output_exceeding_line_cap() {
         let project = new_project(5);
         // Ensure state dir exists for log file
-        std::fs::create_dir_all(&project.config.state_dir)
-            .expect("state dir should be created");
+        std::fs::create_dir_all(&project.config.state_dir).expect("state dir should be created");
 
         let lines: Vec<String> = (1..=600).map(|i| format!("line {i}")).collect();
         let output = lines.join("\n");
@@ -787,14 +789,16 @@ mod tests {
         );
         assert!(logs.contains("line 600"), "should keep last lines");
         assert!(logs.contains("line 101"), "should keep line 101");
-        assert!(!logs.contains("\nline 100\n"), "should not keep line 100 as a distinct line");
+        assert!(
+            !logs.contains("\nline 100\n"),
+            "should not keep line 100 as a distinct line"
+        );
     }
 
     #[test]
     fn append_response_block_does_not_truncate_output_within_cap() {
         let project = new_project(5);
-        std::fs::create_dir_all(&project.config.state_dir)
-            .expect("state dir should be created");
+        std::fs::create_dir_all(&project.config.state_dir).expect("state dir should be created");
 
         let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         let output = lines.join("\n");

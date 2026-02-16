@@ -50,7 +50,10 @@ fn status_with_corrupt_json_shows_warnings_and_recovery_hint() {
 
     let (stdout, stderr, code) = run_status(&project_dir);
 
-    assert_eq!(code, 0, "status command should exit 0 even with corrupt data");
+    assert_eq!(
+        code, 0,
+        "status command should exit 0 even with corrupt data"
+    );
 
     // stderr should contain the warning from read_status_with_warnings
     assert!(

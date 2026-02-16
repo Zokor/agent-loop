@@ -162,16 +162,10 @@ exit 0
 /// system directories so shell builtins like `cat`, `mkdir`, `echo` work.
 fn test_path(project_dir: &Path) -> String {
     let bin_dir = project_dir.join("bin");
-    format!(
-        "{}:/usr/bin:/bin:/usr/sbin:/sbin",
-        bin_dir.display()
-    )
+    format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin_dir.display())
 }
 
-fn run_tasks_cmd(
-    project_dir: &Path,
-    extra_args: &[&str],
-) -> std::process::Output {
+fn run_tasks_cmd(project_dir: &Path, extra_args: &[&str]) -> std::process::Output {
     std::process::Command::new(agent_loop_bin())
         .arg("run-tasks")
         .arg("--single-agent")
@@ -308,7 +302,10 @@ fn fail_fast_default_stops_on_first_failure() {
     let tasks = status["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks.len(), 2);
     assert_eq!(tasks[0]["status"], "failed", "Task 1 should be failed");
-    assert_eq!(tasks[1]["status"], "pending", "Task 2 should remain pending");
+    assert_eq!(
+        tasks[1]["status"], "pending",
+        "Task 2 should remain pending"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }
@@ -323,11 +320,7 @@ fn corrupt_task_status_json_treated_as_all_pending() {
     let project_dir = create_project_dir("corrupt_recovery");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Setup\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Setup\nContent\n");
 
     // Write corrupt task_status.json
     write_state_file(&project_dir, "task_status.json", "{corrupted json data!!!");
@@ -367,11 +360,7 @@ fn cli_rejects_conflicting_fail_flags() {
     let project_dir = create_project_dir("conflicting_flags");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Test\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Test\nContent\n");
 
     let output = std::process::Command::new(agent_loop_bin())
         .args([
@@ -456,7 +445,8 @@ fn skipped_tasks_are_reexecuted_on_subsequent_runs() {
     );
 
     // Pre-seed with a skipped task from a previous run
-    let status_json = r#"{"tasks":[{"title":"Task 1: Previously skipped","status":"skipped","retries":0}]}"#;
+    let status_json =
+        r#"{"tasks":[{"title":"Task 1: Previously skipped","status":"skipped","retries":0}]}"#;
     write_state_file(&project_dir, "task_status.json", status_json);
 
     let output = run_tasks_cmd(&project_dir, &[]);
@@ -473,7 +463,10 @@ fn skipped_tasks_are_reexecuted_on_subsequent_runs() {
     // Task should now be done
     let status = read_task_status(&project_dir);
     let tasks = status["tasks"].as_array().expect("tasks array");
-    assert_eq!(tasks[0]["status"], "done", "Previously skipped task should now be done");
+    assert_eq!(
+        tasks[0]["status"], "done",
+        "Previously skipped task should now be done"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }
@@ -488,11 +481,7 @@ fn failed_task_with_exhausted_retries_is_not_reexecuted() {
     let project_dir = create_project_dir("retry_exhausted");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Exhausted\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Exhausted\nContent\n");
 
     // Pre-seed: failed with retries=2, max_retries default is 2
     let status_json = r#"{"tasks":[{"title":"Task 1: Exhausted","status":"failed","retries":2,"last_error":"MAX_ROUNDS"}]}"#;
@@ -502,7 +491,10 @@ fn failed_task_with_exhausted_retries_is_not_reexecuted() {
     let output = run_tasks_cmd(&project_dir, &[]);
 
     // Should fail without re-executing the task
-    assert!(!output.status.success(), "should fail due to exhausted retries");
+    assert!(
+        !output.status.success(),
+        "should fail due to exhausted retries"
+    );
 
     // Task should remain failed (not re-executed to done)
     let status = read_task_status(&project_dir);
@@ -536,7 +528,10 @@ fn running_task_beyond_retry_boundary_fails_immediately() {
     let output = run_tasks_cmd(&project_dir, &[]);
 
     // Should fail without re-executing
-    assert!(!output.status.success(), "should fail due to exhausted retries");
+    assert!(
+        !output.status.success(),
+        "should fail due to exhausted retries"
+    );
 
     // Task should be marked failed
     let status = read_task_status(&project_dir);
@@ -590,7 +585,10 @@ fn running_task_at_retry_boundary_gets_final_attempt() {
     // Task should be done
     let status = read_task_status(&project_dir);
     let tasks = status["tasks"].as_array().expect("tasks array");
-    assert_eq!(tasks[0]["status"], "done", "Task should complete on final attempt");
+    assert_eq!(
+        tasks[0]["status"], "done",
+        "Task should complete on final attempt"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }
@@ -605,11 +603,7 @@ fn retry_history_resume_with_remaining_budget() {
     let project_dir = create_project_dir("retry_budget");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Resumable\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Resumable\nContent\n");
 
     // Pre-seed: running with retries=1, max_retries default is 2
     // Should still have budget remaining (1 < 2)
@@ -672,10 +666,7 @@ fn continue_on_fail_with_prefailed_task_skips_it() {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Should complete with failures (exit code 1 due to skipped failed task)
-    assert!(
-        !output.status.success(),
-        "should exit non-zero"
-    );
+    assert!(!output.status.success(), "should exit non-zero");
     assert!(
         stdout.contains("previously failed, skipping"),
         "should report skipping failed task: {stdout}"
@@ -684,7 +675,10 @@ fn continue_on_fail_with_prefailed_task_skips_it() {
     // Verify final state
     let status = read_task_status(&project_dir);
     let tasks = status["tasks"].as_array().expect("tasks array");
-    assert_eq!(tasks[0]["status"], "skipped", "Failed task should be skipped");
+    assert_eq!(
+        tasks[0]["status"], "skipped",
+        "Failed task should be skipped"
+    );
     assert_eq!(tasks[1]["status"], "done", "Task 2 should complete");
 
     let _ = fs::remove_dir_all(&project_dir);
@@ -734,7 +728,9 @@ fn task_status_json_schema_matches_contract() {
     let parsed: serde_json::Value = serde_json::from_str(&raw).expect("should be valid JSON");
 
     // Verify the schema contract
-    let tasks = parsed["tasks"].as_array().expect("tasks should be an array");
+    let tasks = parsed["tasks"]
+        .as_array()
+        .expect("tasks should be an array");
     assert_eq!(tasks.len(), 5);
 
     // Verify all valid status values are accepted
@@ -825,7 +821,9 @@ fn max_parallel_2_prints_warning_and_runs_sequentially() {
 
     // Should print the "not yet supported" warning
     assert!(
-        stderr.contains("Parallel task execution is not yet supported; running sequentially with max_parallel=1"),
+        stderr.contains(
+            "Parallel task execution is not yet supported; running sequentially with max_parallel=1"
+        ),
         "should warn about unsupported parallel execution: {stderr}"
     );
 
@@ -852,11 +850,7 @@ fn max_parallel_0_rejected_with_validation_error() {
     let project_dir = create_project_dir("max_parallel_0");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Test\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Test\nContent\n");
 
     let output = run_tasks_cmd(&project_dir, &["--max-parallel", "0"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -890,11 +884,8 @@ fn config_driven_max_parallel_prints_warning() {
     );
 
     // Write .agent-loop.toml with max_parallel = 4 (no CLI override)
-    fs::write(
-        project_dir.join(".agent-loop.toml"),
-        "max_parallel = 4\n",
-    )
-    .expect("should write config");
+    fs::write(project_dir.join(".agent-loop.toml"), "max_parallel = 4\n")
+        .expect("should write config");
 
     // Run without --max-parallel flag — config value should trigger warning
     let output = run_tasks_cmd(&project_dir, &[]);
@@ -908,7 +899,9 @@ fn config_driven_max_parallel_prints_warning() {
 
     // Should print the "not yet supported" warning from config value
     assert!(
-        stderr.contains("Parallel task execution is not yet supported; running sequentially with max_parallel=1"),
+        stderr.contains(
+            "Parallel task execution is not yet supported; running sequentially with max_parallel=1"
+        ),
         "should warn about unsupported parallel execution from config: {stderr}"
     );
 
@@ -1151,18 +1144,15 @@ fn skipped_or_unexecuted_tasks_show_na_and_no_timing() {
 
     // Task 2 was never executed — should have null timing
     assert!(
-        tasks[1].get("task_started_at").is_none()
-            || tasks[1]["task_started_at"].is_null(),
+        tasks[1].get("task_started_at").is_none() || tasks[1]["task_started_at"].is_null(),
         "unexecuted task should have null/missing task_started_at"
     );
     assert!(
-        tasks[1].get("task_ended_at").is_none()
-            || tasks[1]["task_ended_at"].is_null(),
+        tasks[1].get("task_ended_at").is_none() || tasks[1]["task_ended_at"].is_null(),
         "unexecuted task should have null/missing task_ended_at"
     );
     assert!(
-        tasks[1].get("duration_ms").is_none()
-            || tasks[1]["duration_ms"].is_null(),
+        tasks[1].get("duration_ms").is_none() || tasks[1]["duration_ms"].is_null(),
         "unexecuted task should have null/missing duration_ms"
     );
 
@@ -1217,11 +1207,7 @@ fn reexecuted_task_clears_stale_timing_from_previous_run() {
     let project_dir = create_project_dir("metrics_reexec");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(
-        &project_dir,
-        "tasks.md",
-        "### Task 1: Retried\nContent\n",
-    );
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Retried\nContent\n");
 
     // Pre-seed: task was previously failed with old timing data
     let status_json = r#"{"tasks":[{"title":"Task 1: Retried","status":"failed","retries":0,"last_error":"tests failing"}]}"#;

@@ -12,7 +12,9 @@ pub const DEFAULT_PLANNING_MAX_ROUNDS: u32 = 3;
 pub const DEFAULT_DECOMPOSITION_MAX_ROUNDS: u32 = 3;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const DEFAULT_DIFF_MAX_LINES: u32 = 500;
+#[allow(dead_code)]
 pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 200;
+#[allow(dead_code)]
 pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 
@@ -115,10 +117,12 @@ impl Config {
         self.diff_max_lines.unwrap_or(DEFAULT_DIFF_MAX_LINES)
     }
 
+    #[allow(dead_code)]
     pub fn effective_context_line_cap(&self) -> u32 {
         self.context_line_cap.unwrap_or(DEFAULT_CONTEXT_LINE_CAP)
     }
 
+    #[allow(dead_code)]
     pub fn effective_planning_context_excerpt_lines(&self) -> u32 {
         self.planning_context_excerpt_lines
             .unwrap_or(DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES)
