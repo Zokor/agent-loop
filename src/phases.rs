@@ -1534,6 +1534,23 @@ where
                         config,
                     );
                     let first_review = read_state_file_fn("review.md", config);
+
+                    // Write intermediate Reviewing status before adversarial call.
+                    // This prevents false consensus if the adversarial agent fails to
+                    // update status.json — the status stays Reviewing (not Approved),
+                    // so implementation_reviewer_decision returns NeedsChanges.
+                    write_status_fn(
+                        StatusPatch {
+                            status: Some(Status::Reviewing),
+                            round: Some(round),
+                            reason: Some(
+                                "Awaiting adversarial second review".to_string(),
+                            ),
+                            ..StatusPatch::default()
+                        },
+                        config,
+                    );
+
                     let adversarial_timestamp = timestamp_fn();
 
                     if let Err(err) = run_agent_fn(
@@ -4276,12 +4293,34 @@ CRITICAL INSTRUCTIONS:
             "adversarial prompt should contain the diff"
         );
 
+        // Intermediate Reviewing status should be written before adversarial call
+        assert!(
+            status_patches
+                .iter()
+                .any(|p| p.status == Some(Status::Reviewing)),
+            "should write intermediate Reviewing status before adversarial call"
+        );
+
         // Status patches should include Consensus with rating=5
         assert!(
             status_patches
                 .iter()
                 .any(|p| p.status == Some(Status::Consensus) && p.rating == Some(5)),
             "should write Consensus with rating=5"
+        );
+
+        // Reviewing must come before Consensus in the patch sequence
+        let reviewing_idx = status_patches
+            .iter()
+            .position(|p| p.status == Some(Status::Reviewing))
+            .unwrap();
+        let consensus_idx = status_patches
+            .iter()
+            .position(|p| p.status == Some(Status::Consensus))
+            .unwrap();
+        assert!(
+            reviewing_idx < consensus_idx,
+            "Reviewing patch should precede Consensus patch"
         );
 
         // Log should mention adversarial
@@ -4721,5 +4760,97 @@ CRITICAL INSTRUCTIONS:
         assert!(appended[2].2.contains("APPROVED (adversarial)"));
         assert_eq!(appended[3].1, "consensus");
         assert!(appended[3].2.contains("CONSENSUS (adversarial confirmed)"));
+    }
+
+    #[test]
+    fn dual_agent_5_5_adversarial_unchanged_status_prevents_false_consensus() {
+        // Regression test: if the adversarial agent does not write a new status,
+        // the intermediate Reviewing status prevents false consensus even when
+        // timestamps match (coarse clock edge case).
+        let config = test_config_with_rounds(false, 2);
+        let baseline_files = HashSet::new();
+        let mut logs = Vec::<String>::new();
+        let mut status_patches = Vec::<StatusPatch>::new();
+        let mut appended: Vec<(u32, String, String)> = Vec::new();
+        let state_files = HashMap::from([
+            ("task.md".to_string(), "Task body".to_string()),
+            ("plan.md".to_string(), "Plan body".to_string()),
+            ("review.md".to_string(), "First review body".to_string()),
+            ("changes.md".to_string(), "Changes body".to_string()),
+        ]);
+        // Round 1: reviewer APPROVED 5/5
+        // Then adversarial read returns Reviewing (agent didn't write — intermediate status
+        // persists) with matching timestamp (simulating coarse clock)
+        // Round 2: reviewer returns NeedsChanges → max rounds
+        let mut read_statuses = VecDeque::from([
+            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
+            // Adversarial agent didn't update status; intermediate Reviewing persists.
+            // Timestamp matches TEST_TIMESTAMP (coarse clock), so stale check doesn't fire.
+            LoopStatus {
+                status: Status::Reviewing,
+                round: 1,
+                implementer: config.implementer.to_string(),
+                reviewer: config.reviewer.to_string(),
+                mode: config.run_mode.to_string(),
+                last_run_task: "Implement task".to_string(),
+                reason: Some("Awaiting adversarial second review".to_string()),
+                rating: None,
+                timestamp: TEST_TIMESTAMP.to_string(),
+            },
+            test_loop_status(Status::NeedsChanges, 2, Some("still failing"), &config),
+        ]);
+
+        let result = implementation_loop_internal(
+            &config,
+            &baseline_files,
+            |_, _, _| Ok(()),
+            |_, _, _| {},
+            |message, _| logs.push(message.to_string()),
+            |patch, _| status_patches.push(patch),
+            |name, _| state_files.get(name).cloned().unwrap_or_default(),
+            |_| {
+                read_statuses
+                    .pop_front()
+                    .expect("test should provide enough status reads")
+            },
+            |_, _| "(test diff)".to_string(),
+            || TEST_TIMESTAMP.to_string(),
+            |_, _| String::new(),
+            |round, phase, summary, _| {
+                appended.push((round, phase.to_string(), summary.to_string()));
+            },
+            false,
+        );
+
+        assert!(!result, "should NOT reach consensus when adversarial agent didn't write status");
+
+        // Should NOT have Consensus in status patches
+        assert!(
+            !status_patches
+                .iter()
+                .any(|p| p.status == Some(Status::Consensus)),
+            "should not write Consensus when adversarial agent didn't update status"
+        );
+
+        // Should have intermediate Reviewing patch
+        assert!(
+            status_patches
+                .iter()
+                .any(|p| p.status == Some(Status::Reviewing)),
+            "should write intermediate Reviewing status"
+        );
+
+        // Adversarial review history should show unexpected status, not APPROVED
+        let adversarial_entry = appended
+            .iter()
+            .find(|(_, phase, _)| phase == "adversarial-review");
+        assert!(
+            adversarial_entry.is_some(),
+            "should have adversarial-review history entry"
+        );
+        assert!(
+            !adversarial_entry.unwrap().2.contains("APPROVED (adversarial)"),
+            "adversarial history should NOT show APPROVED when agent didn't write status"
+        );
     }
 }
