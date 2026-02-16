@@ -1379,3 +1379,110 @@ fn failed_task_reexecution_gets_consistent_fresh_timing() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Test: Duplicate titles preserve per-occurrence status during run-tasks
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn duplicate_titles_reconcile_by_position_not_first_match() {
+    let project_dir = create_project_dir("dup_titles_positional");
+    create_succeeding_agents(&project_dir);
+
+    // Two tasks with identical titles
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Build\nFirst occurrence\n\n### Task 1: Build\nSecond occurrence\n",
+    );
+
+    // Pre-seed: first occurrence is done, second is pending.
+    // With positional matching, only the second occurrence should run.
+    let status_json = r#"{
+  "tasks": [
+    { "title": "Task 1: Build", "status": "done", "retries": 0 },
+    { "title": "Task 1: Build", "status": "pending", "retries": 0 }
+  ]
+}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // First occurrence should be skipped as already done
+    assert!(
+        stdout.contains("already done, skipping"),
+        "first occurrence should be skipped: {stdout}"
+    );
+
+    // Verify final task_status.json: both should be done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(
+        tasks[0]["status"], "done",
+        "first occurrence should remain done"
+    );
+    assert_eq!(
+        tasks[1]["status"], "done",
+        "second occurrence should now be done"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Duplicate titles — done+pending are NOT both skipped (regression)
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn duplicate_titles_pending_occurrence_is_not_skipped_as_done() {
+    let project_dir = create_project_dir("dup_titles_no_skip");
+    create_succeeding_agents(&project_dir);
+
+    // Three tasks with the same title: done, pending, pending
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task X: Work\nFirst\n\n### Task X: Work\nSecond\n\n### Task X: Work\nThird\n",
+    );
+
+    // Pre-seed positional statuses
+    let status_json = r#"{
+  "tasks": [
+    { "title": "Task X: Work", "status": "done", "retries": 0 },
+    { "title": "Task X: Work", "status": "pending", "retries": 0 },
+    { "title": "Task X: Work", "status": "pending", "retries": 0 }
+  ]
+}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should succeed: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify all three ended up as done
+    let status = read_task_status(&project_dir);
+    let tasks = status["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[0]["status"], "done", "first stays done");
+    assert_eq!(tasks[1]["status"], "done", "second should run and complete");
+    assert_eq!(tasks[2]["status"], "done", "third should run and complete");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
