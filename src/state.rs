@@ -168,76 +168,234 @@ pub fn default_status(config: &Config) -> LoopStatus {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct StatusReadResult {
+    pub status: LoopStatus,
+    pub warnings: Vec<String>,
+}
+
+#[allow(dead_code)]
 pub fn normalize_status_value(raw: &Value, config: &Config) -> LoopStatus {
+    normalize_status_value_with_warnings(raw, config).status
+}
+
+pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> StatusReadResult {
     let fallback = default_status(config);
+    let mut warnings = Vec::new();
+
     let Some(map) = raw.as_object() else {
-        return fallback;
+        warnings.push("root is not a JSON object; using defaults".to_string());
+        return StatusReadResult {
+            status: fallback,
+            warnings,
+        };
     };
 
-    let status = map
-        .get("status")
-        .and_then(|v| serde_json::from_value::<Status>(v.clone()).ok())
-        .unwrap_or(fallback.status);
+    // --- status ---
+    let status = match map.get("status") {
+        Some(v) => match serde_json::from_value::<Status>(v.clone()) {
+            Ok(s) => s,
+            Err(_) => {
+                warnings.push(format!(
+                    "field 'status': invalid value {}; falling back to {}",
+                    v, fallback.status
+                ));
+                fallback.status
+            }
+        },
+        None => {
+            warnings.push(format!(
+                "field 'status': missing; falling back to {}",
+                fallback.status
+            ));
+            fallback.status
+        }
+    };
 
+    // --- round ---
     let round = match map.get("round") {
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .unwrap_or(fallback.round),
-        _ => fallback.round,
+        Some(Value::Number(value)) => match value.as_u64().and_then(|v| u32::try_from(v).ok()) {
+            Some(r) => r,
+            None => {
+                warnings.push(format!(
+                    "field 'round': invalid number {}; falling back to {}",
+                    value, fallback.round
+                ));
+                fallback.round
+            }
+        },
+        Some(other) => {
+            warnings.push(format!(
+                "field 'round': expected number, got {}; falling back to {}",
+                other, fallback.round
+            ));
+            fallback.round
+        }
+        None => {
+            warnings.push(format!(
+                "field 'round': missing; falling back to {}",
+                fallback.round
+            ));
+            fallback.round
+        }
     };
 
-    let implementer = map
-        .get("implementer")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.implementer.clone());
+    // --- implementer ---
+    let implementer = match map.get("implementer") {
+        Some(v) => match v.as_str() {
+            Some(s) => s.to_owned(),
+            None => {
+                warnings.push(format!(
+                    "field 'implementer': expected string, got {}; falling back to '{}'",
+                    v, fallback.implementer
+                ));
+                fallback.implementer.clone()
+            }
+        },
+        None => {
+            warnings.push(format!(
+                "field 'implementer': missing; falling back to '{}'",
+                fallback.implementer
+            ));
+            fallback.implementer.clone()
+        }
+    };
 
-    let reviewer = map
-        .get("reviewer")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.reviewer.clone());
+    // --- reviewer ---
+    let reviewer = match map.get("reviewer") {
+        Some(v) => match v.as_str() {
+            Some(s) => s.to_owned(),
+            None => {
+                warnings.push(format!(
+                    "field 'reviewer': expected string, got {}; falling back to '{}'",
+                    v, fallback.reviewer
+                ));
+                fallback.reviewer.clone()
+            }
+        },
+        None => {
+            warnings.push(format!(
+                "field 'reviewer': missing; falling back to '{}'",
+                fallback.reviewer
+            ));
+            fallback.reviewer.clone()
+        }
+    };
 
-    let mode = map
-        .get("mode")
-        .and_then(Value::as_str)
-        .filter(|value| matches!(*value, "single-agent" | "dual-agent"))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.mode.clone());
+    // --- mode ---
+    let mode = match map.get("mode") {
+        Some(v) => match v.as_str() {
+            Some(s) if matches!(s, "single-agent" | "dual-agent") => s.to_owned(),
+            Some(s) => {
+                warnings.push(format!(
+                    "field 'mode': unsupported value '{}'; falling back to '{}'",
+                    s, fallback.mode
+                ));
+                fallback.mode.clone()
+            }
+            None => {
+                warnings.push(format!(
+                    "field 'mode': expected string, got {}; falling back to '{}'",
+                    v, fallback.mode
+                ));
+                fallback.mode.clone()
+            }
+        },
+        None => {
+            warnings.push(format!(
+                "field 'mode': missing; falling back to '{}'",
+                fallback.mode
+            ));
+            fallback.mode.clone()
+        }
+    };
 
-    let last_run_task =
-        resolve_last_run_task(map.get("lastRunTask").and_then(Value::as_str), config);
+    // --- timestamp ---
+    let status_timestamp = match map.get("timestamp") {
+        Some(v) => match v.as_str() {
+            Some(s) => s.to_owned(),
+            None => {
+                warnings.push(format!(
+                    "field 'timestamp': expected string, got {}; falling back to current time",
+                    v
+                ));
+                fallback.timestamp.clone()
+            }
+        },
+        None => {
+            warnings.push(
+                "field 'timestamp': missing; falling back to current time".to_string(),
+            );
+            fallback.timestamp.clone()
+        }
+    };
 
-    let reason = map
-        .get("reason")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    // --- lastRunTask (optional — warn only when present but invalid) ---
+    let last_run_task = {
+        let raw_value = map.get("lastRunTask");
+        match raw_value {
+            Some(v) if !v.is_string() && !v.is_null() => {
+                warnings.push(format!(
+                    "field 'lastRunTask': expected string, got {}; ignoring",
+                    v
+                ));
+                resolve_last_run_task(None, config)
+            }
+            _ => resolve_last_run_task(raw_value.and_then(Value::as_str), config),
+        }
+    };
 
+    // --- reason (optional — warn only when present but invalid) ---
+    let reason = match map.get("reason") {
+        Some(v) if !v.is_string() && !v.is_null() => {
+            warnings.push(format!(
+                "field 'reason': expected string, got {}; ignoring",
+                v
+            ));
+            None
+        }
+        Some(v) => v.as_str().map(ToOwned::to_owned),
+        None => None,
+    };
+
+    // --- rating (optional — warn only when present but invalid) ---
     let rating = match map.get("rating") {
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .and_then(|v| u32::try_from(v).ok())
-            .filter(|v| (1..=5).contains(v)),
+        Some(Value::Number(value)) => {
+            match value.as_u64().and_then(|v| u32::try_from(v).ok()).filter(|v| (1..=5).contains(v))
+            {
+                Some(r) => Some(r),
+                None => {
+                    warnings.push(format!(
+                        "field 'rating': value {} out of range 1..=5; ignoring",
+                        value
+                    ));
+                    None
+                }
+            }
+        }
+        Some(v) if !v.is_null() => {
+            warnings.push(format!(
+                "field 'rating': expected number, got {}; ignoring",
+                v
+            ));
+            None
+        }
         _ => None,
     };
 
-    let status_timestamp = map
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| fallback.timestamp.clone());
-
-    LoopStatus {
-        status,
-        round,
-        implementer,
-        reviewer,
-        mode,
-        last_run_task,
-        reason,
-        rating,
-        timestamp: status_timestamp,
+    StatusReadResult {
+        status: LoopStatus {
+            status,
+            round,
+            implementer,
+            reviewer,
+            mode,
+            last_run_task,
+            reason,
+            rating,
+            timestamp: status_timestamp,
+        },
+        warnings,
     }
 }
 
@@ -302,22 +460,38 @@ pub fn is_status_stale(expected_ts: &str, status: &LoopStatus) -> bool {
     status.timestamp != expected_ts
 }
 
-pub fn read_status(config: &Config) -> LoopStatus {
+pub fn read_status_with_warnings(config: &Config) -> StatusReadResult {
     let raw = read_state_file("status.json", config);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return default_status(config);
+        return StatusReadResult {
+            status: default_status(config),
+            warnings: Vec::new(),
+        };
     }
 
-    match serde_json::from_str::<Value>(trimmed) {
-        Ok(value) => normalize_status_value(&value, config),
+    let result = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => normalize_status_value_with_warnings(&value, config),
         Err(err) => {
             let mut fallback = default_status(config);
             fallback.status = Status::Error;
             fallback.reason = Some(format!("Invalid status.json: {err}"));
-            fallback
+            StatusReadResult {
+                status: fallback,
+                warnings: vec![format!("invalid JSON: {err}")],
+            }
         }
+    };
+
+    for warning in &result.warnings {
+        eprintln!("\u{26a0} status.json: {warning}");
     }
+
+    result
+}
+
+pub fn read_status(config: &Config) -> LoopStatus {
+    read_status_with_warnings(config).status
 }
 
 pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatus> {
@@ -1434,5 +1608,214 @@ mod tests {
             result, content,
             "file within limit should not be modified"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // StatusReadResult / read_status_with_warnings tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn warnings_invalid_json_produces_error_status_and_parse_warning() {
+        let project = new_project();
+        write_state_file("status.json", "{broken", &project.config)
+            .expect("write should succeed");
+
+        let result = read_status_with_warnings(&project.config);
+        assert_eq!(result.status.status, Status::Error);
+        assert!(
+            result.status.reason.as_deref().unwrap().starts_with("Invalid status.json:"),
+            "reason should contain parse error"
+        );
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].starts_with("invalid JSON:"),
+            "warning should mention invalid JSON, got: {}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn warnings_non_object_root_produces_warning() {
+        let project = new_project();
+        let raw = json!("just a string");
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+
+        assert_eq!(result.status.status, Status::Pending);
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("not a JSON object"),
+            "warning should mention non-object root, got: {}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn warnings_missing_required_fields_produces_per_field_warnings() {
+        let project = new_project();
+        let raw = json!({});
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+
+        // Should produce warnings for: status, round, implementer, reviewer, mode, timestamp
+        let required_fields = ["status", "round", "implementer", "reviewer", "mode", "timestamp"];
+        for field in required_fields {
+            assert!(
+                result.warnings.iter().any(|w| w.contains(&format!("'{field}'")) && w.contains("missing")),
+                "expected missing warning for field '{field}', got: {:?}",
+                result.warnings
+            );
+        }
+        assert_eq!(
+            result.warnings.len(),
+            required_fields.len(),
+            "exactly one warning per missing required field"
+        );
+    }
+
+    #[test]
+    fn warnings_wrong_types_produces_per_field_warnings() {
+        let project = new_project();
+        let raw = json!({
+            "status": 42,
+            "round": "not-a-number",
+            "implementer": false,
+            "reviewer": [],
+            "mode": 99,
+            "timestamp": 12345
+        });
+
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+
+        for field in ["status", "round", "implementer", "reviewer", "mode", "timestamp"] {
+            assert!(
+                result.warnings.iter().any(|w| w.contains(&format!("'{field}'"))),
+                "expected warning for field '{field}', got: {:?}",
+                result.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn warnings_invalid_values_produces_specific_warnings() {
+        let project = new_project();
+
+        // Unknown status enum
+        let raw = json!({"status": "UNKNOWN_VALUE", "round": 1, "implementer": "a", "reviewer": "b", "mode": "single-agent", "timestamp": "t"});
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'status'") && w.contains("invalid")),
+            "expected warning for unknown status, got: {:?}",
+            result.warnings
+        );
+
+        // Unsupported mode
+        let raw = json!({"status": "PENDING", "round": 1, "implementer": "a", "reviewer": "b", "mode": "triple-agent", "timestamp": "t"});
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'mode'") && w.contains("unsupported")),
+            "expected warning for unsupported mode, got: {:?}",
+            result.warnings
+        );
+
+        // Negative round
+        let raw = json!({"status": "PENDING", "round": -5, "implementer": "a", "reviewer": "b", "mode": "single-agent", "timestamp": "t"});
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'round'")),
+            "expected warning for negative round, got: {:?}",
+            result.warnings
+        );
+
+        // Float round
+        let raw = json!({"status": "PENDING", "round": 1.5, "implementer": "a", "reviewer": "b", "mode": "single-agent", "timestamp": "t"});
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'round'")),
+            "expected warning for float round, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn warnings_valid_status_file_produces_no_warnings() {
+        let project = new_project();
+        let raw = json!({
+            "status": "REVIEWING",
+            "round": 3,
+            "implementer": "claude",
+            "reviewer": "codex",
+            "mode": "dual-agent",
+            "lastRunTask": "build feature",
+            "reason": "all good",
+            "rating": 4,
+            "timestamp": "2026-02-14T00:00:00.000Z"
+        });
+
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.is_empty(),
+            "valid status should produce no warnings, got: {:?}",
+            result.warnings
+        );
+        assert_eq!(result.status.status, Status::Reviewing);
+        assert_eq!(result.status.round, 3);
+    }
+
+    #[test]
+    fn warnings_optional_fields_only_warn_when_present_but_invalid() {
+        let project = new_project();
+
+        // rating out of range
+        let raw = json!({
+            "status": "PENDING", "round": 0, "implementer": "a",
+            "reviewer": "b", "mode": "dual-agent", "timestamp": "t",
+            "rating": 10
+        });
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'rating'") && w.contains("out of range")),
+            "expected out-of-range rating warning, got: {:?}",
+            result.warnings
+        );
+
+        // reason wrong type
+        let raw = json!({
+            "status": "PENDING", "round": 0, "implementer": "a",
+            "reviewer": "b", "mode": "dual-agent", "timestamp": "t",
+            "reason": 42
+        });
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'reason'")),
+            "expected reason type warning, got: {:?}",
+            result.warnings
+        );
+
+        // lastRunTask wrong type
+        let raw = json!({
+            "status": "PENDING", "round": 0, "implementer": "a",
+            "reviewer": "b", "mode": "dual-agent", "timestamp": "t",
+            "lastRunTask": false
+        });
+        let result = normalize_status_value_with_warnings(&raw, &project.config);
+        assert!(
+            result.warnings.iter().any(|w| w.contains("'lastRunTask'")),
+            "expected lastRunTask type warning, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn warnings_empty_file_produces_no_warnings() {
+        let project = new_project();
+        // Don't write status.json at all (missing file)
+        let result = read_status_with_warnings(&project.config);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.status.status, Status::Pending);
+
+        // Write empty content
+        write_state_file("status.json", "  ", &project.config).expect("write should succeed");
+        let result = read_status_with_warnings(&project.config);
+        assert!(result.warnings.is_empty());
+        assert_eq!(result.status.status, Status::Pending);
     }
 }
