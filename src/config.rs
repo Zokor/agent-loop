@@ -196,11 +196,13 @@ impl Config {
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
-        // --- planning_only: CLI > TOML > default ---
+        // --- planning_only: CLI > env > TOML > default ---
         let planning_only = if planning_only_flag {
             true
         } else {
-            file.planning_only.unwrap_or(false)
+            env_bool("PLANNING_ONLY")
+                .or(file.planning_only)
+                .unwrap_or(false)
         };
 
         let config = Self {
@@ -415,6 +417,7 @@ mod tests {
             "CONTEXT_LINE_CAP",
             "PLANNING_CONTEXT_EXCERPT_LINES",
             "VERBOSE",
+            "PLANNING_ONLY",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
             unsafe {
@@ -887,6 +890,66 @@ auto_test_cmd = "make test"
         let dir = create_temp_project_root("cfg_cli_planning");
         write_toml(&dir, "planning_only = false\n");
 
+        let config =
+            Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
+        assert!(config.planning_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // planning_only env var precedence
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn env_enables_planning_only_without_toml() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_ONLY", "1");
+
+        let dir = create_temp_project_root("cfg_env_planning_only");
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        assert!(config.planning_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_overrides_toml_for_planning_only() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_ONLY", "1");
+
+        let dir = create_temp_project_root("cfg_env_over_toml_po");
+        write_toml(&dir, "planning_only = false\n");
+
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        assert!(config.planning_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_false_overrides_toml_true_for_planning_only() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_ONLY", "0");
+
+        let dir = create_temp_project_root("cfg_env_false_po");
+        write_toml(&dir, "planning_only = true\n");
+
+        let config =
+            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+        assert!(!config.planning_only);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_overrides_env_for_planning_only() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_ONLY", "0");
+
+        let dir = create_temp_project_root("cfg_cli_over_env_po");
         let config =
             Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
         assert!(config.planning_only);
