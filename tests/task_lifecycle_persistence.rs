@@ -1206,3 +1206,178 @@ fn init_command_resets_task_metrics_json() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+// ---------------------------------------------------------------------------
+// Test: Re-execution with pre-existing metrics clears stale timing
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn reexecuted_task_clears_stale_timing_from_previous_run() {
+    let project_dir = create_project_dir("metrics_reexec");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Retried\nContent\n",
+    );
+
+    // Pre-seed: task was previously failed with old timing data
+    let status_json = r#"{"tasks":[{"title":"Task 1: Retried","status":"failed","retries":0,"last_error":"tests failing"}]}"#;
+    write_state_file(&project_dir, "task_status.json", status_json);
+
+    let old_metrics = r#"{"tasks":[{"title":"Task 1: Retried","task_started_at":"2026-01-01T00:00:00.000Z","task_ended_at":"2026-01-01T00:05:00.000Z","duration_ms":300000}]}"#;
+    write_state_file(&project_dir, "task_metrics.json", old_metrics);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "should succeed on retry: stdout={}, stderr={}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Verify metrics were refreshed — task_started_at should NOT be the old value
+    let metrics = read_task_metrics(&project_dir);
+    let tasks = metrics["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1);
+
+    let started = tasks[0]["task_started_at"]
+        .as_str()
+        .expect("should have task_started_at");
+    assert_ne!(
+        started, "2026-01-01T00:00:00.000Z",
+        "task_started_at should be refreshed, not the old stale value"
+    );
+
+    let ended = tasks[0]["task_ended_at"]
+        .as_str()
+        .expect("should have task_ended_at");
+    assert_ne!(
+        ended, "2026-01-01T00:05:00.000Z",
+        "task_ended_at should be refreshed, not the old stale value"
+    );
+
+    // duration_ms should be present and a valid number
+    assert!(
+        tasks[0]["duration_ms"].as_u64().is_some(),
+        "should have numeric duration_ms"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Non-executed task with old metrics preserves timing from reconciliation
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn skipped_task_with_old_metrics_preserves_reconciled_timing() {
+    let project_dir = create_project_dir("metrics_skip_old");
+    create_failing_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Failing\nThis will fail\n\n### Task 2: Skipped\nNever reached\n",
+    );
+
+    // Pre-seed metrics for Task 2 with old timing (from a previous run that
+    // completed it, but the task list has since been re-initialized)
+    let old_metrics = r#"{"tasks":[
+        {"title":"Task 1: Failing"},
+        {"title":"Task 2: Skipped","task_started_at":"2026-01-01T00:00:00.000Z","task_ended_at":"2026-01-01T00:05:00.000Z","duration_ms":300000}
+    ]}"#;
+    write_state_file(&project_dir, "task_metrics.json", old_metrics);
+
+    let output = run_tasks_cmd(&project_dir, &[]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Should fail (fail-fast on task 1)
+    assert!(!output.status.success(), "should exit non-zero");
+
+    // Verify summary header is present
+    assert!(
+        stdout.contains("Task Durations:"),
+        "should contain summary header: {stdout}"
+    );
+
+    let metrics = read_task_metrics(&project_dir);
+    let tasks = metrics["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 2);
+
+    // Task 1 was executed and should have fresh timing from this run
+    assert!(
+        tasks[0]["task_started_at"].is_string(),
+        "executed failing task should have task_started_at"
+    );
+
+    // Task 2 preserves old reconciled timing (since it wasn't re-executed,
+    // its old timing stays from reconciliation)
+    assert!(
+        tasks[1]["task_started_at"].is_string(),
+        "Task 2 should preserve reconciled timing"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: Failed task on re-execution gets fresh timing, not stale + new mixed
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn failed_task_reexecution_gets_consistent_fresh_timing() {
+    let project_dir = create_project_dir("metrics_fail_reexec");
+    create_failing_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Always fails\nContent\n",
+    );
+
+    // Pre-seed: task was previously run and has old timing
+    let old_metrics = r#"{"tasks":[{"title":"Task 1: Always fails","task_started_at":"2026-01-01T00:00:00.000Z","task_ended_at":"2026-01-01T00:05:00.000Z","duration_ms":300000}]}"#;
+    write_state_file(&project_dir, "task_metrics.json", old_metrics);
+
+    // No pre-seeded task_status, so it starts fresh (pending)
+    let output = run_tasks_cmd(&project_dir, &[]);
+
+    // Should fail
+    assert!(!output.status.success(), "should exit non-zero");
+
+    // Verify timing was refreshed — task_started_at should be newer than the old value
+    let metrics = read_task_metrics(&project_dir);
+    let tasks = metrics["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1);
+
+    let started = tasks[0]["task_started_at"]
+        .as_str()
+        .expect("should have task_started_at");
+    assert_ne!(
+        started, "2026-01-01T00:00:00.000Z",
+        "task_started_at should be refreshed on re-execution"
+    );
+
+    let ended = tasks[0]["task_ended_at"]
+        .as_str()
+        .expect("should have task_ended_at after failure");
+    assert_ne!(
+        ended, "2026-01-01T00:05:00.000Z",
+        "task_ended_at should be refreshed on re-execution"
+    );
+
+    // duration_ms should be present (the task ran and failed)
+    assert!(
+        tasks[0]["duration_ms"].as_u64().is_some(),
+        "should have numeric duration_ms after failed execution"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
