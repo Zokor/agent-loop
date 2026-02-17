@@ -148,7 +148,7 @@ Options:
 
 Settings are resolved in this order (highest precedence first):
 
-1. **CLI flags** (`--single-agent`, `--planning-only`)
+1. **CLI flags** (`--single-agent`) and **subcommands** (`plan`, `resume`, `tasks`)
 2. **Environment variables**
 3. **`.agent-loop.toml`** (per-project config file in the project root)
 4. **Built-in defaults**
