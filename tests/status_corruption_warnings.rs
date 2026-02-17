@@ -248,6 +248,10 @@ fn status_with_valid_active_status_shows_no_warnings_or_hints() {
         "active status should not show resume hint, got:\n{stdout}"
     );
     assert!(
+        !stdout.contains("--resume"),
+        "active status should not show deprecated --resume hint, got:\n{stdout}"
+    );
+    assert!(
         !stderr.contains("\u{26a0}"),
         "valid status should produce no stderr warnings, got:\n{stderr}"
     );
@@ -354,6 +358,10 @@ fn status_with_non_stale_reason_on_non_terminal_status_shows_no_hints() {
     assert!(
         !stdout.contains("agent-loop resume"),
         "non-stale non-terminal status should not show resume hint, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("--resume"),
+        "non-stale non-terminal status should not show deprecated --resume hint, got:\n{stdout}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);
