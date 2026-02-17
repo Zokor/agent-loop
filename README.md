@@ -23,31 +23,45 @@ codex --version     # OpenAI Codex CLI (only needed for dual-agent mode)
 
 ## Commands
 
+### Primary subcommands
+
 ```
-agent-loop run <task>                Run the loop on a task
-agent-loop run --file <path>         Read task from a file
-agent-loop run --single-agent        Use the same agent for both roles
 agent-loop plan <task>               Plan and decompose only, no implementation
 agent-loop plan --file <path>        Plan from a file
 agent-loop resume                    Continue from existing .agent-loop/state without re-init
 agent-loop tasks                     Execute all tasks from .agent-loop/state/tasks.md
 agent-loop tasks --file <path>       Execute tasks from a custom file
+```
+
+### Run
+
+```
+agent-loop run <task>                Run the loop on a task
+agent-loop run --file <path>         Read task from a file
+agent-loop run --single-agent        Use the same agent for both roles
+```
+
+`agent-loop "task"` also works (shorthand for `agent-loop run "task"`).
+
+### Utility
+
+```
 agent-loop init                      Create .agent-loop/state/ in current directory
 agent-loop status                    Show current loop status
 agent-loop help                      Print usage
 ```
 
-`agent-loop "task"` also works (shorthand for `agent-loop run "task"`).
-
 ### Deprecated forms (still supported)
 
-The following forms continue to work but emit deprecation warnings:
+The following command forms continue to work but emit deprecation warnings.
+Use the new forms above instead — the old ones may be removed in a future release.
 
-```
-agent-loop run --planning-only       → use 'agent-loop plan' instead
-agent-loop run --resume              → use 'agent-loop resume' instead
-agent-loop run-tasks                 → use 'agent-loop tasks' instead
-```
+| Old form | Replacement |
+| --- | --- |
+| `agent-loop run --planning-only` | `agent-loop plan` |
+| `agent-loop run --resume` | `agent-loop resume` |
+| `agent-loop run-tasks` | `agent-loop tasks` |
+| `agent-loop tasks --tasks-file <path>` | `agent-loop tasks --file <path>` |
 
 ## How It Works
 
@@ -78,7 +92,21 @@ Review Plan → Refine Plan → Consensus → Decompose Tasks → Stop
 ## Examples
 
 ```bash
-# Simple task
+# Plan first, then execute — the recommended workflow
+agent-loop plan --file PLAN.md
+agent-loop tasks
+
+# Resume an interrupted loop
+agent-loop resume
+
+# Resume with higher round limits
+DECOMPOSITION_MAX_ROUNDS=6 agent-loop resume
+
+# Run tasks from a custom file with retry options
+agent-loop tasks --file my-tasks.md
+agent-loop tasks --max-retries 4 --round-step 3
+
+# Simple implementation task
 agent-loop run "Add user authentication with JWT tokens"
 
 # Task from file
@@ -93,40 +121,23 @@ IMPLEMENTER=codex agent-loop run "Build a REST API"
 # Single-agent mode
 agent-loop run --single-agent "Fix the pagination bug"
 
-# Planning-only: decompose a large plan into tasks
-agent-loop plan --file PLAN.md
-
-# Resume an interrupted loop
-agent-loop resume
-
-# Resume with higher round limits
-DECOMPOSITION_MAX_ROUNDS=6 agent-loop resume
-
-# Run all generated tasks autonomously (resets rounds per task)
-agent-loop tasks
-
-# Run all tasks with more retries for MAX_ROUNDS cases
-agent-loop tasks --max-retries 4 --round-step 3
-
-# Run tasks from a custom file
-agent-loop tasks --file my-tasks.md
-
-# Then implement each task one by one
+# Implement tasks one by one
 agent-loop run "Task 1: Foundation setup"
 agent-loop run "Task 2: Database schema"
 ```
 
 ## Autonomous Task Runner
 
-After planning mode generates `.agent-loop/state/tasks.md`, execute all tasks in sequence:
+After `agent-loop plan` generates `.agent-loop/state/tasks.md`, execute all tasks in sequence:
 
 ```bash
 agent-loop tasks
+agent-loop tasks --file custom-tasks.md   # or use a custom file
 ```
 
 Behavior:
 
-- Parses headings like `### Task 1: ...` from `tasks.md`
+- Parses headings like `### Task 1: ...` from the tasks file
 - Runs each task with `agent-loop run "Task N: ..."` (fresh run, so rounds reset per task)
 - If a task stops with `status: MAX_ROUNDS`, retries with `agent-loop resume`
 - If a task stops with timeout `status: ERROR` (for example, "timed out after ..."), retries with `agent-loop resume`
@@ -134,15 +145,19 @@ Behavior:
 
 Options:
 
-- `--file <path>`: use a custom tasks markdown file
-- `--max-retries <n>`: retry count for retryable failures (`MAX_ROUNDS` and timeout `ERROR`) (default `2`)
-- `--round-step <n>`: amount added to `MAX_ROUNDS` on each retry (default `2`)
-- `--single-agent`: run each task in single-agent mode
-- `--continue-on-fail`: continue with remaining tasks even if one fails
-- `--fail-fast`: stop immediately on first task failure
-- `--max-parallel <n>`: limit concurrent task execution
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--file <path>` | `.agent-loop/state/tasks.md` | Custom tasks markdown file |
+| `--max-retries <n>` | `2` | Retry count for retryable failures (`MAX_ROUNDS` and timeout `ERROR`) |
+| `--round-step <n>` | `2` | Amount added to `MAX_ROUNDS` on each retry |
+| `--single-agent` | off | Run each task in single-agent mode |
+| `--continue-on-fail` | off | Continue with remaining tasks even if one fails |
+| `--fail-fast` | off | Stop immediately on first task failure |
+| `--max-parallel <n>` | `1` | Limit concurrent task execution |
 
-> **Note:** `--tasks-file` is deprecated in favor of `--file`.
+> **Deprecation:** The old `agent-loop run-tasks` subcommand and the `--tasks-file` flag are
+> deprecated. Use `agent-loop tasks` with `--file` instead. The old forms still work but emit
+> warnings and may be removed in a future release.
 
 ## Configuration
 
