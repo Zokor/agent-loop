@@ -153,7 +153,7 @@ Options:
 | `--single-agent` | off | Run each task in single-agent mode |
 | `--continue-on-fail` | off | Continue with remaining tasks even if one fails |
 | `--fail-fast` | off | Stop immediately on first task failure |
-| `--max-parallel <n>` | `1` | Limit concurrent task execution |
+| `--max-parallel <n>` | `1` | Reserved for future parallel execution (values >1 are accepted but currently downgraded to sequential with a warning) |
 
 > **Deprecation:** The old `agent-loop run-tasks` subcommand and the `--tasks-file` flag are
 > deprecated. Use `agent-loop tasks` with `--file` instead. The old forms still work but emit
