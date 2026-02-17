@@ -312,7 +312,7 @@ pub fn is_truthy(value: Option<&str>) -> bool {
     value.is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
-fn is_falsy(value: &str) -> bool {
+pub fn is_falsy(value: &str) -> bool {
     matches!(
         value.to_ascii_lowercase().as_str(),
         "0" | "false" | "no" | "off"
