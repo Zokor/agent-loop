@@ -26,16 +26,28 @@ codex --version     # OpenAI Codex CLI (only needed for dual-agent mode)
 ```
 agent-loop run <task>                Run the loop on a task
 agent-loop run --file <path>         Read task from a file
-agent-loop run --planning-only       Plan and decompose only, no implementation
-agent-loop run --resume              Continue from existing .agent-loop/state without re-init
 agent-loop run --single-agent        Use the same agent for both roles
-agent-loop run-tasks                 Execute all tasks from .agent-loop/state/tasks.md
+agent-loop plan <task>               Plan and decompose only, no implementation
+agent-loop plan --file <path>        Plan from a file
+agent-loop resume                    Continue from existing .agent-loop/state without re-init
+agent-loop tasks                     Execute all tasks from .agent-loop/state/tasks.md
+agent-loop tasks --file <path>       Execute tasks from a custom file
 agent-loop init                      Create .agent-loop/state/ in current directory
 agent-loop status                    Show current loop status
 agent-loop help                      Print usage
 ```
 
 `agent-loop "task"` also works (shorthand for `agent-loop run "task"`).
+
+### Deprecated forms (still supported)
+
+The following forms continue to work but emit deprecation warnings:
+
+```
+agent-loop run --planning-only       → use 'agent-loop plan' instead
+agent-loop run --resume              → use 'agent-loop resume' instead
+agent-loop run-tasks                 → use 'agent-loop tasks' instead
+```
 
 ## How It Works
 
@@ -51,7 +63,7 @@ Planning → Implementation → Review → Consensus → Done
 4. **Consensus** — Both agents agree the work is complete
 5. **Loop** — If not, iterate until consensus or MAX_ROUNDS
 
-### Planning-Only Mode (`--planning-only`)
+### Planning-Only Mode (`plan`)
 
 ```
 Review Plan → Refine Plan → Consensus → Decompose Tasks → Stop
@@ -82,16 +94,22 @@ IMPLEMENTER=codex agent-loop run "Build a REST API"
 agent-loop run --single-agent "Fix the pagination bug"
 
 # Planning-only: decompose a large plan into tasks
-agent-loop run --file PLAN.md --planning-only
+agent-loop plan --file PLAN.md
 
-# Resume planning-only decomposition after raising round limits
-DECOMPOSITION_MAX_ROUNDS=6 agent-loop run --planning-only --resume
+# Resume an interrupted loop
+agent-loop resume
+
+# Resume with higher round limits
+DECOMPOSITION_MAX_ROUNDS=6 agent-loop resume
 
 # Run all generated tasks autonomously (resets rounds per task)
-agent-loop run-tasks
+agent-loop tasks
 
 # Run all tasks with more retries for MAX_ROUNDS cases
-agent-loop run-tasks --max-retries 4 --round-step 3
+agent-loop tasks --max-retries 4 --round-step 3
+
+# Run tasks from a custom file
+agent-loop tasks --file my-tasks.md
 
 # Then implement each task one by one
 agent-loop run "Task 1: Foundation setup"
@@ -100,26 +118,31 @@ agent-loop run "Task 2: Database schema"
 
 ## Autonomous Task Runner
 
-After planning-only mode generates `.agent-loop/state/tasks.md`, execute all tasks in sequence:
+After planning mode generates `.agent-loop/state/tasks.md`, execute all tasks in sequence:
 
 ```bash
-agent-loop run-tasks
+agent-loop tasks
 ```
 
 Behavior:
 
 - Parses headings like `### Task 1: ...` from `tasks.md`
 - Runs each task with `agent-loop run "Task N: ..."` (fresh run, so rounds reset per task)
-- If a task stops with `status: MAX_ROUNDS`, retries with `agent-loop run --resume`
-- If a task stops with timeout `status: ERROR` (for example, "timed out after ..."), retries with `agent-loop run --resume`
+- If a task stops with `status: MAX_ROUNDS`, retries with `agent-loop resume`
+- If a task stops with timeout `status: ERROR` (for example, "timed out after ..."), retries with `agent-loop resume`
 - Increases `MAX_ROUNDS` by `--round-step` on each retry
 
 Options:
 
-- `--tasks-file <path>`: use a custom tasks markdown file
+- `--file <path>`: use a custom tasks markdown file
 - `--max-retries <n>`: retry count for retryable failures (`MAX_ROUNDS` and timeout `ERROR`) (default `2`)
 - `--round-step <n>`: amount added to `MAX_ROUNDS` on each retry (default `2`)
 - `--single-agent`: run each task in single-agent mode
+- `--continue-on-fail`: continue with remaining tasks even if one fails
+- `--fail-fast`: stop immediately on first task failure
+- `--max-parallel <n>`: limit concurrent task execution
+
+> **Note:** `--tasks-file` is deprecated in favor of `--file`.
 
 ## Configuration
 
@@ -225,6 +248,7 @@ Running `agent-loop init` or `agent-loop run` creates `.agent-loop/state/` in th
     ├── changes.md     # Summary of latest implementation changes
     ├── review.md      # Latest review feedback
     ├── status.json    # Loop state: status, round, actors, timestamp
+    ├── workflow.txt   # Workflow marker (plan or run) for resume
     └── log.txt        # Full timestamped session log
 ```
 
@@ -236,7 +260,7 @@ The tool binary lives globally. Only state files are created per-project.
 
 **Implementation mode** — Task is well-defined and scoped. You know what to build. Ready to write code.
 
-**Planning-only mode** — Starting a new project, need architecture review, plan is too large for a single run (>500 lines or >5 phases). Use `--planning-only` first, then implement each task from the generated `tasks.md`.
+**Planning-only mode** — Starting a new project, need architecture review, plan is too large for a single run (>500 lines or >5 phases). Use `agent-loop plan` first, then implement each task from the generated `tasks.md`.
 
 ## Single-Agent vs Dual-Agent
 
