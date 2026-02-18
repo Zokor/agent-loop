@@ -204,9 +204,6 @@ auto_test = false
 
 # Override auto-detected quality check command
 # auto_test_cmd = "cargo test"
-
-# Plan and decompose only, no implementation (default: false)
-planning_only = false
 ```
 
 Unknown keys are rejected to catch typos early. If the file is missing, everything falls back to defaults silently.
@@ -226,10 +223,6 @@ MAX_ROUNDS=50 agent-loop run "task"
 # --single-agent forces single-agent even if SINGLE_AGENT=0 in env
 # or single_agent = false in TOML
 agent-loop run --single-agent "task"
-
-# Env overrides TOML for planning_only too
-# (planning_only = false in .agent-loop.toml, env wins)
-PLANNING_ONLY=1 agent-loop run "task"
 ```
 
 ### Environment variables
@@ -248,7 +241,6 @@ Environment variables override `.agent-loop.toml` values but are overridden by C
 | `AUTO_COMMIT`              | `1`      | Auto-commit loop-owned changes after each round (`0` to disable) |
 | `AUTO_TEST`                | `0`      | Run quality checks before review (`1`/`true`/`yes`/`on` to enable) |
 | `AUTO_TEST_CMD`            |          | Override auto-detected quality check command                     |
-| `PLANNING_ONLY`            | `0`      | Plan and decompose only, no implementation (`1`/`true`/`yes`/`on` to enable) |
 
 ## Per-Project State
 

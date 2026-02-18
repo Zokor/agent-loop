@@ -47,8 +47,6 @@ struct FileConfig {
     auto_test: Option<bool>,
     /// Override auto-detected quality check command.
     auto_test_cmd: Option<String>,
-    /// Plan and decompose only, no implementation.
-    planning_only: Option<bool>,
     /// Maximum diff lines before truncation.
     diff_max_lines: Option<u32>,
     /// Maximum lines for project-context output.
@@ -104,7 +102,6 @@ pub struct Config {
     pub auto_commit: bool,
     pub auto_test: bool,
     pub auto_test_cmd: Option<String>,
-    pub planning_only: bool,
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
     pub planning_context_excerpt_lines: Option<u32>,
@@ -129,33 +126,20 @@ impl Config {
     pub fn from_cli(
         project_dir: PathBuf,
         single_agent_flag: bool,
-        planning_only_flag: bool,
         verbose_flag: bool,
     ) -> Result<Self, AgentLoopError> {
-        Self::from_cli_with_overrides(
-            project_dir,
-            single_agent_flag,
-            planning_only_flag,
-            verbose_flag,
-            None,
-            None,
-        )
+        Self::from_cli_with_overrides(project_dir, single_agent_flag, verbose_flag, None)
     }
 
     /// Build config with optional overrides applied **before** validation.
     ///
-    /// `max_rounds_override` and `planning_only_override` take highest precedence
-    /// (above CLI flags, env vars, and TOML) and are validated together with the
-    /// rest of the config. This avoids post-hoc mutation that could bypass bounds
-    /// checks (e.g. forcing implementation mode after validation allowed
-    /// `max_rounds = 0` in planning-only mode).
+    /// `max_rounds_override` takes highest precedence (above env vars and TOML)
+    /// and is validated together with the rest of the config.
     pub fn from_cli_with_overrides(
         project_dir: PathBuf,
         single_agent_flag: bool,
-        planning_only_flag: bool,
         verbose_flag: bool,
         max_rounds_override: Option<u32>,
-        planning_only_override: Option<bool>,
     ) -> Result<Self, AgentLoopError> {
         let file = load_file_config(&project_dir)?;
 
@@ -223,17 +207,6 @@ impl Config {
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
-        // --- planning_only: override > CLI > env > TOML > default ---
-        let planning_only = if let Some(po) = planning_only_override {
-            po
-        } else if planning_only_flag {
-            true
-        } else {
-            env_bool("PLANNING_ONLY")
-                .or(file.planning_only)
-                .unwrap_or(false)
-        };
-
         let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
             run_mode: resolve_run_mode(single_agent),
@@ -248,7 +221,6 @@ impl Config {
             auto_commit,
             auto_test,
             auto_test_cmd,
-            planning_only,
             diff_max_lines,
             context_line_cap,
             planning_context_excerpt_lines,
@@ -397,11 +369,10 @@ fn parse_env<T: FromStr>(key: &str) -> Option<T> {
 }
 
 fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
-    if config.max_rounds == 0 && !config.planning_only {
+    if config.max_rounds == 0 {
         return Err(AgentLoopError::Config(
-            "max_rounds must be > 0 in implementation mode. \
-             Set MAX_ROUNDS or max_rounds in .agent-loop.toml to a positive value, \
-             or use --planning-only."
+            "max_rounds must be > 0. \
+             Set MAX_ROUNDS or max_rounds in .agent-loop.toml to a positive value."
                 .to_string(),
         ));
     }
@@ -414,9 +385,9 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         ));
     }
 
-    if config.planning_only && config.decomposition_max_rounds == 0 {
+    if config.decomposition_max_rounds == 0 {
         return Err(AgentLoopError::Config(
-            "decomposition_max_rounds must be > 0 in planning-only mode. \
+            "decomposition_max_rounds must be > 0. \
              Set DECOMPOSITION_MAX_ROUNDS or decomposition_max_rounds in .agent-loop.toml to a positive value."
                 .to_string(),
         ));
@@ -441,12 +412,8 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
     Ok(())
 }
 
-fn emit_config_warnings(config: &Config) {
-    if config.planning_only && config.max_rounds == 0 {
-        eprintln!(
-            "Warning: max_rounds=0 is ignored in planning-only mode (only planning_max_rounds and decomposition_max_rounds apply)."
-        );
-    }
+fn emit_config_warnings(_config: &Config) {
+    // No active warnings. Retained as a hook for future config warnings.
 }
 
 #[cfg(test)]
@@ -470,7 +437,6 @@ mod tests {
             "CONTEXT_LINE_CAP",
             "PLANNING_CONTEXT_EXCERPT_LINES",
             "VERBOSE",
-            "PLANNING_ONLY",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
             unsafe {
@@ -587,7 +553,6 @@ single_agent = true
 auto_commit = false
 auto_test = true
 auto_test_cmd = "cargo test"
-planning_only = true
 diff_max_lines = 250
 context_line_cap = 150
 planning_context_excerpt_lines = 80
@@ -605,7 +570,6 @@ max_parallel = 4
         assert_eq!(config.auto_commit, Some(false));
         assert_eq!(config.auto_test, Some(true));
         assert_eq!(config.auto_test_cmd.as_deref(), Some("cargo test"));
-        assert_eq!(config.planning_only, Some(true));
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(150));
         assert_eq!(config.planning_context_excerpt_lines, Some(80));
@@ -661,7 +625,7 @@ max_parallel = 4
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_defaults");
-        let config = Config::from_cli(project_dir.clone(), false, false, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
 
         assert_eq!(config.project_dir, project_dir);
@@ -680,7 +644,6 @@ max_parallel = 4
         assert!(config.auto_commit);
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
-        assert!(!config.planning_only);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -701,7 +664,7 @@ max_parallel = 4
         set_env("TIMEOUT", "900");
 
         let project_dir = create_temp_project_root("cfg_env_overrides");
-        let config = Config::from_cli(project_dir.clone(), false, true, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 42);
@@ -713,7 +676,6 @@ max_parallel = 4
         assert!(config.single_agent);
         assert_eq!(config.run_mode, RunMode::SingleAgent);
         assert!(!config.auto_commit);
-        assert!(config.planning_only);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -727,7 +689,7 @@ max_parallel = 4
         set_env("TIMEOUT", "-1");
 
         let project_dir = create_temp_project_root("cfg_invalid_env");
-        let config = Config::from_cli(project_dir.clone(), false, false, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, DEFAULT_MAX_ROUNDS);
@@ -741,28 +703,15 @@ max_parallel = 4
     }
 
     #[test]
-    fn from_cli_rejects_zero_max_rounds_in_implementation_mode() {
+    fn from_cli_rejects_zero_max_rounds() {
         let _guard = env_lock();
         clear_env();
         set_env("MAX_ROUNDS", "0");
 
         let project_dir = create_temp_project_root("cfg_zero_rounds");
-        let err = Config::from_cli(project_dir.clone(), false, false, false)
-            .expect_err("max_rounds=0 in implementation mode should fail");
+        let err = Config::from_cli(project_dir.clone(), false, false)
+            .expect_err("max_rounds=0 should fail");
         assert!(err.to_string().contains("max_rounds must be > 0"));
-        let _ = std::fs::remove_dir_all(&project_dir);
-    }
-
-    #[test]
-    fn from_cli_allows_zero_max_rounds_in_planning_only_mode() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("MAX_ROUNDS", "0");
-
-        let project_dir = create_temp_project_root("cfg_zero_rounds_planning");
-        let config = Config::from_cli(project_dir.clone(), false, true, false)
-            .expect("max_rounds=0 in planning-only mode should succeed");
-        assert_eq!(config.max_rounds, 0);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -772,7 +721,7 @@ max_parallel = 4
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_auto_test_off");
-        let config = Config::from_cli(project_dir.clone(), false, false, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
@@ -786,7 +735,7 @@ max_parallel = 4
         set_env("AUTO_TEST", "1");
 
         let project_dir = create_temp_project_root("cfg_auto_test_on");
-        let config = Config::from_cli(project_dir.clone(), false, false, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
         assert!(config.auto_test);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -800,12 +749,12 @@ max_parallel = 4
         set_env("AUTO_TEST_CMD", "make test");
 
         let project_dir = create_temp_project_root("cfg_auto_test_cmd");
-        let config = Config::from_cli(project_dir.clone(), false, false, false)
+        let config = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
         assert_eq!(config.auto_test_cmd, Some("make test".to_string()));
 
         set_env("AUTO_TEST_CMD", "   ");
-        let config2 = Config::from_cli(project_dir.clone(), false, false, false)
+        let config2 = Config::from_cli(project_dir.clone(), false, false)
             .expect("from_cli should succeed");
         assert_eq!(config2.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -819,7 +768,7 @@ max_parallel = 4
         set_env("IMPLEMENTER", "codex");
 
         let project_dir = create_temp_project_root("cfg_cli_flag");
-        let config = Config::from_cli(project_dir.clone(), true, false, false)
+        let config = Config::from_cli(project_dir.clone(), true, false)
             .expect("from_cli should succeed");
 
         assert!(config.single_agent);
@@ -851,12 +800,11 @@ single_agent = true
 auto_commit = false
 auto_test = true
 auto_test_cmd = "cargo test"
-planning_only = true
 "#,
         );
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
@@ -868,7 +816,6 @@ planning_only = true
         assert!(!config.auto_commit);
         assert!(config.auto_test);
         assert_eq!(config.auto_test_cmd, Some("cargo test".to_string()));
-        assert!(config.planning_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -904,7 +851,7 @@ auto_test_cmd = "make test"
         set_env("AUTO_TEST_CMD", "npm test");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
@@ -930,82 +877,8 @@ auto_test_cmd = "make test"
         set_env("SINGLE_AGENT", "false");
 
         let config =
-            Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
         assert!(config.single_agent);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cli_overrides_toml_for_planning_only() {
-        let _guard = env_lock();
-        clear_env();
-
-        let dir = create_temp_project_root("cfg_cli_planning");
-        write_toml(&dir, "planning_only = false\n");
-
-        let config =
-            Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
-        assert!(config.planning_only);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // -----------------------------------------------------------------------
-    // planning_only env var precedence
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn env_enables_planning_only_without_toml() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("PLANNING_ONLY", "1");
-
-        let dir = create_temp_project_root("cfg_env_planning_only");
-        let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
-        assert!(config.planning_only);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_overrides_toml_for_planning_only() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("PLANNING_ONLY", "1");
-
-        let dir = create_temp_project_root("cfg_env_over_toml_po");
-        write_toml(&dir, "planning_only = false\n");
-
-        let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
-        assert!(config.planning_only);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn env_false_overrides_toml_true_for_planning_only() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("PLANNING_ONLY", "0");
-
-        let dir = create_temp_project_root("cfg_env_false_po");
-        write_toml(&dir, "planning_only = true\n");
-
-        let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
-        assert!(!config.planning_only);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn cli_overrides_env_for_planning_only() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("PLANNING_ONLY", "0");
-
-        let dir = create_temp_project_root("cfg_cli_over_env_po");
-        let config =
-            Config::from_cli(dir.clone(), false, true, false).expect("from_cli should succeed");
-        assert!(config.planning_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1023,7 +896,7 @@ auto_test_cmd = "make test"
         set_env("SINGLE_AGENT", "0");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1038,7 +911,7 @@ auto_test_cmd = "make test"
         set_env("AUTO_TEST", "0");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.auto_test);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1053,7 +926,7 @@ auto_test_cmd = "make test"
         set_env("AUTO_COMMIT", "0");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1071,7 +944,7 @@ auto_test_cmd = "make test"
         write_toml(&dir, "reviewer = \"claude\"\nimplementer = \"claude\"\n");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         // Both claude -> explicit reviewer override honored
         assert_eq!(config.implementer, Agent::Claude);
         assert_eq!(config.reviewer, Agent::Claude);
@@ -1088,7 +961,7 @@ auto_test_cmd = "make test"
         set_env("REVIEWER", "codex");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Codex);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1105,7 +978,7 @@ auto_test_cmd = "make test"
         );
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.single_agent);
         assert_eq!(config.implementer, Agent::Codex);
         assert_eq!(config.reviewer, Agent::Codex);
@@ -1121,7 +994,7 @@ auto_test_cmd = "make test"
 
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
         let config =
-            Config::from_cli(dir.clone(), true, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Claude);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1137,7 +1010,7 @@ auto_test_cmd = "make test"
 
         let dir = create_temp_project_root("cfg_ac_default");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1150,7 +1023,7 @@ auto_test_cmd = "make test"
 
         let dir = create_temp_project_root("cfg_ac_nonzero");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1166,21 +1039,21 @@ auto_test_cmd = "make test"
         set_env("PLANNING_MAX_ROUNDS", "0");
 
         let dir = create_temp_project_root("cfg_zero_planning");
-        let err = Config::from_cli(dir.clone(), false, false, false)
+        let err = Config::from_cli(dir.clone(), false, false)
             .expect_err("planning_max_rounds=0 should fail");
         assert!(err.to_string().contains("planning_max_rounds must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn validate_rejects_zero_decomposition_max_rounds_in_planning_only() {
+    fn validate_rejects_zero_decomposition_max_rounds() {
         let _guard = env_lock();
         clear_env();
         set_env("DECOMPOSITION_MAX_ROUNDS", "0");
 
-        let dir = create_temp_project_root("cfg_zero_decomp_plan");
-        let err = Config::from_cli(dir.clone(), false, true, false)
-            .expect_err("decomposition_max_rounds=0 in planning-only should fail");
+        let dir = create_temp_project_root("cfg_zero_decomp");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("decomposition_max_rounds=0 should fail");
         assert!(
             err.to_string()
                 .contains("decomposition_max_rounds must be > 0")
@@ -1196,7 +1069,7 @@ auto_test_cmd = "make test"
 
         let dir = create_temp_project_root("cfg_zero_timeout");
         let err =
-            Config::from_cli(dir.clone(), false, false, false).expect_err("timeout=0 should fail");
+            Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
         assert!(err.to_string().contains("timeout must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1207,7 +1080,7 @@ auto_test_cmd = "make test"
         clear_env();
 
         let dir = create_temp_project_root("cfg_valid_defaults");
-        let config = Config::from_cli(dir.clone(), false, false, false)
+        let config = Config::from_cli(dir.clone(), false, false)
             .expect("default config should be valid");
         assert!(config.max_rounds > 0);
         assert!(config.planning_max_rounds > 0);
@@ -1247,7 +1120,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_new_fields_default");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, None);
         assert_eq!(config.context_line_cap, None);
         assert_eq!(config.planning_context_excerpt_lines, None);
@@ -1275,7 +1148,7 @@ planning_context_excerpt_lines = 75
             "diff_max_lines = 250\ncontext_line_cap = 120\nplanning_context_excerpt_lines = 60\n",
         );
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(120));
         assert_eq!(config.planning_context_excerpt_lines, Some(60));
@@ -1295,7 +1168,7 @@ planning_context_excerpt_lines = 75
         set_env("DIFF_MAX_LINES", "999");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(999));
         assert_eq!(config.effective_diff_max_lines(), 999);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1311,7 +1184,7 @@ planning_context_excerpt_lines = 75
         set_env("CONTEXT_LINE_CAP", "300");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.context_line_cap, Some(300));
         assert_eq!(config.effective_context_line_cap(), 300);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1327,7 +1200,7 @@ planning_context_excerpt_lines = 75
         set_env("PLANNING_CONTEXT_EXCERPT_LINES", "200");
 
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.planning_context_excerpt_lines, Some(200));
         assert_eq!(config.effective_planning_context_excerpt_lines(), 200);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1344,7 +1217,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_verbose_default");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1356,7 +1229,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_verbose_flag");
         let config =
-            Config::from_cli(dir.clone(), false, false, true).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1369,7 +1242,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_verbose_env");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1382,7 +1255,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_verbose_flag_over_env");
         let config =
-            Config::from_cli(dir.clone(), false, false, true).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1407,7 +1280,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_max_parallel_default");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, DEFAULT_MAX_PARALLEL);
         assert_eq!(config.max_parallel, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1421,7 +1294,7 @@ planning_context_excerpt_lines = 75
         let dir = create_temp_project_root("cfg_toml_max_parallel");
         write_toml(&dir, "max_parallel = 4\n");
         let config =
-            Config::from_cli(dir.clone(), false, false, false).expect("from_cli should succeed");
+            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1433,7 +1306,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_zero_max_parallel");
         write_toml(&dir, "max_parallel = 0\n");
-        let err = Config::from_cli(dir.clone(), false, false, false)
+        let err = Config::from_cli(dir.clone(), false, false)
             .expect_err("max_parallel=0 should fail");
         assert!(err.to_string().contains("max_parallel must be >= 1"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1482,7 +1355,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_invalid_impl");
         write_toml(&dir, "implementer = \"typo-agent\"\n");
-        let err = Config::from_cli(dir.clone(), false, false, false)
+        let err = Config::from_cli(dir.clone(), false, false)
             .expect_err("invalid implementer should fail from_cli");
         assert!(err.to_string().contains("invalid implementer"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1495,7 +1368,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_invalid_rev");
         write_toml(&dir, "reviewer = \"gpt4\"\n");
-        let err = Config::from_cli(dir.clone(), false, false, false)
+        let err = Config::from_cli(dir.clone(), false, false)
             .expect_err("invalid reviewer should fail from_cli");
         assert!(err.to_string().contains("invalid reviewer"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1506,47 +1379,14 @@ planning_context_excerpt_lines = 75
     // -----------------------------------------------------------------------
 
     #[test]
-    fn overrides_planning_only_false_rejects_zero_max_rounds() {
-        let _guard = env_lock();
-        clear_env();
-
-        let dir = create_temp_project_root("cfg_override_po_false");
-        // TOML sets planning_only=true and max_rounds=0, which is valid in
-        // planning-only mode. Overriding planning_only to false must reject
-        // max_rounds=0 during validation, not after.
-        write_toml(&dir, "planning_only = true\nmax_rounds = 0\n");
-
-        let err =
-            Config::from_cli_with_overrides(dir.clone(), false, false, false, None, Some(false))
-                .expect_err("max_rounds=0 with planning_only override false should fail");
-        assert!(err.to_string().contains("max_rounds must be > 0"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn overrides_max_rounds_applied_before_validation() {
         let _guard = env_lock();
         clear_env();
 
         let dir = create_temp_project_root("cfg_override_mr");
-        let config =
-            Config::from_cli_with_overrides(dir.clone(), false, false, false, Some(42), None)
-                .expect("override max_rounds should succeed");
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(42))
+            .expect("override max_rounds should succeed");
         assert_eq!(config.max_rounds, 42);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn overrides_planning_only_false_with_env_planning_only_true() {
-        let _guard = env_lock();
-        clear_env();
-        set_env("PLANNING_ONLY", "1");
-
-        let dir = create_temp_project_root("cfg_override_env_po");
-        let config =
-            Config::from_cli_with_overrides(dir.clone(), false, false, false, None, Some(false))
-                .expect("override should force implementation mode");
-        assert!(!config.planning_only);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1559,9 +1399,8 @@ planning_context_excerpt_lines = 75
         let dir = create_temp_project_root("cfg_override_mr_env");
         write_toml(&dir, "max_rounds = 50\n");
 
-        let config =
-            Config::from_cli_with_overrides(dir.clone(), false, false, false, Some(7), None)
-                .expect("override max_rounds should win");
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(7))
+            .expect("override max_rounds should win");
         assert_eq!(config.max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }

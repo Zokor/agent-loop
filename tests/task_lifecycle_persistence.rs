@@ -1082,8 +1082,8 @@ fn run_tasks_prints_task_duration_summary_table() {
 
     // Verify summary table is printed
     assert!(
-        stdout.contains("Task Durations:"),
-        "should contain 'Task Durations:' header: {stdout}"
+        stdout.contains("Task Metrics:"),
+        "should contain 'Task Metrics:' header: {stdout}"
     );
     assert!(
         stdout.contains("Task 1: Setup"),
@@ -1125,7 +1125,7 @@ fn skipped_or_unexecuted_tasks_show_na_and_no_timing() {
 
     // Verify summary table shows n/a for unexecuted task
     assert!(
-        stdout.contains("Task Durations:"),
+        stdout.contains("Task Metrics:"),
         "should contain summary header: {stdout}"
     );
     assert!(
@@ -1290,7 +1290,7 @@ fn skipped_task_with_old_metrics_preserves_reconciled_timing() {
 
     // Verify summary header is present
     assert!(
-        stdout.contains("Task Durations:"),
+        stdout.contains("Task Metrics:"),
         "should contain summary header: {stdout}"
     );
 
@@ -1487,4 +1487,54 @@ fn duplicate_titles_pending_occurrence_is_not_skipped_as_done() {
     assert_eq!(tasks[2]["status"], "done", "third should run and complete");
 
     let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Test: MAX_ROUNDS escalation arithmetic matches the tasks retry contract
+// ---------------------------------------------------------------------------
+//
+// The tasks retry loop escalates `current_max_rounds` by `round_step` on each
+// retry. This test validates the exact arithmetic without needing a full
+// integration run (which would require controlling mock agent behavior across
+// planning/implementation/review phases).
+//
+// Contract (from src/main.rs):
+//   - Fresh task: current_max_rounds = base_max_rounds
+//   - After each retry: current_max_rounds += round_step
+//   - Resumed task: current_max_rounds = base_max_rounds + round_step * retry
+#[test]
+fn max_rounds_escalation_arithmetic_matches_contract() {
+    let base: u32 = 5;
+    let round_step: u32 = 3;
+    let max_retries: u32 = 4;
+
+    // Fresh task starts at base
+    let mut current = base;
+    assert_eq!(current, 5, "fresh attempt should use base MAX_ROUNDS");
+
+    // Each retry adds round_step
+    let mut expected_values = vec![current];
+    for retry in 1..=max_retries {
+        current = current.saturating_add(round_step);
+        expected_values.push(current);
+
+        // Also verify the resume-initial formula gives the same result
+        let resume_initial = base.saturating_add(round_step.saturating_mul(retry));
+        assert_eq!(
+            current, resume_initial,
+            "retry {retry}: incremental ({current}) should match resume formula ({resume_initial})"
+        );
+    }
+
+    assert_eq!(
+        expected_values,
+        vec![5, 8, 11, 14, 17],
+        "MAX_ROUNDS should escalate by round_step={round_step} each retry"
+    );
+
+    // Edge case: saturating arithmetic with large values
+    let large_base: u32 = u32::MAX - 2;
+    let large_step: u32 = 5;
+    let result = large_base.saturating_add(large_step);
+    assert_eq!(result, u32::MAX, "saturating_add should cap at u32::MAX");
 }

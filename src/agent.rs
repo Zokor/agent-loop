@@ -48,6 +48,85 @@ const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
 const FORCE_KILL_GRACE_MS: u64 = 2_000;
 const RESPONSE_BLOCK_MAX_LINES: usize = 500;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub agent_calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cost_usd_micros: u64,
+}
+
+impl UsageSnapshot {
+    pub fn is_zero(self) -> bool {
+        self.agent_calls == 0
+            && self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.total_tokens == 0
+            && self.cost_usd_micros == 0
+    }
+
+    pub fn saturating_add(self, rhs: Self) -> Self {
+        Self {
+            agent_calls: self.agent_calls.saturating_add(rhs.agent_calls),
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            total_tokens: self.total_tokens.saturating_add(rhs.total_tokens),
+            cost_usd_micros: self.cost_usd_micros.saturating_add(rhs.cost_usd_micros),
+        }
+    }
+
+    pub fn saturating_sub(self, rhs: Self) -> Self {
+        Self {
+            agent_calls: self.agent_calls.saturating_sub(rhs.agent_calls),
+            input_tokens: self.input_tokens.saturating_sub(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(rhs.output_tokens),
+            total_tokens: self.total_tokens.saturating_sub(rhs.total_tokens),
+            cost_usd_micros: self.cost_usd_micros.saturating_sub(rhs.cost_usd_micros),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AgentUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    cost_usd_micros: u64,
+}
+
+static AGENT_CALLS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static INPUT_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OUTPUT_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static TOTAL_TOKENS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static COST_USD_MICROS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+pub fn usage_snapshot() -> UsageSnapshot {
+    UsageSnapshot {
+        agent_calls: AGENT_CALLS_TOTAL.load(Ordering::Relaxed),
+        input_tokens: INPUT_TOKENS_TOTAL.load(Ordering::Relaxed),
+        output_tokens: OUTPUT_TOKENS_TOTAL.load(Ordering::Relaxed),
+        total_tokens: TOTAL_TOKENS_TOTAL.load(Ordering::Relaxed),
+        cost_usd_micros: COST_USD_MICROS_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+fn record_agent_invocation(usage: AgentUsage) {
+    AGENT_CALLS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    if usage.input_tokens > 0 {
+        INPUT_TOKENS_TOTAL.fetch_add(usage.input_tokens, Ordering::Relaxed);
+    }
+    if usage.output_tokens > 0 {
+        OUTPUT_TOKENS_TOTAL.fetch_add(usage.output_tokens, Ordering::Relaxed);
+    }
+    if usage.total_tokens > 0 {
+        TOTAL_TOKENS_TOTAL.fetch_add(usage.total_tokens, Ordering::Relaxed);
+    }
+    if usage.cost_usd_micros > 0 {
+        COST_USD_MICROS_TOTAL.fetch_add(usage.cost_usd_micros, Ordering::Relaxed);
+    }
+}
+
 /// Truncate `output` to at most `max_lines` lines using a ring-buffer approach.
 /// Returns `(kept_output, dropped_count)`.
 fn truncate_response_lines(output: &str, max_lines: usize) -> (String, usize) {
@@ -161,6 +240,95 @@ fn extract_claude_stream_json_text(output: &str) -> Option<String> {
     result_text.or(assistant_text)
 }
 
+fn parse_u64_field(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => text.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_cost_usd_micros(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().and_then(|v| {
+            if v.is_finite() && v >= 0.0 {
+                Some((v * 1_000_000.0).round() as u64)
+            } else {
+                None
+            }
+        }),
+        serde_json::Value::String(text) => text.parse::<f64>().ok().and_then(|v| {
+            if v.is_finite() && v >= 0.0 {
+                Some((v * 1_000_000.0).round() as u64)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    }
+}
+
+fn update_usage_from_object(
+    map: &serde_json::Map<String, serde_json::Value>,
+    usage: &mut AgentUsage,
+) {
+    if let Some(value) = map.get("input_tokens").and_then(parse_u64_field) {
+        usage.input_tokens = value;
+    }
+    if let Some(value) = map.get("output_tokens").and_then(parse_u64_field) {
+        usage.output_tokens = value;
+    }
+    if let Some(value) = map.get("total_tokens").and_then(parse_u64_field) {
+        usage.total_tokens = value;
+    }
+
+    for cost_key in ["total_cost_usd", "cost_usd", "estimated_cost_usd"] {
+        if let Some(value) = map.get(cost_key).and_then(parse_cost_usd_micros) {
+            usage.cost_usd_micros = value;
+        }
+    }
+}
+
+fn extract_stream_json_usage(output: &str) -> AgentUsage {
+    let mut usage = AgentUsage::default();
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        if let Some(root) = value.as_object() {
+            update_usage_from_object(root, &mut usage);
+            if let Some(usage_obj) = root.get("usage").and_then(|v| v.as_object()) {
+                update_usage_from_object(usage_obj, &mut usage);
+            }
+            if let Some(message_obj) = root.get("message").and_then(|v| v.as_object()) {
+                update_usage_from_object(message_obj, &mut usage);
+                if let Some(message_usage) = message_obj.get("usage").and_then(|v| v.as_object()) {
+                    update_usage_from_object(message_usage, &mut usage);
+                }
+            }
+            if let Some(result_obj) = root.get("result").and_then(|v| v.as_object()) {
+                update_usage_from_object(result_obj, &mut usage);
+                if let Some(result_usage) = result_obj.get("usage").and_then(|v| v.as_object()) {
+                    update_usage_from_object(result_usage, &mut usage);
+                }
+            }
+        }
+    }
+
+    if usage.total_tokens == 0 && (usage.input_tokens > 0 || usage.output_tokens > 0) {
+        usage.total_tokens = usage.input_tokens.saturating_add(usage.output_tokens);
+    }
+
+    usage
+}
+
 fn normalize_agent_output(agent: Agent, output: String) -> String {
     match agent {
         Agent::Claude => extract_claude_stream_json_text(&output).unwrap_or(output),
@@ -264,7 +432,6 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
             return Err(AgentLoopError::Agent(reason));
         }
     };
-
     let start = Instant::now();
     let output = Arc::new(Mutex::new(Vec::<u8>::new()));
     let last_output_ms = Arc::new(AtomicU64::new(start.elapsed().as_millis() as u64));
@@ -374,6 +541,11 @@ pub fn run_agent(agent: Agent, prompt: &str, config: &Config) -> Result<String, 
         .map(|mut guard| std::mem::take(&mut *guard))
         .unwrap_or_default();
     let combined_output = String::from_utf8_lossy(&raw_bytes).into_owned();
+    let usage = match agent {
+        Agent::Claude => extract_stream_json_usage(&combined_output),
+        Agent::Codex => AgentUsage::default(),
+    };
+    record_agent_invocation(usage);
     let normalized_output = normalize_agent_output(agent, combined_output);
     if let Err(err) = append_response_block(agent, &normalized_output, config) {
         let _ = log(&format!("⚠ {agent} error: {err}"), config);
@@ -729,6 +901,67 @@ mod tests {
 
         let extracted = extract_claude_stream_json_text(output);
         assert_eq!(extracted.as_deref(), Some("final result text"));
+    }
+
+    #[test]
+    fn extract_stream_json_usage_reads_tokens_and_cost() {
+        let output = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"usage\":{\"input_tokens\":120,\"output_tokens\":45}}}\n",
+            "{\"type\":\"result\",\"usage\":{\"total_tokens\":165,\"total_cost_usd\":0.012345}}\n"
+        );
+
+        let usage = extract_stream_json_usage(output);
+        assert_eq!(
+            usage,
+            AgentUsage {
+                input_tokens: 120,
+                output_tokens: 45,
+                total_tokens: 165,
+                cost_usd_micros: 12_345,
+            }
+        );
+    }
+
+    #[test]
+    fn extract_stream_json_usage_derives_total_from_input_plus_output() {
+        let output = "{\"usage\":{\"input_tokens\":1000,\"output_tokens\":250}}\n";
+        let usage = extract_stream_json_usage(output);
+        assert_eq!(usage.input_tokens, 1000);
+        assert_eq!(usage.output_tokens, 250);
+        assert_eq!(usage.total_tokens, 1250);
+    }
+
+    #[test]
+    fn usage_snapshot_saturating_math_is_safe() {
+        let lhs = UsageSnapshot {
+            agent_calls: 2,
+            input_tokens: 100,
+            output_tokens: 50,
+            total_tokens: 150,
+            cost_usd_micros: 1_000,
+        };
+        let rhs = UsageSnapshot {
+            agent_calls: 1,
+            input_tokens: 60,
+            output_tokens: 30,
+            total_tokens: 90,
+            cost_usd_micros: 700,
+        };
+
+        let sum = lhs.saturating_add(rhs);
+        assert_eq!(
+            sum,
+            UsageSnapshot {
+                agent_calls: 3,
+                input_tokens: 160,
+                output_tokens: 80,
+                total_tokens: 240,
+                cost_usd_micros: 1_700,
+            }
+        );
+
+        let diff = sum.saturating_sub(lhs);
+        assert_eq!(diff, rhs);
     }
 
     #[test]

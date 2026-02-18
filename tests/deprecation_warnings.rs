@@ -125,7 +125,9 @@ fn run_planning_only_resume_emits_deprecation_warning() {
         "command should fail (no state dir in temp dir)"
     );
     assert!(
-        stderr.contains("Warning: 'run --planning-only --resume' is deprecated. Use 'resume' instead."),
+        stderr.contains(
+            "Warning: 'run --planning-only --resume' is deprecated. Use 'resume' instead."
+        ),
         "stderr should contain combined deprecation warning, got: {stderr}"
     );
 }

@@ -771,7 +771,7 @@ fn print_planning_complete_summary(status: &LoopStatus, task: &str) {
     println!();
 }
 
-pub fn planning_phase(config: &Config) -> bool {
+pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let _ = log("━━━ Planning Phase ━━━", config);
     warn_on_status_write(
         "PLANNING",
@@ -971,7 +971,7 @@ pub fn planning_phase(config: &Config) -> bool {
         }
 
         if round_limit_reached(planning_round, config.planning_max_rounds) {
-            let message = if config.planning_only {
+            let message = if planning_only {
                 "⚠️ Max planning rounds reached without consensus"
             } else {
                 "⚠️ Max planning rounds reached - proceeding with current plan"
@@ -980,7 +980,7 @@ pub fn planning_phase(config: &Config) -> bool {
         }
     }
 
-    if config.planning_only && !reached_consensus {
+    if planning_only && !reached_consensus {
         warn_on_status_write(
             "MAX_ROUNDS",
             StatusPatch {
@@ -2040,10 +2040,10 @@ CRITICAL INSTRUCTIONS:
             paths.status_json.display()
         )));
         assert!(prompt.contains(
-            "{\"status\": \"APPROVED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
+            "{\"status\": \"APPROVED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
         ));
         assert!(prompt.contains(
-            "{\"status\": \"NEEDS_REVISION\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"reason\": \"your reason here\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
+            "{\"status\": \"NEEDS_REVISION\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"reason\": \"your reason here\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
         ));
     }
 
@@ -2070,10 +2070,10 @@ CRITICAL INSTRUCTIONS:
             paths.tasks_md.display()
         )));
         assert!(prompt.contains(
-            "{\"status\": \"CONSENSUS\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
+            "{\"status\": \"CONSENSUS\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
         ));
         assert!(prompt.contains(
-            "{\"status\": \"NEEDS_REVISION\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"reason\": \"brief explanation\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
+            "{\"status\": \"NEEDS_REVISION\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"reason\": \"brief explanation\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
         ));
     }
 
@@ -2102,7 +2102,7 @@ CRITICAL INSTRUCTIONS:
             paths.status_json.display()
         )));
         assert!(prompt.contains(
-            "{\"status\": \"DISPUTED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"timestamp\": \"2026-02-14T12:00:00.999Z\"}"
+            "{\"status\": \"DISPUTED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T12:00:00.999Z\"}"
         ));
     }
 
@@ -2152,7 +2152,7 @@ CRITICAL INSTRUCTIONS:
         );
 
         let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config);
+        let planned = planning_phase(&project.config, false);
 
         assert!(!planned);
         let status = read_status(&project.config);
@@ -2227,7 +2227,7 @@ CRITICAL INSTRUCTIONS:
         project.create_executable("codex", "#!/bin/sh\nexit 0\n");
 
         let _path_guard = project.with_path_override();
-        let _planned = planning_phase(&project.config);
+        let _planned = planning_phase(&project.config, false);
 
         // In non-planning_only mode, planning_phase returns true even without consensus.
         // The key assertion is that stale detection fired (visible in the log).
@@ -2261,7 +2261,7 @@ CRITICAL INSTRUCTIONS:
         );
 
         let _path_guard = project.with_path_override();
-        let _ = planning_phase(&project.config);
+        let _ = planning_phase(&project.config, false);
 
         let log_contents = project.read_log();
         assert!(
@@ -2296,7 +2296,7 @@ CRITICAL INSTRUCTIONS:
         );
 
         let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config);
+        let planned = planning_phase(&project.config, false);
 
         assert!(planned);
         let round2_prompt = fs::read_to_string(project.path(".round2-reviewer-prompt.txt"))
@@ -2331,7 +2331,7 @@ CRITICAL INSTRUCTIONS:
         );
 
         let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config);
+        let planned = planning_phase(&project.config, false);
 
         assert!(planned);
         let round1_prompt = fs::read_to_string(project.path(".round1-reviewer-prompt.txt"))
@@ -2485,10 +2485,10 @@ CRITICAL INSTRUCTIONS:
             single_paths.status_json.display()
         )));
         assert!(single_prompt.contains(
-            "{\"status\": \"APPROVED\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"rating\": 4, \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
+            "{\"status\": \"APPROVED\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"rating\": 4, \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
         ));
         assert!(single_prompt.contains(
-            "{\"status\": \"NEEDS_CHANGES\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
+            "{\"status\": \"NEEDS_CHANGES\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
         ));
     }
 
@@ -2508,10 +2508,10 @@ CRITICAL INSTRUCTIONS:
         assert!(prompt.contains("REVIEW:\nLooks good overall"));
         assert!(prompt.contains(&format!("write this to {}:", paths.status_json.display())));
         assert!(prompt.contains(
-            "{\"status\": \"CONSENSUS\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
+            "{\"status\": \"CONSENSUS\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
         ));
         assert!(prompt.contains(
-            "{\"status\": \"DISPUTED\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"reason\": \"what was missed\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
+            "{\"status\": \"DISPUTED\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"reason\": \"what was missed\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
         ));
     }
 

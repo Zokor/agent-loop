@@ -74,10 +74,7 @@ fn tasks_file_flag_emits_deprecation_warning() {
     let tmp = TempDir::new("deprecation_warning");
     let tasks_file = write_headingless_tasks_file(tmp.path());
 
-    let output = run_tasks_command(
-        tmp.path(),
-        &["--tasks-file", &tasks_file.to_string_lossy()],
-    );
+    let output = run_tasks_command(tmp.path(), &["--tasks-file", &tasks_file.to_string_lossy()]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -107,10 +104,7 @@ fn file_flag_does_not_emit_deprecation_warning() {
     let tmp = TempDir::new("no_deprecation");
     let tasks_file = write_headingless_tasks_file(tmp.path());
 
-    let output = run_tasks_command(
-        tmp.path(),
-        &["--file", &tasks_file.to_string_lossy()],
-    );
+    let output = run_tasks_command(tmp.path(), &["--file", &tasks_file.to_string_lossy()]);
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -137,8 +131,7 @@ fn file_flag_does_not_emit_deprecation_warning() {
 fn file_and_tasks_file_together_rejected() {
     let tmp = TempDir::new("both_flags");
     let tasks_file = tmp.path().join("tasks.md");
-    fs::write(&tasks_file, "### Task 1: Test\nContent\n")
-        .expect("tasks file should be written");
+    fs::write(&tasks_file, "### Task 1: Test\nContent\n").expect("tasks file should be written");
 
     let file_arg = tasks_file.to_string_lossy().to_string();
     let output = run_tasks_command(
@@ -166,8 +159,7 @@ fn file_and_tasks_file_together_rejected() {
 fn round_step_zero_rejected() {
     let tmp = TempDir::new("round_step_zero");
     let tasks_file = tmp.path().join("tasks.md");
-    fs::write(&tasks_file, "### Task 1: Test\nContent\n")
-        .expect("tasks file should be written");
+    fs::write(&tasks_file, "### Task 1: Test\nContent\n").expect("tasks file should be written");
 
     let output = run_tasks_command(
         tmp.path(),
@@ -176,10 +168,7 @@ fn round_step_zero_rejected() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    assert!(
-        !output.status.success(),
-        "should fail with --round-step 0"
-    );
+    assert!(!output.status.success(), "should fail with --round-step 0");
     assert!(
         stderr.contains("--round-step"),
         "error should mention --round-step, got: {stderr}"
@@ -194,8 +183,7 @@ fn round_step_zero_rejected() {
 fn continue_on_fail_with_fail_fast_rejected() {
     let tmp = TempDir::new("conflict_flags");
     let tasks_file = tmp.path().join("tasks.md");
-    fs::write(&tasks_file, "### Task 1: Test\nContent\n")
-        .expect("tasks file should be written");
+    fs::write(&tasks_file, "### Task 1: Test\nContent\n").expect("tasks file should be written");
 
     let output = run_tasks_command(
         tmp.path(),
@@ -227,8 +215,7 @@ fn continue_on_fail_with_fail_fast_rejected() {
 fn max_parallel_zero_rejected() {
     let tmp = TempDir::new("max_parallel_zero");
     let tasks_file = tmp.path().join("tasks.md");
-    fs::write(&tasks_file, "### Task 1: Test\nContent\n")
-        .expect("tasks file should be written");
+    fs::write(&tasks_file, "### Task 1: Test\nContent\n").expect("tasks file should be written");
 
     let output = run_tasks_command(
         tmp.path(),

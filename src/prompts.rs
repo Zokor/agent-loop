@@ -206,15 +206,17 @@ pub(crate) fn planning_reviewer_prompt(
     };
 
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a brief justification.\n\nIf you approve the plan, write this exact JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {} and write this JSON to {}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a brief justification.\n\nIf you approve the plan, write this exact JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {} and write this JSON to {}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         path_text(&paths.plan_md),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -228,13 +230,15 @@ pub(crate) fn planning_implementer_revision_prompt(
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has revised your plan. Review their changes.\n\nORIGINAL TASK:\n{task}\n\nREVISED PLAN:\n{revised_plan}\n\nREVIEWER'S REASON:\n{reviewer_reason}\n\nIf you agree with the revisions, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to make further changes, revise the plan in {} and write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "The reviewer has revised your plan. Review their changes.\n\nORIGINAL TASK:\n{task}\n\nREVISED PLAN:\n{revised_plan}\n\nREVIEWER'S REASON:\n{reviewer_reason}\n\nIf you agree with the revisions, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to make further changes, revise the plan in {} and write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         path_text(&paths.plan_md),
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -268,11 +272,12 @@ pub(crate) fn decomposition_revision_prompt(
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "You are the IMPLEMENTER revising a task breakdown.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCURRENT TASKS:\n{current_tasks}\n\nREVIEWER FEEDBACK:\n{reviewer_feedback}\n\nRevise {} to address all reviewer feedback while preserving clear dependencies and testing requirements.\n\nThen write this JSON to {}:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "You are the IMPLEMENTER revising a task breakdown.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCURRENT TASKS:\n{current_tasks}\n\nREVIEWER FEEDBACK:\n{reviewer_feedback}\n\nRevise {} to address all reviewer feedback while preserving clear dependencies and testing requirements.\n\nThen write this JSON to {}:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}",
         path_text(&paths.tasks_md),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -285,14 +290,16 @@ pub(crate) fn decomposition_reviewer_prompt(
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\nIf you approve the breakdown, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\nIf you approve the breakdown, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         path_text(&paths.tasks_md),
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -347,14 +354,16 @@ pub(crate) fn implementation_reviewer_prompt(
     };
 
     format!(
-        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -366,12 +375,14 @@ pub(crate) fn implementation_consensus_prompt(
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has APPROVED your implementation.\n\nREVIEW:\n{review}\n\nIf you agree the implementation is complete and the review is fair, write this to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you disagree or think something was missed, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"reason\": \"what was missed\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "The reviewer has APPROVED your implementation.\n\nREVIEW:\n{review}\n\nIf you agree the implementation is complete and the review is fair, write this to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you disagree or think something was missed, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"what was missed\", \"timestamp\": \"{prompt_timestamp}\"}}",
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 
@@ -422,16 +433,18 @@ pub(crate) fn implementation_adversarial_review_prompt(
         5 = excellent (clean, well-tested, follows plan precisely)\n\n\
         Then write one of these to {}:\n\n\
         If APPROVED (no meaningful issues found):\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"rating\": 5, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 5, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
         If CHANGES NEEDED (found issues the first reviewer missed):\n\
-        {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"rating\": 3, \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 3, \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
+        config.run_mode,
         config.implementer,
         config.reviewer,
+        config.run_mode,
     )
 }
 

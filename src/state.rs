@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -52,6 +53,34 @@ impl fmt::Display for Status {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowKind {
+    Plan,
+    Run,
+}
+
+impl fmt::Display for WorkflowKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Plan => "plan",
+            Self::Run => "run",
+        };
+        write!(f, "{label}")
+    }
+}
+
+impl FromStr for WorkflowKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "plan" => Ok(Self::Plan),
+            "run" => Ok(Self::Run),
+            other => Err(format!("unknown workflow kind: {other:?}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopStatus {
     pub status: Status,
@@ -87,6 +116,32 @@ pub fn normalize_task_text(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+pub fn extract_task_title(value: &str) -> String {
+    let mut in_code_fence = false;
+
+    for line in value.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_fence = !in_code_fence;
+            continue;
+        }
+        if in_code_fence || trimmed.is_empty() {
+            continue;
+        }
+
+        if trimmed.starts_with('#') {
+            let heading = trimmed.trim_start_matches('#').trim();
+            if !heading.is_empty() {
+                return normalize_task_text(heading);
+            }
+        }
+    }
+
+    // If no markdown heading is present, preserve existing behavior and keep
+    // the full normalized task text.
+    normalize_task_text(value)
+}
+
 pub fn summarize_task(value: &str, max_length: Option<usize>) -> String {
     let normalized = normalize_task_text(value);
     let limit = max_length.unwrap_or(120);
@@ -107,12 +162,12 @@ pub fn resolve_last_run_task(explicit: Option<&str>, config: &Config) -> String 
     if let Some(value) = explicit
         && !value.trim().is_empty()
     {
-        return normalize_task_text(value);
+        return extract_task_title(value);
     }
 
     let task_from_state = read_state_file("task.md", config);
     if !task_from_state.trim().is_empty() {
-        return normalize_task_text(&task_from_state);
+        return extract_task_title(&task_from_state);
     }
 
     String::new()
@@ -725,6 +780,16 @@ pub struct TaskMetricsEntry {
     pub task_ended_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -789,7 +854,22 @@ pub fn read_recent_history(config: &Config, max_lines: usize) -> String {
     }
 }
 
-pub fn init(task: &str, config: &Config, baseline_files: &[String]) -> io::Result<()> {
+pub fn write_workflow(kind: WorkflowKind, config: &Config) -> io::Result<()> {
+    write_state_file("workflow.txt", &format!("{kind}\n"), config)
+}
+
+#[allow(dead_code)] // used in tests; resume_command uses the pre-config state_dir variant
+pub fn read_workflow(config: &Config) -> Option<WorkflowKind> {
+    let raw = read_state_file("workflow.txt", config);
+    raw.trim().parse().ok()
+}
+
+pub fn init(
+    task: &str,
+    config: &Config,
+    baseline_files: &[String],
+    workflow: WorkflowKind,
+) -> io::Result<()> {
     fs::create_dir_all(&config.state_dir)?;
     // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
     let _baseline_files = baseline_files;
@@ -800,6 +880,7 @@ pub fn init(task: &str, config: &Config, baseline_files: &[String]) -> io::Resul
     write_state_file("changes.md", "", config)?;
     write_state_file("conversation.md", "", config)?;
     write_state_file("log.txt", "", config)?;
+    write_workflow(workflow, config)?;
 
     write_status(
         StatusPatch {
@@ -900,6 +981,20 @@ mod tests {
             normalize_task_text("  Task 1:\n  build    feature   "),
             "Task 1: build feature"
         );
+        assert_eq!(
+            extract_task_title(
+                "# Order Waiting List Status Implementation Plan\n\n## Summary\nLong body text"
+            ),
+            "Order Waiting List Status Implementation Plan"
+        );
+        assert_eq!(
+            extract_task_title("   First line title  \nSecond line details"),
+            "First line title Second line details"
+        );
+        assert_eq!(
+            extract_task_title("```md\n# inside code fence\n```\n# Real Title"),
+            "Real Title"
+        );
         assert_eq!(summarize_task("short task", Some(20)), "short task");
         assert_eq!(
             summarize_task("12345678901234567890", Some(10)),
@@ -946,8 +1041,12 @@ mod tests {
     #[test]
     fn read_status_uses_defaults_for_missing_empty_and_error_for_invalid_json() {
         let project = new_project();
-        write_state_file("task.md", "   task from state   ", &project.config)
-            .expect("task.md should be writable");
+        write_state_file(
+            "task.md",
+            "   # task from state   \n\nfull details",
+            &project.config,
+        )
+        .expect("task.md should be writable");
 
         let missing = read_status(&project.config);
         assert_eq!(missing.status, Status::Pending);
@@ -1034,6 +1133,7 @@ mod tests {
             "  Build\n a   robust  state module ",
             &project.config,
             &baseline_files,
+            WorkflowKind::Run,
         )
         .expect("init should succeed");
 
@@ -1044,6 +1144,7 @@ mod tests {
             "changes.md",
             "log.txt",
             "status.json",
+            "workflow.txt",
         ] {
             assert!(
                 state_file_path(name, &project.config).exists(),
@@ -1060,6 +1161,9 @@ mod tests {
         assert_eq!(status.last_run_task, "Build a robust state module");
         assert_eq!(status.reason, None);
         assert_eq!(status.rating, None);
+
+        let workflow = read_workflow(&project.config);
+        assert_eq!(workflow, Some(WorkflowKind::Run));
 
         let log_content = read_state_file("log.txt", &project.config);
         assert!(log_content.contains("Agent loop initialized"));
@@ -1388,31 +1492,31 @@ mod tests {
         let reader = thread::spawn(move || {
             let mut reads = 0u64;
             while !done.load(Ordering::Relaxed) {
-                if let Ok(raw) = fs::read_to_string(&read_path) {
-                    if !raw.trim().is_empty() {
-                        let parsed: serde_json::Value = serde_json::from_str(&raw)
-                            .unwrap_or_else(|_| panic!("reader saw partial/invalid JSON: {raw}"));
+                if let Ok(raw) = fs::read_to_string(&read_path)
+                    && !raw.trim().is_empty()
+                {
+                    let parsed: serde_json::Value = serde_json::from_str(&raw)
+                        .unwrap_or_else(|_| panic!("reader saw partial/invalid JSON: {raw}"));
 
-                        // Assert the payload is one of the expected versions, not just
-                        // any valid JSON. This catches corruption that happens to produce
-                        // a parseable but unexpected document.
-                        let version = parsed["version"].as_u64().unwrap_or_else(|| {
-                            panic!("missing or non-integer 'version' field: {raw}")
-                        });
-                        assert!(
-                            version <= WRITE_ITERATIONS,
-                            "version {version} out of expected range 0..={WRITE_ITERATIONS}"
-                        );
+                    // Assert the payload is one of the expected versions, not just
+                    // any valid JSON. This catches corruption that happens to produce
+                    // a parseable but unexpected document.
+                    let version = parsed["version"]
+                        .as_u64()
+                        .unwrap_or_else(|| panic!("missing or non-integer 'version' field: {raw}"));
+                    assert!(
+                        version <= WRITE_ITERATIONS,
+                        "version {version} out of expected range 0..={WRITE_ITERATIONS}"
+                    );
 
-                        let data = parsed["data"]
-                            .as_str()
-                            .unwrap_or_else(|| panic!("missing or non-string 'data' field: {raw}"));
-                        assert_eq!(
-                            data,
-                            "x".repeat(512),
-                            "data field corrupted for version {version}"
-                        );
-                    }
+                    let data = parsed["data"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("missing or non-string 'data' field: {raw}"));
+                    assert_eq!(
+                        data,
+                        "x".repeat(512),
+                        "data field corrupted for version {version}"
+                    );
                 }
                 reads += 1;
             }
@@ -1615,7 +1719,13 @@ mod tests {
         let project = new_project();
         let baseline_files = vec!["src/main.rs".to_string()];
 
-        init("Test task", &project.config, &baseline_files).expect("init should succeed");
+        init(
+            "Test task",
+            &project.config,
+            &baseline_files,
+            WorkflowKind::Run,
+        )
+        .expect("init should succeed");
 
         assert!(
             state_file_path("conversation.md", &project.config).exists(),
@@ -1683,6 +1793,32 @@ mod tests {
         assert!(
             !logs.contains("last_run_task truncated"),
             "no truncation warning expected for short task"
+        );
+    }
+
+    #[test]
+    fn write_status_uses_title_only_for_markdown_task_content() {
+        let project = new_project();
+        write_state_file("task.md", "", &project.config).expect("task.md should be writable");
+
+        let result = write_status(
+            StatusPatch {
+                status: Some(Status::Implementing),
+                last_run_task: Some(
+                    "# Add waiting list status\n\n## Summary\nImplement full waiting list flow."
+                        .to_string(),
+                ),
+                ..StatusPatch::default()
+            },
+            &project.config,
+        )
+        .expect("write_status should succeed");
+
+        assert_eq!(result.last_run_task, "Add waiting list status");
+        let logs = read_state_file("log.txt", &project.config);
+        assert!(
+            !logs.contains("last_run_task truncated"),
+            "title-only extraction should avoid truncation warning"
         );
     }
 
@@ -2233,12 +2369,22 @@ mod tests {
                     task_started_at: Some("2026-02-16T10:00:00.000Z".to_string()),
                     task_ended_at: Some("2026-02-16T10:05:30.000Z".to_string()),
                     duration_ms: Some(330_000),
+                    agent_calls: Some(6),
+                    input_tokens: Some(2_400),
+                    output_tokens: Some(1_100),
+                    total_tokens: Some(3_500),
+                    cost_usd_micros: Some(123_456),
                 },
                 TaskMetricsEntry {
                     title: "Task 2: Add retries".to_string(),
                     task_started_at: Some("2026-02-16T10:06:00.000Z".to_string()),
                     task_ended_at: Some("2026-02-16T10:10:15.000Z".to_string()),
                     duration_ms: Some(255_000),
+                    agent_calls: Some(4),
+                    input_tokens: Some(1_900),
+                    output_tokens: Some(900),
+                    total_tokens: Some(2_800),
+                    cost_usd_micros: Some(98_765),
                 },
             ],
         };
@@ -2294,6 +2440,11 @@ mod tests {
             task_started_at: None,
             task_ended_at: None,
             duration_ms: None,
+            agent_calls: None,
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cost_usd_micros: None,
         };
 
         let json = serde_json::to_value(&entry).unwrap();
@@ -2302,6 +2453,11 @@ mod tests {
         assert!(!obj.contains_key("task_started_at"));
         assert!(!obj.contains_key("task_ended_at"));
         assert!(!obj.contains_key("duration_ms"));
+        assert!(!obj.contains_key("agent_calls"));
+        assert!(!obj.contains_key("input_tokens"));
+        assert!(!obj.contains_key("output_tokens"));
+        assert!(!obj.contains_key("total_tokens"));
+        assert!(!obj.contains_key("cost_usd_micros"));
 
         // With values set
         let entry_with_values = TaskMetricsEntry {
@@ -2309,6 +2465,11 @@ mod tests {
             task_started_at: Some("2026-02-16T10:00:00.000Z".to_string()),
             task_ended_at: Some("2026-02-16T10:05:00.000Z".to_string()),
             duration_ms: Some(300_000),
+            agent_calls: Some(5),
+            input_tokens: Some(1_500),
+            output_tokens: Some(700),
+            total_tokens: Some(2_200),
+            cost_usd_micros: Some(77_000),
         };
 
         let json = serde_json::to_value(&entry_with_values).unwrap();
@@ -2316,5 +2477,77 @@ mod tests {
         assert_eq!(obj["task_started_at"], "2026-02-16T10:00:00.000Z");
         assert_eq!(obj["task_ended_at"], "2026-02-16T10:05:00.000Z");
         assert_eq!(obj["duration_ms"], 300_000);
+        assert_eq!(obj["agent_calls"], 5);
+        assert_eq!(obj["input_tokens"], 1_500);
+        assert_eq!(obj["output_tokens"], 700);
+        assert_eq!(obj["total_tokens"], 2_200);
+        assert_eq!(obj["cost_usd_micros"], 77_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // WorkflowKind tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workflow_kind_display_matches_expected_strings() {
+        assert_eq!(WorkflowKind::Plan.to_string(), "plan");
+        assert_eq!(WorkflowKind::Run.to_string(), "run");
+    }
+
+    #[test]
+    fn workflow_kind_from_str_round_trip() {
+        assert_eq!("plan".parse::<WorkflowKind>(), Ok(WorkflowKind::Plan));
+        assert_eq!("run".parse::<WorkflowKind>(), Ok(WorkflowKind::Run));
+    }
+
+    #[test]
+    fn workflow_kind_from_str_rejects_unknown() {
+        assert!("unknown".parse::<WorkflowKind>().is_err());
+        assert!("PLAN".parse::<WorkflowKind>().is_err());
+        assert!("RUN".parse::<WorkflowKind>().is_err());
+        assert!("".parse::<WorkflowKind>().is_err());
+        assert!("Plan".parse::<WorkflowKind>().is_err());
+    }
+
+    #[test]
+    fn write_then_read_workflow_round_trip() {
+        let project = new_project();
+
+        write_workflow(WorkflowKind::Plan, &project.config)
+            .expect("write_workflow Plan should succeed");
+        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Plan));
+
+        write_workflow(WorkflowKind::Run, &project.config)
+            .expect("write_workflow Run should succeed");
+        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Run));
+    }
+
+    #[test]
+    fn read_workflow_returns_none_for_missing_file() {
+        let project = new_project();
+        assert_eq!(read_workflow(&project.config), None);
+    }
+
+    #[test]
+    fn read_workflow_returns_none_for_empty_content() {
+        let project = new_project();
+        write_state_file("workflow.txt", "", &project.config).expect("empty write should succeed");
+        assert_eq!(read_workflow(&project.config), None);
+
+        write_state_file("workflow.txt", "   \n\t  ", &project.config)
+            .expect("whitespace write should succeed");
+        assert_eq!(read_workflow(&project.config), None);
+    }
+
+    #[test]
+    fn read_workflow_returns_none_for_unknown_content() {
+        let project = new_project();
+        write_state_file("workflow.txt", "garbage\n", &project.config)
+            .expect("garbage write should succeed");
+        assert_eq!(read_workflow(&project.config), None);
+
+        write_state_file("workflow.txt", "PLAN\n", &project.config)
+            .expect("uppercase write should succeed");
+        assert_eq!(read_workflow(&project.config), None);
     }
 }
