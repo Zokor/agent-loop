@@ -17,8 +17,15 @@ pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 200;
 #[allow(dead_code)]
 pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
+pub const DEFAULT_DECISIONS_MAX_LINES: u32 = 50;
 
 const CONFIG_FILE_NAME: &str = ".agent-loop.toml";
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct QualityCommand {
+    pub command: String,
+    pub remediation: Option<String>,
+}
 
 /// Per-project configuration loaded from `.agent-loop.toml`.
 ///
@@ -47,6 +54,12 @@ struct FileConfig {
     auto_test: Option<bool>,
     /// Override auto-detected quality check command.
     auto_test_cmd: Option<String>,
+    /// Explicit quality checks that override auto-detection when set.
+    quality_commands: Option<Vec<QualityCommand>>,
+    /// Run post-consensus compound phase to extract reusable learnings.
+    compound: Option<bool>,
+    /// Number of trailing decisions lines to inject in prompts.
+    decisions_max_lines: Option<u32>,
     /// Maximum diff lines before truncation.
     diff_max_lines: Option<u32>,
     /// Maximum lines for project-context output.
@@ -55,6 +68,8 @@ struct FileConfig {
     planning_context_excerpt_lines: Option<u32>,
     /// Maximum parallel task execution (future-safe plumbing).
     max_parallel: Option<u32>,
+    /// Implement all tasks from tasks.md in one batch loop (default true).
+    batch_implement: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,10 +117,14 @@ pub struct Config {
     pub auto_commit: bool,
     pub auto_test: bool,
     pub auto_test_cmd: Option<String>,
+    pub quality_commands: Vec<QualityCommand>,
+    pub compound: bool,
+    pub decisions_max_lines: u32,
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
     pub planning_context_excerpt_lines: Option<u32>,
     pub max_parallel: u32,
+    pub batch_implement: bool,
     pub verbose: bool,
 }
 
@@ -194,6 +213,11 @@ impl Config {
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         });
+        let quality_commands = file.quality_commands.unwrap_or_default();
+        let compound = env_bool("COMPOUND").or(file.compound).unwrap_or(true);
+        let decisions_max_lines = parse_env("DECISIONS_MAX_LINES")
+            .or(file.decisions_max_lines)
+            .unwrap_or(DEFAULT_DECISIONS_MAX_LINES);
 
         // --- diff/context limits: env > TOML > None (defaults via effective helpers) ---
         let diff_max_lines = parse_env("DIFF_MAX_LINES").or(file.diff_max_lines);
@@ -203,6 +227,9 @@ impl Config {
 
         // --- max_parallel: TOML > default ---
         let max_parallel = file.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+        let batch_implement = env_bool("BATCH_IMPLEMENT")
+            .or(file.batch_implement)
+            .unwrap_or(true);
 
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
@@ -221,10 +248,14 @@ impl Config {
             auto_commit,
             auto_test,
             auto_test_cmd,
+            quality_commands,
+            compound,
+            decisions_max_lines,
             diff_max_lines,
             context_line_cap,
             planning_context_excerpt_lines,
             max_parallel,
+            batch_implement,
             verbose,
         };
 
@@ -409,6 +440,14 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         ));
     }
 
+    if config.decisions_max_lines == 0 {
+        return Err(AgentLoopError::Config(
+            "decisions_max_lines must be > 0. \
+             Set DECISIONS_MAX_LINES or decisions_max_lines in .agent-loop.toml to a positive value."
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -429,6 +468,8 @@ mod tests {
             "AUTO_COMMIT",
             "AUTO_TEST",
             "AUTO_TEST_CMD",
+            "COMPOUND",
+            "DECISIONS_MAX_LINES",
             "MAX_ROUNDS",
             "PLANNING_MAX_ROUNDS",
             "DECOMPOSITION_MAX_ROUNDS",
@@ -436,6 +477,7 @@ mod tests {
             "DIFF_MAX_LINES",
             "CONTEXT_LINE_CAP",
             "PLANNING_CONTEXT_EXCERPT_LINES",
+            "BATCH_IMPLEMENT",
             "VERBOSE",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
@@ -553,10 +595,20 @@ single_agent = true
 auto_commit = false
 auto_test = true
 auto_test_cmd = "cargo test"
+compound = false
+decisions_max_lines = 75
 diff_max_lines = 250
 context_line_cap = 150
 planning_context_excerpt_lines = 80
 max_parallel = 4
+batch_implement = false
+
+[[quality_commands]]
+command = "cargo clippy -- -D warnings"
+remediation = "Fix all clippy warnings."
+
+[[quality_commands]]
+command = "cargo test"
 "#,
         );
         let config = load_file_config(&dir).expect("valid full file should parse");
@@ -570,10 +622,25 @@ max_parallel = 4
         assert_eq!(config.auto_commit, Some(false));
         assert_eq!(config.auto_test, Some(true));
         assert_eq!(config.auto_test_cmd.as_deref(), Some("cargo test"));
+        assert_eq!(config.compound, Some(false));
+        assert_eq!(config.decisions_max_lines, Some(75));
+        let quality_commands = config
+            .quality_commands
+            .as_ref()
+            .expect("quality_commands should parse");
+        assert_eq!(quality_commands.len(), 2);
+        assert_eq!(quality_commands[0].command, "cargo clippy -- -D warnings");
+        assert_eq!(
+            quality_commands[0].remediation.as_deref(),
+            Some("Fix all clippy warnings.")
+        );
+        assert_eq!(quality_commands[1].command, "cargo test");
+        assert_eq!(quality_commands[1].remediation, None);
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(150));
         assert_eq!(config.planning_context_excerpt_lines, Some(80));
         assert_eq!(config.max_parallel, Some(4));
+        assert_eq!(config.batch_implement, Some(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -644,6 +711,10 @@ max_parallel = 4
         assert!(config.auto_commit);
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
+        assert!(config.compound);
+        assert_eq!(config.decisions_max_lines, DEFAULT_DECISIONS_MAX_LINES);
+        assert!(config.quality_commands.is_empty());
+        assert!(config.batch_implement);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -800,6 +871,9 @@ single_agent = true
 auto_commit = false
 auto_test = true
 auto_test_cmd = "cargo test"
+compound = false
+decisions_max_lines = 90
+batch_implement = false
 "#,
         );
 
@@ -816,6 +890,9 @@ auto_test_cmd = "cargo test"
         assert!(!config.auto_commit);
         assert!(config.auto_test);
         assert_eq!(config.auto_test_cmd, Some("cargo test".to_string()));
+        assert!(!config.compound);
+        assert_eq!(config.decisions_max_lines, 90);
+        assert!(!config.batch_implement);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -839,6 +916,9 @@ single_agent = true
 auto_commit = false
 auto_test = false
 auto_test_cmd = "make test"
+compound = true
+decisions_max_lines = 40
+batch_implement = true
 "#,
         );
 
@@ -860,6 +940,9 @@ auto_test_cmd = "make test"
         assert!(config.auto_commit);
         assert!(config.auto_test);
         assert_eq!(config.auto_test_cmd, Some("npm test".to_string()));
+        assert!(config.compound);
+        assert_eq!(config.decisions_max_lines, 40);
+        assert!(config.batch_implement);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1071,6 +1154,92 @@ auto_test_cmd = "make test"
         let err =
             Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
         assert!(err.to_string().contains("timeout must be > 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_zero_decisions_max_lines() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECISIONS_MAX_LINES", "0");
+
+        let dir = create_temp_project_root("cfg_zero_decisions_max_lines");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("decisions_max_lines=0 should fail");
+        assert!(err.to_string().contains("decisions_max_lines must be > 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_compound_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_compound_env_overrides_toml");
+        write_toml(&dir, "compound = true\n");
+        set_env("COMPOUND", "0");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(!config.compound);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_decisions_max_lines_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_decisions_lines_env_overrides_toml");
+        write_toml(&dir, "decisions_max_lines = 20\n");
+        set_env("DECISIONS_MAX_LINES", "80");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.decisions_max_lines, 80);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_batch_implement_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_batch_implement_env_overrides_toml");
+        write_toml(&dir, "batch_implement = true\n");
+        set_env("BATCH_IMPLEMENT", "0");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(!config.batch_implement);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_file_config_parses_quality_commands_with_and_without_remediation() {
+        let dir = create_temp_project_root("toml_quality_commands");
+        write_toml(
+            &dir,
+            r#"
+[[quality_commands]]
+command = "cargo clippy -- -D warnings"
+remediation = "Fix clippy warnings."
+
+[[quality_commands]]
+command = "cargo test"
+"#,
+        );
+
+        let config = load_file_config(&dir).expect("quality_commands should parse");
+        let quality_commands = config
+            .quality_commands
+            .expect("quality_commands should exist");
+        assert_eq!(quality_commands.len(), 2);
+        assert_eq!(quality_commands[0].command, "cargo clippy -- -D warnings");
+        assert_eq!(
+            quality_commands[0].remediation.as_deref(),
+            Some("Fix clippy warnings.")
+        );
+        assert_eq!(quality_commands[1].command, "cargo test");
+        assert_eq!(quality_commands[1].remediation, None);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

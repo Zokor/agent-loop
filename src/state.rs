@@ -14,6 +14,8 @@ use crate::config::Config;
 
 const LAST_RUN_TASK_MAX_CHARS: usize = 500;
 const CONVERSATION_MAX_LINES: usize = 200;
+const DECISIONS_REFERENCE_START: &str = "<!-- agent-loop:decisions-reference:start -->";
+const DECISIONS_REFERENCE_END: &str = "<!-- agent-loop:decisions-reference:end -->";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -56,14 +58,16 @@ impl fmt::Display for Status {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkflowKind {
     Plan,
-    Run,
+    Decompose,
+    Implement,
 }
 
 impl fmt::Display for WorkflowKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let label = match self {
             Self::Plan => "plan",
-            Self::Run => "run",
+            Self::Decompose => "decompose",
+            Self::Implement => "implement",
         };
         write!(f, "{label}")
     }
@@ -75,7 +79,8 @@ impl FromStr for WorkflowKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "plan" => Ok(Self::Plan),
-            "run" => Ok(Self::Run),
+            "decompose" => Ok(Self::Decompose),
+            "implement" | "run" => Ok(Self::Implement),
             other => Err(format!("unknown workflow kind: {other:?}")),
         }
     }
@@ -110,6 +115,103 @@ pub struct StatusPatch {
 
 fn state_file_path(name: &str, config: &Config) -> PathBuf {
     config.state_dir.join(Path::new(name))
+}
+
+pub fn decisions_path(config: &Config) -> PathBuf {
+    config.project_dir.join(".agent-loop").join("decisions.md")
+}
+
+pub fn read_decisions(config: &Config) -> String {
+    let Ok(content) = fs::read_to_string(decisions_path(config)) else {
+        return String::new();
+    };
+
+    if content.trim().is_empty() {
+        return String::new();
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let max_lines = config.decisions_max_lines as usize;
+    if lines.len() <= max_lines {
+        return lines.join("\n");
+    }
+
+    lines[lines.len() - max_lines..].join("\n")
+}
+
+pub fn append_decision(entry: &str, config: &Config) -> io::Result<()> {
+    if entry.trim().is_empty() {
+        return Ok(());
+    }
+
+    let path = decisions_path(config);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    writeln!(file, "{}", entry.trim())
+}
+
+fn decisions_reference_block() -> String {
+    format!(
+        "{DECISIONS_REFERENCE_START}\n## Agent Loop Decisions\nReview `.agent-loop/decisions.md` before planning or implementation.\nAppend durable learnings as `- [CATEGORY] description`, where CATEGORY is one of: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY.\n{DECISIONS_REFERENCE_END}"
+    )
+}
+
+fn upsert_decisions_reference(content: &str) -> Option<String> {
+    if content.contains(".agent-loop/decisions.md") && !content.contains(DECISIONS_REFERENCE_START)
+    {
+        return None;
+    }
+
+    let block = decisions_reference_block();
+
+    if let Some(start_idx) = content.find(DECISIONS_REFERENCE_START)
+        && let Some(end_rel_idx) = content[start_idx..].find(DECISIONS_REFERENCE_END)
+    {
+        let end_idx = start_idx + end_rel_idx + DECISIONS_REFERENCE_END.len();
+        let mut updated = String::with_capacity(content.len().saturating_add(block.len()));
+        updated.push_str(&content[..start_idx]);
+        updated.push_str(&block);
+        updated.push_str(&content[end_idx..]);
+        return (updated != content).then_some(updated);
+    }
+
+    let mut updated = String::new();
+    let trimmed = content.trim_end_matches('\n');
+    if !trimmed.is_empty() {
+        updated.push_str(trimmed);
+        updated.push_str("\n\n");
+    }
+    updated.push_str(&block);
+    updated.push('\n');
+
+    (updated != content).then_some(updated)
+}
+
+fn ensure_decisions_reference_file(path: &Path) -> io::Result<bool> {
+    let content = match fs::read_to_string(path) {
+        Ok(existing) => existing,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+
+    let Some(updated) = upsert_decisions_reference(&content) else {
+        return Ok(false);
+    };
+
+    fs::write(path, updated)?;
+    Ok(true)
+}
+
+fn ensure_project_guide_decisions_references(config: &Config) {
+    for filename in ["AGENTS.md", "CLAUDE.md"] {
+        let path = config.project_dir.join(filename);
+        if let Err(err) = ensure_decisions_reference_file(&path) {
+            eprintln!("⚠ failed to sync decisions reference in {filename}: {err}");
+        }
+    }
 }
 
 pub fn normalize_task_text(value: &str) -> String {
@@ -871,6 +973,17 @@ pub fn init(
     workflow: WorkflowKind,
 ) -> io::Result<()> {
     fs::create_dir_all(&config.state_dir)?;
+    let decisions = decisions_path(config);
+    if !decisions.exists() {
+        if let Some(parent) = decisions.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(decisions)?;
+    }
+    ensure_project_guide_decisions_references(config);
     // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
     let _baseline_files = baseline_files;
 
@@ -1133,7 +1246,7 @@ mod tests {
             "  Build\n a   robust  state module ",
             &project.config,
             &baseline_files,
-            WorkflowKind::Run,
+            WorkflowKind::Implement,
         )
         .expect("init should succeed");
 
@@ -1151,6 +1264,23 @@ mod tests {
                 "{name} should exist after init"
             );
         }
+        assert!(
+            decisions_path(&project.config).exists(),
+            "decisions.md should exist after init"
+        );
+        for guide in ["AGENTS.md", "CLAUDE.md"] {
+            let guide_path = project.root.join(guide);
+            let guide_content =
+                fs::read_to_string(&guide_path).expect("guide should be created during init");
+            assert!(
+                guide_content.contains(".agent-loop/decisions.md"),
+                "{guide} should reference decisions.md"
+            );
+            assert!(
+                guide_content.contains(DECISIONS_REFERENCE_START),
+                "{guide} should contain managed decisions reference marker"
+            );
+        }
 
         let status = read_status(&project.config);
         assert_eq!(status.status, Status::Pending);
@@ -1163,11 +1293,103 @@ mod tests {
         assert_eq!(status.rating, None);
 
         let workflow = read_workflow(&project.config);
-        assert_eq!(workflow, Some(WorkflowKind::Run));
+        assert_eq!(workflow, Some(WorkflowKind::Implement));
 
         let log_content = read_state_file("log.txt", &project.config);
         assert!(log_content.contains("Agent loop initialized"));
         assert!(log_content.contains("Task: Build a robust state module"));
+    }
+
+    #[test]
+    fn init_decisions_reference_blocks_are_idempotent() {
+        let project = new_project();
+        let baseline_files = vec!["src/main.rs".to_string()];
+
+        init(
+            "First task",
+            &project.config,
+            &baseline_files,
+            WorkflowKind::Implement,
+        )
+        .expect("first init should succeed");
+        init(
+            "Second task",
+            &project.config,
+            &baseline_files,
+            WorkflowKind::Implement,
+        )
+        .expect("second init should succeed");
+
+        for guide in ["AGENTS.md", "CLAUDE.md"] {
+            let guide_content =
+                fs::read_to_string(project.root.join(guide)).expect("guide should exist");
+            assert_eq!(
+                guide_content.matches(DECISIONS_REFERENCE_START).count(),
+                1,
+                "{guide} should contain exactly one managed decisions block"
+            );
+        }
+    }
+
+    #[test]
+    fn manual_decisions_reference_is_preserved_without_managed_block() {
+        let project = new_project();
+        let path = project.root.join("AGENTS.md");
+        let original = "Repository guide\nAlways check .agent-loop/decisions.md first.\n";
+        fs::write(&path, original).expect("manual guide should be writable");
+
+        let changed =
+            ensure_decisions_reference_file(&path).expect("guide synchronization should succeed");
+        assert!(!changed, "manual decisions reference should be preserved");
+        assert_eq!(
+            fs::read_to_string(&path).expect("guide should be readable"),
+            original
+        );
+    }
+
+    #[test]
+    fn decisions_path_is_project_level_sibling_of_state_dir() {
+        let project = new_project();
+        let path = decisions_path(&project.config);
+        assert_eq!(path, project.root.join(".agent-loop").join("decisions.md"));
+    }
+
+    #[test]
+    fn read_decisions_missing_file_returns_empty() {
+        let project = new_project();
+        assert_eq!(read_decisions(&project.config), "");
+    }
+
+    #[test]
+    fn append_decision_noops_for_empty_entry_and_appends_non_empty_entry() {
+        let project = new_project();
+
+        append_decision("   ", &project.config).expect("empty append should succeed");
+        assert_eq!(read_decisions(&project.config), "");
+
+        append_decision("- [PATTERN] Use helper modules", &project.config)
+            .expect("append should succeed");
+        append_decision("- [CONSTRAINT] Keep API stable", &project.config)
+            .expect("append should succeed");
+
+        let content = read_decisions(&project.config);
+        assert!(content.contains("- [PATTERN] Use helper modules"));
+        assert!(content.contains("- [CONSTRAINT] Keep API stable"));
+    }
+
+    #[test]
+    fn read_decisions_returns_last_n_lines() {
+        let mut project = new_project();
+        project.config.decisions_max_lines = 2;
+
+        append_decision("- [ARCHITECTURE] A", &project.config).expect("append should succeed");
+        append_decision("- [PATTERN] B", &project.config).expect("append should succeed");
+        append_decision("- [GOTCHA] C", &project.config).expect("append should succeed");
+
+        let content = read_decisions(&project.config);
+        assert!(!content.contains("- [ARCHITECTURE] A"));
+        assert!(content.contains("- [PATTERN] B"));
+        assert!(content.contains("- [GOTCHA] C"));
     }
 
     #[test]
@@ -1723,7 +1945,7 @@ mod tests {
             "Test task",
             &project.config,
             &baseline_files,
-            WorkflowKind::Run,
+            WorkflowKind::Implement,
         )
         .expect("init should succeed");
 
@@ -2491,20 +2713,33 @@ mod tests {
     #[test]
     fn workflow_kind_display_matches_expected_strings() {
         assert_eq!(WorkflowKind::Plan.to_string(), "plan");
-        assert_eq!(WorkflowKind::Run.to_string(), "run");
+        assert_eq!(WorkflowKind::Decompose.to_string(), "decompose");
+        assert_eq!(WorkflowKind::Implement.to_string(), "implement");
     }
 
     #[test]
     fn workflow_kind_from_str_round_trip() {
         assert_eq!("plan".parse::<WorkflowKind>(), Ok(WorkflowKind::Plan));
-        assert_eq!("run".parse::<WorkflowKind>(), Ok(WorkflowKind::Run));
+        assert_eq!(
+            "decompose".parse::<WorkflowKind>(),
+            Ok(WorkflowKind::Decompose)
+        );
+        assert_eq!(
+            "implement".parse::<WorkflowKind>(),
+            Ok(WorkflowKind::Implement)
+        );
+    }
+
+    #[test]
+    fn workflow_kind_from_str_maps_legacy_run_to_implement() {
+        assert_eq!("run".parse::<WorkflowKind>(), Ok(WorkflowKind::Implement));
     }
 
     #[test]
     fn workflow_kind_from_str_rejects_unknown() {
         assert!("unknown".parse::<WorkflowKind>().is_err());
         assert!("PLAN".parse::<WorkflowKind>().is_err());
-        assert!("RUN".parse::<WorkflowKind>().is_err());
+        assert!("IMPLEMENT".parse::<WorkflowKind>().is_err());
         assert!("".parse::<WorkflowKind>().is_err());
         assert!("Plan".parse::<WorkflowKind>().is_err());
     }
@@ -2517,9 +2752,13 @@ mod tests {
             .expect("write_workflow Plan should succeed");
         assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Plan));
 
-        write_workflow(WorkflowKind::Run, &project.config)
-            .expect("write_workflow Run should succeed");
-        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Run));
+        write_workflow(WorkflowKind::Decompose, &project.config)
+            .expect("write_workflow Decompose should succeed");
+        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Decompose));
+
+        write_workflow(WorkflowKind::Implement, &project.config)
+            .expect("write_workflow Implement should succeed");
+        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Implement));
     }
 
     #[test]

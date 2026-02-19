@@ -1,288 +1,235 @@
 # agent-loop
 
-A CLI that runs a collaborative development loop between two AI coding agents. One implements, the other reviews. They iterate until both agree the work is done.
+`agent-loop` is a CLI for iterative AI-assisted delivery with explicit phases:
 
-By default two different agents are used (Claude implements, Codex reviews). In single-agent mode the same agent handles both roles.
+1. `plan`: create/refine the implementation plan only
+2. `tasks`: decompose the plan into implementable tasks only
+3. `implement`: execute implementation work only
 
-## Install
-
-```bash
-# Build and install globally
-cargo install --path .
-
-# Verify
-agent-loop help
-```
-
-Requires at least one agent CLI installed and authenticated:
-
-```bash
-claude --version    # Claude Code CLI
-codex --version     # OpenAI Codex CLI (only needed for dual-agent mode)
-```
+It persists session state under `.agent-loop/`, captures reusable decisions in `decisions.md`, and can run an optional post-consensus compound learning phase.
 
 ## Commands
 
-### Primary subcommands
+### `plan`
 
-```
-agent-loop plan <task>               Plan and decompose only, no implementation
-agent-loop plan --file <path>        Plan from a file
-agent-loop resume                    Continue from existing .agent-loop/state without re-init
-agent-loop tasks                     Execute all tasks from .agent-loop/state/tasks.md
-agent-loop tasks --file <path>       Execute tasks from a custom file
-```
-
-### Run
-
-```
-agent-loop run <task>                Run the loop on a task
-agent-loop run --file <path>         Read task from a file
-agent-loop run --single-agent        Use the same agent for both roles
-```
-
-`agent-loop "task"` also works (shorthand for `agent-loop run "task"`).
-
-### Utility
-
-```
-agent-loop init                      Create .agent-loop/state/ in current directory
-agent-loop status                    Show current loop status
-agent-loop help                      Print usage
-```
-
-### Deprecated forms (still supported)
-
-The following command forms continue to work but emit deprecation warnings.
-Use the new forms above instead — the old ones may be removed in a future release.
-
-| Old form | Replacement |
-| --- | --- |
-| `agent-loop run --planning-only` | `agent-loop plan` |
-| `agent-loop run --resume` | `agent-loop resume` |
-| `agent-loop run-tasks` | `agent-loop tasks` |
-| `agent-loop tasks --tasks-file <path>` | `agent-loop tasks --file <path>` |
-
-## How It Works
-
-### Implementation Mode (default)
-
-```
-Planning → Implementation → Review → Consensus → Done
-```
-
-1. **Planning** — Implementer proposes a plan, reviewer approves or revises (up to `PLANNING_MAX_ROUNDS`)
-2. **Implementation** — Implementer writes code based on the agreed plan
-3. **Review** — Reviewer checks the code, approves or requests changes
-4. **Consensus** — Both agents agree the work is complete
-5. **Loop** — If not, iterate until consensus or MAX_ROUNDS
-
-### Planning-Only Mode (`plan`)
-
-```
-Review Plan → Refine Plan → Consensus → Decompose Tasks → Stop
-```
-
-1. **Planning** — Both agents review and refine the plan
-2. **Consensus** — Both must agree before proceeding
-3. **Task Decomposition** — Break plan into discrete implementable tasks
-4. **Output** — Generates `.agent-loop/state/tasks.md`
-5. **Stop** — No code is written; run each task separately later
-
-## Examples
+Plan only. No decomposition and no implementation rounds.
 
 ```bash
-# Plan first, then execute — the recommended workflow
-agent-loop plan --file PLAN.md
-agent-loop tasks
-
-# Resume an interrupted loop
-agent-loop resume
-
-# Resume with higher round limits
-DECOMPOSITION_MAX_ROUNDS=6 agent-loop resume
-
-# Run tasks from a custom file with retry options
-agent-loop tasks --file my-tasks.md
-agent-loop tasks --max-retries 4 --round-step 3
-
-# Simple implementation task
-agent-loop run "Add user authentication with JWT tokens"
-
-# Task from file
-agent-loop run --file task.md
-
-# Custom settings
-MAX_ROUNDS=3 TIMEOUT=600 agent-loop run "Refactor the API layer"
-
-# Swap roles (Codex implements, Claude reviews)
-IMPLEMENTER=codex agent-loop run "Build a REST API"
-
-# Single-agent mode
-agent-loop run --single-agent "Fix the pagination bug"
-
-# Implement tasks one by one
-agent-loop run "Task 1: Foundation setup"
-agent-loop run "Task 2: Database schema"
+agent-loop plan <task>
+agent-loop plan --file <path>
 ```
 
-## Autonomous Task Runner
+### `tasks`
 
-After `agent-loop plan` generates `.agent-loop/state/tasks.md`, execute all tasks in sequence:
+Decompose only. Uses `.agent-loop/state/plan.md` by default.
 
 ```bash
 agent-loop tasks
-agent-loop tasks --file custom-tasks.md   # or use a custom file
+agent-loop tasks --resume
+agent-loop tasks --file <path-to-plan.md>
 ```
 
-Behavior:
+If no plan exists, it errors with:
 
-- Parses headings like `### Task 1: ...` from the tasks file
-- Runs each task with `agent-loop run "Task N: ..."` (fresh run, so rounds reset per task)
-- If a task stops with `status: MAX_ROUNDS`, retries with `agent-loop resume`
-- If a task stops with timeout `status: ERROR` (for example, "timed out after ..."), retries with `agent-loop resume`
-- Increases `MAX_ROUNDS` by `--round-step` on each retry
+```text
+No plan found. Run 'agent-loop plan' first.
+```
 
-Options:
+### `implement`
 
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--file <path>` | `.agent-loop/state/tasks.md` | Custom tasks markdown file |
-| `--max-retries <n>` | `2` | Retry count for retryable failures (`MAX_ROUNDS` and timeout `ERROR`) |
-| `--round-step <n>` | `2` | Amount added to `MAX_ROUNDS` on each retry |
-| `--single-agent` | off | Run each task in single-agent mode |
-| `--continue-on-fail` | off | Continue with remaining tasks even if one fails |
-| `--fail-fast` | off | Stop immediately on first task failure |
-| `--max-parallel <n>` | `1` | Reserved for future parallel execution (values >1 are accepted but currently downgraded to sequential with a warning) |
+Implementation only.
 
-> **Deprecation:** The old `agent-loop run-tasks` subcommand and the `--tasks-file` flag are
-> deprecated. Use `agent-loop tasks` with `--file` instead. The old forms still work but emit
-> warnings and may be removed in a future release.
+```bash
+agent-loop implement
+agent-loop implement --per-task
+agent-loop implement --task "Task 1: ..."
+agent-loop implement --file <task.md>
+agent-loop implement --resume
+```
+
+`agent-loop implement` (without flags) reads `.agent-loop/state/tasks.md` and executes all tasks in one implementation/review loop.
+Use `agent-loop implement --per-task` for legacy one-task-at-a-time execution.
+
+If no tasks file exists, it errors with:
+
+```text
+No tasks found. Run 'agent-loop tasks' first.
+```
+
+### `reset`
+
+Clear `.agent-loop/state/` and recreate it empty.
+
+```bash
+agent-loop reset
+```
+
+Output:
+
+```text
+State cleared. decisions.md preserved.
+```
+
+### Other
+
+```bash
+agent-loop status
+agent-loop version
+agent-loop help
+```
+
+## Workflow
+
+```text
+plan  ->  tasks  ->  implement
+```
+
+Implementation rounds use reviewer approval + implementer self-review before consensus:
+
+```text
+implement round
+  -> reviewer review
+  -> if approved: implementer self-review
+     -> CONSENSUS or DISPUTED
+```
+
+In dual-agent mode, a reviewer 5/5 triggers adversarial review first, then still runs implementer self-review (no dual-agent auto-consensus shortcut).
+
+## Decisions And Compound
+
+`agent-loop` persists reusable learnings in:
+
+```text
+.agent-loop/decisions.md
+```
+
+This file is:
+
+- Read at planning/implementation phase start
+- Injected into prompts as `PRIOR DECISIONS & LEARNINGS` (last `decisions_max_lines` lines)
+- Referenced automatically from root `AGENTS.md` and `CLAUDE.md` via a managed block
+- Preserved by `agent-loop reset`
+
+Decision categories used in prompts:
+
+- `ARCHITECTURE`
+- `PATTERN`
+- `CONSTRAINT`
+- `GOTCHA`
+- `DEPENDENCY`
+
+### Compound phase
+
+After implementation consensus, `agent-loop` can run a best-effort compound reflection phase to extract reusable learnings into `decisions.md`.
+
+Enable/disable:
+
+- TOML: `compound = false`
+- Env: `COMPOUND=0`
+
+### Struggle signals
+
+On `MAX_ROUNDS` and `ERROR` implementation exits, `agent-loop` appends a struggle signal to `decisions.md`:
+
+```text
+- [STRUGGLE] Task: <task_summary> | Issue: <reason> | Round: <n> | Date: <YYYY-MM-DD>
+```
 
 ## Configuration
 
-Settings are resolved in this order (highest precedence first):
-
-1. **CLI flags** (`--single-agent`) and **subcommands** (`plan`, `resume`, `tasks`)
-2. **Environment variables**
-3. **`.agent-loop.toml`** (per-project config file in the project root)
-4. **Built-in defaults**
-
-For persistent per-project settings, `.agent-loop.toml` is the preferred approach over environment variables.
-
-### `.agent-loop.toml`
-
-Place this file in your project root. All keys are optional — only set what you want to override:
+Use `.agent-loop.toml` in project root.
 
 ```toml
-# Max implementation/review rounds (default: 20)
 max_rounds = 20
-
-# Max planning consensus rounds (default: 3)
 planning_max_rounds = 3
-
-# Max task decomposition review rounds (default: 3)
 decomposition_max_rounds = 3
-
-# Idle timeout in seconds (default: 600)
 timeout = 600
 
-# Which agent implements: "claude" or "codex" (default: "claude")
-implementer = "claude"
-
-# Which agent reviews: "claude" or "codex" (default: opposite of implementer)
-reviewer = "codex"
-
-# Use same agent for both roles (default: false)
+implementer = "claude" # or "codex"
+reviewer = "codex"     # or "claude"
 single_agent = false
 
-# Auto-commit loop-owned changes after each round (default: true)
 auto_commit = true
-
-# Run quality checks before review (default: false)
 auto_test = false
+auto_test_cmd = "cargo test"
 
-# Override auto-detected quality check command
-# auto_test_cmd = "cargo test"
+compound = true
+decisions_max_lines = 50
+
+max_parallel = 1
+batch_implement = true
+diff_max_lines = 500
+context_line_cap = 200
+planning_context_excerpt_lines = 100
+
+[[quality_commands]]
+command = "cargo clippy -- -D warnings"
+remediation = "Fix all clippy warnings. Run 'cargo clippy --fix' for auto-fixable issues."
+
+[[quality_commands]]
+command = "cargo test"
 ```
 
-Unknown keys are rejected to catch typos early. If the file is missing, everything falls back to defaults silently.
+### `quality_commands`
 
-### Precedence examples
+When configured, `[[quality_commands]]` overrides auto-detected quality checks.
 
-```bash
-# .agent-loop.toml sets max_rounds = 10
+- `command`: shell command to run (executed with `sh -c` on Unix and `cmd /C` on Windows)
+- `remediation` (optional): hint prepended in quality output as `REMEDIATION: ...`
 
-# TOML wins over default (10 instead of 20)
-agent-loop run "task"
+Priority:
 
-# Env wins over TOML (50 instead of 10)
-MAX_ROUNDS=50 agent-loop run "task"
+1. `quality_commands`
+2. `auto_test_cmd`
+3. auto-detection by project type
 
-# CLI flag wins over everything
-# --single-agent forces single-agent even if SINGLE_AGENT=0 in env
-# or single_agent = false in TOML
-agent-loop run --single-agent "task"
-```
+## Environment Variables
 
-### Environment variables
+- `MAX_ROUNDS`
+- `PLANNING_MAX_ROUNDS`
+- `DECOMPOSITION_MAX_ROUNDS`
+- `TIMEOUT`
+- `IMPLEMENTER`
+- `REVIEWER`
+- `SINGLE_AGENT`
+- `AUTO_COMMIT`
+- `AUTO_TEST`
+- `AUTO_TEST_CMD`
+- `COMPOUND`
+- `DECISIONS_MAX_LINES`
+- `DIFF_MAX_LINES`
+- `CONTEXT_LINE_CAP`
+- `PLANNING_CONTEXT_EXCERPT_LINES`
+- `BATCH_IMPLEMENT`
+- `VERBOSE`
 
-Environment variables override `.agent-loop.toml` values but are overridden by CLI flags.
+## State Layout
 
-| Variable                   | Default  | Description                                                      |
-| -------------------------- | -------- | ---------------------------------------------------------------- |
-| `MAX_ROUNDS`               | `20`     | Max implementation/review cycles (exits early on consensus)      |
-| `PLANNING_MAX_ROUNDS`      | `3`      | Max planning consensus rounds                                    |
-| `DECOMPOSITION_MAX_ROUNDS` | `3`      | Max task decomposition review rounds                              |
-| `TIMEOUT`                  | `600`    | Idle timeout in seconds (resets on any agent output)             |
-| `IMPLEMENTER`              | `claude` | Which agent implements: `claude` or `codex`                      |
-| `REVIEWER`                 |          | Which agent reviews: `claude` or `codex` (default: opposite of implementer) |
-| `SINGLE_AGENT`             | `0`      | Use same agent for both roles (`1`/`true`/`yes`/`on` to enable)  |
-| `AUTO_COMMIT`              | `1`      | Auto-commit loop-owned changes after each round (`0` to disable) |
-| `AUTO_TEST`                | `0`      | Run quality checks before review (`1`/`true`/`yes`/`on` to enable) |
-| `AUTO_TEST_CMD`            |          | Override auto-detected quality check command                     |
-
-## Per-Project State
-
-Running `agent-loop init` or `agent-loop run` creates `.agent-loop/state/` in the current directory:
-
-```
+```text
 .agent-loop/
-└── state/
-    ├── task.md        # Original task description
-    ├── plan.md        # Agreed development plan
-    ├── tasks.md       # Task breakdown (planning-only mode)
-    ├── changes.md     # Summary of latest implementation changes
-    ├── review.md      # Latest review feedback
-    ├── status.json    # Loop state: status, round, actors, timestamp
-    ├── workflow.txt   # Workflow marker (plan or run) for resume
-    └── log.txt        # Full timestamped session log
+  decisions.md
+  state/
+    task.md
+    plan.md
+    tasks.md
+    changes.md
+    review.md
+    status.json
+    workflow.txt
+    log.txt
+    conversation.md
+    task_status.json
+    task_metrics.json
 ```
 
-Add `.agent-loop/state/` to your project's `.gitignore` — state is ephemeral.
+`reset` only clears `state/`; `decisions.md` is preserved.
 
-The tool binary lives globally. Only state files are created per-project.
+## Repository Knowledge Context
 
-## When to Use Which Mode
+When building planning context, `agent-loop` reads these files if present (within line budget):
 
-**Implementation mode** — Task is well-defined and scoped. You know what to build. Ready to write code.
-
-**Planning-only mode** — Starting a new project, need architecture review, plan is too large for a single run (>500 lines or >5 phases). Use `agent-loop plan` first, then implement each task from the generated `tasks.md`.
-
-## Single-Agent vs Dual-Agent
-
-**Dual-agent (default)** — Two different agents (Claude + Codex). Independent review from a different model catches more issues. Use for complex tasks.
-
-**Single-agent (`--single-agent`)** — Same agent for both roles. A hardening preamble is injected into reviewer prompts to counteract self-review bias, instructing the agent to evaluate code as if written by someone else. Use when you only have one CLI or the task is straightforward.
-
-## Exit Codes
-
-- `0` — Consensus reached
-- `1` — Max rounds hit, decomposition failed, or error
-
-## Git Integration
-
-- Auto-commits scoped changes after each implementation round with `agent-loop: <message>` prefix
-- Excludes `.agent-loop/state/` from commits
-- Only commits files created/modified by the loop (not pre-existing changes)
-- Disable with `AUTO_COMMIT=0`
+1. `README.md`
+2. `CLAUDE.md`
+3. `ARCHITECTURE.md`
+4. `CONVENTIONS.md`
+5. `AGENTS.md`

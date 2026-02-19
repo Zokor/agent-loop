@@ -9,6 +9,7 @@ use crate::{
     error::AgentLoopError,
     git::{git_checkpoint, git_diff_for_review, git_rev_parse_head},
     prompts::{
+        compound_prompt,
         decomposition_initial_prompt, decomposition_reviewer_prompt, decomposition_revision_prompt,
         gather_project_context, implementation_adversarial_review_prompt,
         implementation_consensus_prompt, implementation_implementer_prompt,
@@ -16,13 +17,10 @@ use crate::{
         planning_initial_prompt, planning_reviewer_prompt,
     },
     state::{
-        LoopStatus, Status, StatusPatch, is_status_stale, log, read_state_file, read_status,
-        summarize_task, timestamp, write_status,
+        LoopStatus, Status, StatusPatch, append_decision, is_status_stale, log, read_decisions,
+        read_state_file, read_status, summarize_task, timestamp, write_status,
     },
 };
-
-#[cfg(test)]
-use crate::prompts::single_agent_reviewer_preamble;
 
 const STALE_TIMESTAMP_REASON: &str = "Agent did not write status (stale timestamp detected)";
 const DECOMPOSITION_REVISION_FALLBACK_REASON: &str =
@@ -108,7 +106,7 @@ fn round_limit_reached(round: u32, max_rounds: u32) -> bool {
 }
 
 fn planning_next_step_command() -> &'static str {
-    "agent-loop run \"Task 1: ...\""
+    "agent-loop implement --task \"Task 1: ...\""
 }
 
 fn implementation_checkpoint_message(round: u32, changes: &str) -> String {
@@ -118,6 +116,76 @@ fn implementation_checkpoint_message(round: u32, changes: &str) -> String {
     }
 
     format!("round-{round}-implementation: {summary}")
+}
+
+fn struggle_date() -> String {
+    timestamp()
+        .split('T')
+        .next()
+        .unwrap_or("1970-01-01")
+        .to_string()
+}
+
+fn record_struggle_signal(task: &str, issue: &str, round: u32, config: &Config) {
+    let task_summary = summarize_task(task, Some(120));
+    let safe_task = if task_summary.trim().is_empty() {
+        "(unknown task)"
+    } else {
+        task_summary.as_str()
+    };
+    let safe_issue = if issue.trim().is_empty() {
+        "(unknown issue)"
+    } else {
+        issue.trim()
+    };
+    let entry = format!(
+        "- [STRUGGLE] Task: {safe_task} | Issue: {safe_issue} | Round: {round} | Date: {}",
+        struggle_date()
+    );
+    if let Err(err) = append_decision(&entry, config) {
+        let _ = log(
+            &format!("WARN: failed to append struggle signal: {err}"),
+            config,
+        );
+    }
+}
+
+fn run_compound_phase_with_runner<FRunAgent, FLog>(
+    task: &str,
+    plan: &str,
+    config: &Config,
+    run_agent_fn: &mut FRunAgent,
+    log_fn: &mut FLog,
+) where
+    FRunAgent: FnMut(crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
+    FLog: FnMut(&str, &Config),
+{
+    if !config.compound {
+        return;
+    }
+
+    log_fn("🧠 Running compound learning phase...", config);
+    if let Err(err) = run_agent_fn(config.implementer, &compound_prompt(task, plan), config) {
+        log_fn(
+            &format!("WARN: compound phase failed (continuing): {err}"),
+            config,
+        );
+    } else {
+        log_fn("✅ Compound learning phase complete.", config);
+    }
+}
+
+#[allow(dead_code)]
+pub fn compound_phase(task: &str, plan: &str, config: &Config) {
+    run_compound_phase_with_runner(
+        task,
+        plan,
+        config,
+        &mut |agent, prompt, current_config| run_agent(agent, prompt, current_config).map(|_| ()),
+        &mut |message, current_config| {
+            let _ = log(message, current_config);
+        },
+    );
 }
 
 fn implementation_reviewer_decision(status: Status) -> ImplementationReviewerDecision {
@@ -248,6 +316,7 @@ enum ProjectType {
 struct CheckCommand {
     label: String,
     command: String,
+    remediation: Option<String>,
 }
 
 fn detect_project_type(project_dir: &Path) -> ProjectType {
@@ -291,16 +360,19 @@ fn resolve_rust_commands() -> Vec<CheckCommand> {
         CheckCommand {
             label: "cargo build".to_string(),
             command: "cargo build".to_string(),
+            remediation: None,
         },
         CheckCommand {
             label: "cargo test".to_string(),
             command: "cargo test".to_string(),
+            remediation: None,
         },
     ];
     if clippy_available() {
         commands.push(CheckCommand {
             label: "cargo clippy".to_string(),
             command: "cargo clippy -- -D warnings".to_string(),
+            remediation: None,
         });
     }
     commands
@@ -328,6 +400,7 @@ fn resolve_jsts_commands(project_dir: &Path) -> Vec<CheckCommand> {
             commands.push(CheckCommand {
                 label: format!("npm run {script_name}"),
                 command: format!("npm run {script_name}"),
+                remediation: None,
             });
         }
     }
@@ -335,10 +408,23 @@ fn resolve_jsts_commands(project_dir: &Path) -> Vec<CheckCommand> {
 }
 
 fn resolve_quality_commands(config: &Config) -> Vec<CheckCommand> {
+    if !config.quality_commands.is_empty() {
+        return config
+            .quality_commands
+            .iter()
+            .map(|quality| CheckCommand {
+                label: quality.command.clone(),
+                command: quality.command.clone(),
+                remediation: quality.remediation.clone(),
+            })
+            .collect();
+    }
+
     if let Some(override_cmd) = &config.auto_test_cmd {
         return vec![CheckCommand {
             label: "custom".to_string(),
             command: override_cmd.clone(),
+            remediation: None,
         }];
     }
 
@@ -354,6 +440,7 @@ struct CheckResult {
     label: String,
     success: bool,
     timed_out: bool,
+    remediation: Option<String>,
     output: String,
 }
 
@@ -451,16 +538,35 @@ fn run_single_check(check: &CheckCommand, project_dir: &Path) -> CheckResult {
     run_single_check_with_timeout(check, project_dir, QUALITY_CHECK_TIMEOUT_SECS)
 }
 
+fn make_quality_shell_command(command: &str, project_dir: &Path) -> Command {
+    // Use the platform-native shell so quality checks work without requiring
+    // Unix tooling on Windows.
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", command]);
+        cmd
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", command]);
+        cmd
+    };
+
+    cmd.current_dir(project_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd
+}
+
 fn run_single_check_with_timeout(
     check: &CheckCommand,
     project_dir: &Path,
     timeout_secs: u64,
 ) -> CheckResult {
-    let mut cmd = Command::new("sh");
-    cmd.args(["-c", &check.command])
-        .current_dir(project_dir)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut cmd = make_quality_shell_command(&check.command, project_dir);
 
     #[cfg(unix)]
     unsafe {
@@ -480,6 +586,7 @@ fn run_single_check_with_timeout(
                 label: check.label.clone(),
                 success: false,
                 timed_out: false,
+                remediation: check.remediation.clone(),
                 output: format!("Failed to spawn: {err}"),
             };
         }
@@ -571,6 +678,7 @@ fn run_single_check_with_timeout(
         label: check.label.clone(),
         success,
         timed_out,
+        remediation: check.remediation.clone(),
         output,
     }
 }
@@ -658,8 +766,18 @@ fn format_quality_checks(results: &[CheckResult]) -> String {
         };
 
         lines.push(format!("\n--- {} [{}] ---", result.label, status_label));
-        if !result.output.trim().is_empty() {
-            lines.push(result.output.clone());
+        let remediation = result
+            .remediation
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(str::trim);
+        let output = result.output.trim();
+
+        match (remediation, output.is_empty()) {
+            (Some(hint), false) => lines.push(format!("REMEDIATION: {hint}\n{}", result.output)),
+            (Some(hint), true) => lines.push(format!("REMEDIATION: {hint}")),
+            (None, false) => lines.push(result.output.clone()),
+            (None, true) => {}
         }
     }
 
@@ -789,12 +907,13 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         config.effective_context_line_cap() as usize,
         config.effective_planning_context_excerpt_lines() as usize,
     );
+    let decisions = read_decisions(config);
 
     let _ = log("📝 Implementer proposing plan...", config);
     if !run_agent_or_record_error(
         config,
         config.implementer,
-        &planning_initial_prompt(&task, &project_context, &paths),
+        &planning_initial_prompt(&task, &project_context, &decisions, &paths),
         Some(0),
     ) {
         return false;
@@ -1308,8 +1427,10 @@ where
     FAppendHistory: FnMut(u32, &str, &str, &Config),
 {
     let paths = phase_paths(config);
+    let phase_decisions = read_decisions(config);
 
     if config.max_rounds == 0 {
+        let task = read_state_file_fn("task.md", config);
         log_fn(
             &format!("\n⏰ {}", IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON),
             config,
@@ -1324,6 +1445,7 @@ where
             config,
         );
         git_checkpoint_fn("max-rounds-reached", config, baseline_files);
+        record_struggle_signal(&task, IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON, 0, config);
         return false;
     }
 
@@ -1349,6 +1471,7 @@ where
     }
 
     if start_round > config.max_rounds {
+        let task = read_state_file_fn("task.md", config);
         log_fn(
             &format!(
                 "\n⏰ Max rounds ({}) reached without consensus",
@@ -1365,6 +1488,12 @@ where
             config,
         );
         git_checkpoint_fn("max-rounds-reached", config, baseline_files);
+        record_struggle_signal(
+            &task,
+            "max rounds already exhausted before resume",
+            config.max_rounds,
+            config,
+        );
         return false;
     }
 
@@ -1398,6 +1527,7 @@ where
                 &task,
                 &plan,
                 &previous_review,
+                &phase_decisions,
                 &paths,
                 &impl_history,
             ),
@@ -1415,6 +1545,7 @@ where
                 },
                 config,
             );
+            record_struggle_signal(&task, &err.to_string(), round, config);
             return false;
         }
 
@@ -1452,6 +1583,7 @@ where
                 &reviewer_prompt_timestamp,
                 &paths,
                 quality_checks_output.as_deref(),
+                &phase_decisions,
                 &reviewer_history,
             ),
             config,
@@ -1468,6 +1600,7 @@ where
                 },
                 config,
             );
+            record_struggle_signal(&task, &err.to_string(), round, config);
             return false;
         }
 
@@ -1526,6 +1659,13 @@ where
                         config,
                     );
                     git_checkpoint_fn(&format!("consensus-round-{round}"), config, baseline_files);
+                    run_compound_phase_with_runner(
+                        &task,
+                        &plan,
+                        config,
+                        &mut run_agent_fn,
+                        &mut log_fn,
+                    );
                     return true;
                 } else if is_perfect_score {
                     // === BRANCH 2: Dual-agent 5/5 — adversarial second review ===
@@ -1579,6 +1719,7 @@ where
                             },
                             config,
                         );
+                        record_struggle_signal(&task, &err.to_string(), round, config);
                         return false;
                     }
 
@@ -1618,32 +1759,137 @@ where
                     match implementation_reviewer_decision(adversarial_status.status) {
                         ImplementationReviewerDecision::Approved => {
                             log_fn(
-                                &format!(
-                                    "\n🎉 CONSENSUS reached in round {round}! (adversarial confirmed)"
+                                "🤝 Adversarial review approved — running implementer self-review...",
+                                config,
+                            );
+
+                            let review = read_state_file_fn("review.md", config);
+                            let consensus_prompt_timestamp = timestamp_fn();
+                            if let Err(err) = run_agent_fn(
+                                config.implementer,
+                                &implementation_consensus_prompt(
+                                    config,
+                                    &task,
+                                    &plan,
+                                    &review,
+                                    round,
+                                    &consensus_prompt_timestamp,
+                                    &paths,
                                 ),
                                 config,
-                            );
-                            write_status_fn(
-                                StatusPatch {
-                                    status: Some(Status::Consensus),
-                                    round: Some(round),
-                                    rating: reviewer_rating,
-                                    ..StatusPatch::default()
-                                },
-                                config,
-                            );
-                            append_history_fn(
-                                round,
-                                "consensus",
-                                "CONSENSUS (adversarial confirmed)",
-                                config,
-                            );
-                            git_checkpoint_fn(
-                                &format!("consensus-round-{round}"),
-                                config,
-                                baseline_files,
-                            );
-                            return true;
+                            ) {
+                                let status = status_for_error(&err);
+                                let reason = err.to_string();
+                                log_fn(&format!("❌ {reason}"), config);
+                                write_status_fn(
+                                    StatusPatch {
+                                        status: Some(status),
+                                        round: Some(round),
+                                        reason: Some(reason),
+                                        ..StatusPatch::default()
+                                    },
+                                    config,
+                                );
+                                record_struggle_signal(&task, &err.to_string(), round, config);
+                                return false;
+                            }
+
+                            let mut final_status = read_status_fn(config);
+                            if final_status.status != Status::Error
+                                && is_status_stale(&consensus_prompt_timestamp, &final_status)
+                            {
+                                log_fn(
+                                    "⚠️ Stale status detected after implementation consensus — writing Disputed fallback",
+                                    config,
+                                );
+                                write_status_fn(
+                                    StatusPatch {
+                                        status: Some(Status::Disputed),
+                                        round: Some(round),
+                                        reason: Some(STALE_TIMESTAMP_REASON.to_string()),
+                                        ..StatusPatch::default()
+                                    },
+                                    config,
+                                );
+                                final_status = read_status_fn(config);
+                            }
+
+                            if final_status.rating.is_none()
+                                && let Some(r) = reviewer_rating
+                            {
+                                write_status_fn(
+                                    StatusPatch {
+                                        rating: Some(r),
+                                        ..StatusPatch::default()
+                                    },
+                                    config,
+                                );
+                            }
+
+                            let consensus_summary = match final_status.status {
+                                Status::Consensus => "CONSENSUS".to_string(),
+                                Status::Disputed => {
+                                    format!(
+                                        "DISPUTED — {}",
+                                        final_status
+                                            .reason
+                                            .as_deref()
+                                            .unwrap_or("see status.json")
+                                    )
+                                }
+                                other => format!("{other}"),
+                            };
+                            append_history_fn(round, "consensus", &consensus_summary, config);
+
+                            match implementation_consensus_decision(final_status.status) {
+                                ImplementationConsensusDecision::Consensus => {
+                                    log_fn(
+                                        &format!("\n🎉 CONSENSUS reached in round {round}!"),
+                                        config,
+                                    );
+                                    git_checkpoint_fn(
+                                        &format!("consensus-round-{round}"),
+                                        config,
+                                        baseline_files,
+                                    );
+                                    run_compound_phase_with_runner(
+                                        &task,
+                                        &plan,
+                                        config,
+                                        &mut run_agent_fn,
+                                        &mut log_fn,
+                                    );
+                                    return true;
+                                }
+                                ImplementationConsensusDecision::Disputed
+                                | ImplementationConsensusDecision::Continue => {
+                                    log_fn(
+                                        &format!(
+                                            "⚠ Implementer disputed: {}",
+                                            final_status
+                                                .reason
+                                                .as_deref()
+                                                .unwrap_or("see status.json")
+                                        ),
+                                        config,
+                                    );
+                                }
+                                ImplementationConsensusDecision::Error => {
+                                    let reason = status_error_reason(&final_status);
+                                    log_fn(&format!("❌ {reason}"), config);
+                                    write_status_fn(
+                                        StatusPatch {
+                                            status: Some(Status::Error),
+                                            round: Some(round),
+                                            reason: Some(reason.clone()),
+                                            ..StatusPatch::default()
+                                        },
+                                        config,
+                                    );
+                                    record_struggle_signal(&task, &reason, round, config);
+                                    return false;
+                                }
+                            }
                         }
                         ImplementationReviewerDecision::NeedsChanges => {
                             log_fn(
@@ -1665,11 +1911,12 @@ where
                                 StatusPatch {
                                     status: Some(Status::Error),
                                     round: Some(round),
-                                    reason: Some(reason),
+                                    reason: Some(reason.clone()),
                                     ..StatusPatch::default()
                                 },
                                 config,
                             );
+                            record_struggle_signal(&task, &reason, round, config);
                             return false;
                         }
                     }
@@ -1686,6 +1933,8 @@ where
                         config.implementer,
                         &implementation_consensus_prompt(
                             config,
+                            &task,
+                            &plan,
                             &review,
                             round,
                             &consensus_prompt_timestamp,
@@ -1705,6 +1954,7 @@ where
                             },
                             config,
                         );
+                        record_struggle_signal(&task, &err.to_string(), round, config);
                         return false;
                     }
 
@@ -1760,6 +2010,13 @@ where
                                 config,
                                 baseline_files,
                             );
+                            run_compound_phase_with_runner(
+                                &task,
+                                &plan,
+                                config,
+                                &mut run_agent_fn,
+                                &mut log_fn,
+                            );
                             return true;
                         }
                         ImplementationConsensusDecision::Disputed
@@ -1779,11 +2036,12 @@ where
                                 StatusPatch {
                                     status: Some(Status::Error),
                                     round: Some(round),
-                                    reason: Some(reason),
+                                    reason: Some(reason.clone()),
                                     ..StatusPatch::default()
                                 },
                                 config,
                             );
+                            record_struggle_signal(&task, &reason, round, config);
                             return false;
                         }
                     }
@@ -1797,16 +2055,20 @@ where
                     StatusPatch {
                         status: Some(Status::Error),
                         round: Some(round),
-                        reason: Some(reason),
+                        reason: Some(reason.clone()),
                         ..StatusPatch::default()
                     },
                     config,
                 );
+                record_struggle_signal(&task, &reason, round, config);
                 return false;
             }
         }
 
         if round == config.max_rounds {
+            let issue = read_status_fn(config)
+                .reason
+                .unwrap_or_else(|| "max rounds reached without consensus".to_string());
             log_fn(
                 &format!(
                     "\n⏰ Max rounds ({}) reached without consensus",
@@ -1823,6 +2085,7 @@ where
                 config,
             );
             git_checkpoint_fn("max-rounds-reached", config, baseline_files);
+            record_struggle_signal(&task, &issue, round, config);
             return false;
         }
     }
@@ -1903,2958 +2166,145 @@ pub fn print_summary(config: &Config) {
     println!("{}", format_summary_block(&status));
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestConfigOptions, TestProject, env_lock, make_test_config};
-    use std::{
-        collections::{HashMap, HashSet, VecDeque},
-        fs,
-        path::PathBuf,
-    };
+    use crate::config::QualityCommand;
+    use crate::test_support::{TestConfigOptions, create_temp_project_root, make_test_config};
 
-    const TEST_TIMESTAMP: &str = "2026-02-14T00:00:00.000Z";
-
-    fn new_project(single_agent: bool) -> TestProject {
-        TestProject::builder("agent_loop_phase_test")
-            .single_agent(single_agent)
-            .auto_commit(false)
-            .build()
-    }
-
-    fn test_config(single_agent: bool) -> Config {
-        let project_dir = PathBuf::from("/tmp/agent-loop-phases-tests");
-        make_test_config(
-            &project_dir,
-            TestConfigOptions {
-                single_agent,
-                auto_commit: true,
-                ..TestConfigOptions::default()
-            },
-        )
-    }
-
-    fn test_config_with_rounds(single_agent: bool, max_rounds: u32) -> Config {
-        let mut config = test_config(single_agent);
-        config.max_rounds = max_rounds;
-        config
-    }
-
-    fn test_loop_status(
-        status: Status,
-        round: u32,
-        reason: Option<&str>,
-        config: &Config,
-    ) -> LoopStatus {
-        test_loop_status_with_rating(status, round, reason, None, config)
-    }
-
-    fn test_loop_status_with_rating(
-        status: Status,
-        round: u32,
-        reason: Option<&str>,
-        rating: Option<u32>,
-        config: &Config,
-    ) -> LoopStatus {
-        LoopStatus {
-            status,
-            round,
-            implementer: config.implementer.to_string(),
-            reviewer: config.reviewer.to_string(),
-            mode: config.run_mode.to_string(),
-            last_run_task: "Implement task".to_string(),
-            reason: reason.map(ToOwned::to_owned),
-            rating,
-            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
-        }
+    fn test_config() -> Config {
+        let root = create_temp_project_root("phases_tests");
+        make_test_config(&root, TestConfigOptions::default())
     }
 
     #[test]
-    fn single_agent_reviewer_preamble_is_empty_in_dual_agent_mode() {
-        let config = test_config(false);
-        assert_eq!(single_agent_reviewer_preamble(&config), "");
-    }
-
-    #[test]
-    fn single_agent_reviewer_preamble_matches_typescript_text_exactly() {
-        let config = test_config(true);
-        assert_eq!(
-            single_agent_reviewer_preamble(&config),
-            "⚠️ SINGLE-AGENT REVIEWER MODE ⚠️
-You are now switching roles from IMPLEMENTER to REVIEWER. You must adopt a completely independent, critical perspective.
-
-CRITICAL INSTRUCTIONS:
-- You MUST evaluate the work as if you did NOT write it.
-- Do NOT assume correctness because the code \"looks familiar.\"
-- Actively look for bugs, edge cases, missing tests, and design flaws.
-- Apply the same scrutiny you would to a junior developer's first PR.
-- If something is unclear or under-tested, flag it — do not give benefit of the doubt.
-- Your approval carries weight: a false approval means bugs ship to production.
-
-"
-        );
-    }
-
-    #[test]
-    fn phase_paths_are_derived_from_absolute_state_dir() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-
-        assert!(paths.task_md.is_absolute());
-        assert!(paths.plan_md.is_absolute());
-        assert!(paths.tasks_md.is_absolute());
-        assert!(paths.changes_md.is_absolute());
-        assert!(paths.review_md.is_absolute());
-        assert!(paths.status_json.is_absolute());
-
-        assert_eq!(paths.task_md, config.state_dir.join("task.md"));
-        assert_eq!(paths.plan_md, config.state_dir.join("plan.md"));
-        assert_eq!(paths.tasks_md, config.state_dir.join("tasks.md"));
-        assert_eq!(paths.changes_md, config.state_dir.join("changes.md"));
-        assert_eq!(paths.review_md, config.state_dir.join("review.md"));
-        assert_eq!(paths.status_json, config.state_dir.join("status.json"));
-    }
-
-    #[test]
-    fn planning_reviewer_prompt_contains_paths_and_status_templates() {
-        let config = test_config(true);
-        let paths = phase_paths(&config);
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            2,
-            "2026-02-14T10:00:00.000Z",
-            &paths,
-            None,
-        );
-
-        assert!(prompt.starts_with("⚠️ SINGLE-AGENT REVIEWER MODE ⚠️"));
-        assert!(prompt.contains(&format!(
-            "write this exact JSON to {}:",
-            paths.status_json.display()
-        )));
-        assert!(prompt.contains(&format!(
-            "write your revised plan to {} and write this JSON to {}:",
-            paths.plan_md.display(),
-            paths.status_json.display()
-        )));
-        assert!(prompt.contains(
-            "{\"status\": \"APPROVED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
-        ));
-        assert!(prompt.contains(
-            "{\"status\": \"NEEDS_REVISION\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"reason\": \"your reason here\", \"timestamp\": \"2026-02-14T10:00:00.000Z\"}"
-        ));
-    }
-
-    #[test]
-    fn decomposition_reviewer_prompt_contains_paths_and_status_templates() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-        let prompt = decomposition_reviewer_prompt(
-            &config,
-            "Plan content",
-            "Task list",
-            3,
-            "2026-02-14T11:30:15.250Z",
-            &paths,
-        );
-
-        assert!(prompt.starts_with("You are the REVIEWER in a collaborative development loop."));
-        assert!(prompt.contains(&format!(
-            "write this JSON to {}:",
-            paths.status_json.display()
-        )));
-        assert!(prompt.contains(&format!(
-            "revise the task list in {} and write:",
-            paths.tasks_md.display()
-        )));
-        assert!(prompt.contains(
-            "{\"status\": \"CONSENSUS\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
-        ));
-        assert!(prompt.contains(
-            "{\"status\": \"NEEDS_REVISION\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"reason\": \"brief explanation\", \"timestamp\": \"2026-02-14T11:30:15.250Z\"}"
-        ));
-    }
-
-    #[test]
-    fn decomposition_revision_prompt_contains_feedback_and_disputed_status_template() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-        let prompt = decomposition_revision_prompt(
-            &config,
-            "Original task",
-            "Agreed plan",
-            "Current tasks",
-            "Missing test coverage task",
-            2,
-            "2026-02-14T12:00:00.999Z",
-            &paths,
-        );
-
-        assert!(prompt.contains("REVIEWER FEEDBACK:\nMissing test coverage task"));
-        assert!(prompt.contains(&format!(
-            "Revise {} to address all reviewer feedback",
-            paths.tasks_md.display()
-        )));
-        assert!(prompt.contains(&format!(
-            "Then write this JSON to {}:",
-            paths.status_json.display()
-        )));
-        assert!(prompt.contains(
-            "{\"status\": \"DISPUTED\", \"round\": 2, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T12:00:00.999Z\"}"
-        ));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn task_decomposition_phase_uses_previous_round_reason_for_revision_prompt() {
-        let _env_guard = env_lock();
-        let project = new_project(false);
-        crate::state::write_state_file("task.md", "Build feature X", &project.config)
-            .expect("task.md should be writable");
-        crate::state::write_state_file("plan.md", "Plan details", &project.config)
-            .expect("plan.md should be writable");
-        crate::state::write_state_file("tasks.md", "Initial tasks", &project.config)
-            .expect("tasks.md should be writable");
-
-        project.create_executable(
-            "claude",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.claude-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nif [ \"$COUNT\" -eq 2 ]; then\n  printf '%s' \"$2\" > \"$PWD/.round2-prompt.txt\"\nfi\nexit 0\n",
-        );
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.codex-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 1 ]; then\n  printf '{\"status\":\"NEEDS_REVISION\",\"round\":1,\"reason\":\"tasks too coarse\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nelse\n  printf '{\"status\":\"CONSENSUS\",\"round\":2,\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let decomposed = task_decomposition_phase(&project.config);
-
-        assert!(decomposed);
-        let second_round_prompt = fs::read_to_string(project.path(".round2-prompt.txt"))
-            .expect("round two prompt should be captured");
-        assert!(second_round_prompt.contains("REVIEWER FEEDBACK:\ntasks too coarse"));
-        assert!(!second_round_prompt.contains("REVIEWER FEEDBACK:\nNeeds revision"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn planning_phase_aborts_when_reviewer_writes_invalid_status_json() {
-        let _env_guard = env_lock();
-        let project = new_project(false);
-        crate::state::write_state_file("task.md", "Build feature Y", &project.config)
-            .expect("task.md should be writable");
-
-        project.create_executable("claude", "#!/bin/sh\nexit 0\n");
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nprintf '{broken' > \"$PWD/.agent-loop/state/status.json\"\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config, false);
-
-        assert!(!planned);
-        let status = read_status(&project.config);
-        assert_eq!(status.status, Status::Error);
-        assert!(
-            status
-                .reason
-                .as_deref()
-                .is_some_and(|value| value.starts_with("Invalid status.json:"))
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn task_decomposition_phase_resume_continues_from_next_round() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.decomposition_max_rounds = 5;
-        crate::state::write_state_file("task.md", "Build feature Z", &project.config)
-            .expect("task.md should be writable");
-        crate::state::write_state_file("plan.md", "Plan details", &project.config)
-            .expect("plan.md should be writable");
-        crate::state::write_state_file("tasks.md", "Existing tasks", &project.config)
-            .expect("tasks.md should be writable");
-        crate::state::write_status(
-            StatusPatch {
-                status: Some(Status::NeedsRevision),
-                round: Some(3),
-                reason: Some("carry-forward reason".to_string()),
-                ..StatusPatch::default()
-            },
-            &project.config,
-        )
-        .expect("status should be writable");
-
-        project.create_executable(
-            "claude",
-            "#!/bin/sh\nprintf '%s' \"$2\" > \"$PWD/.resume-round4-prompt.txt\"\nexit 0\n",
-        );
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nprintf '{\"status\":\"CONSENSUS\",\"round\":4,\"timestamp\":\"%s\"}' \"$TS\" > \"$PWD/.agent-loop/state/status.json\"\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let resumed = task_decomposition_phase_resume(&project.config);
-
-        assert!(resumed);
-        let prompt = fs::read_to_string(project.path(".resume-round4-prompt.txt"))
-            .expect("resume prompt should be captured");
-        assert!(prompt.contains("REVIEWER FEEDBACK:\ncarry-forward reason"));
-        assert!(prompt.contains("\"round\": 4"));
-        assert!(!prompt.contains("Create a task breakdown file"));
-
-        let log_contents = fs::read_to_string(project.path(".agent-loop/state/log.txt"))
-            .expect("log should be readable");
-        assert!(log_contents.contains("Resuming task decomposition from round 4/5"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn planning_reviewer_stale_status_triggers_needs_revision_fallback() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.planning_max_rounds = 1;
-        crate::state::write_state_file("task.md", "Build feature S", &project.config)
-            .expect("task.md should be writable");
-
-        // Implementer writes an initial plan, does not touch status.
-        project.create_executable("claude", "#!/bin/sh\nexit 0\n");
-        // Reviewer does NOT write status.json — causes stale detection.
-        project.create_executable("codex", "#!/bin/sh\nexit 0\n");
-
-        let _path_guard = project.with_path_override();
-        let _planned = planning_phase(&project.config, false);
-
-        // In non-planning_only mode, planning_phase returns true even without consensus.
-        // The key assertion is that stale detection fired (visible in the log).
-        let log_contents = project.read_log();
-        assert!(
-            log_contents.contains("Stale status detected after planning reviewer"),
-            "should log stale reviewer detection, got: {log_contents}"
-        );
-        assert!(
-            log_contents.contains(STALE_TIMESTAMP_REASON),
-            "stale reason should appear in log, got: {log_contents}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn planning_implementer_revision_stale_status_triggers_needs_revision_fallback() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.planning_max_rounds = 2;
-        crate::state::write_state_file("task.md", "Build feature T", &project.config)
-            .expect("task.md should be writable");
-
-        // Implementer writes initial plan on first call, does NOT write status on revision.
-        project.create_executable("claude", "#!/bin/sh\nexit 0\n");
-        // Reviewer writes NeedsRevision on first call with matching timestamp (triggers the revision path),
-        // then on second call does NOT write (loop exits after max rounds).
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.codex-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 1 ]; then\n  printf '{\"status\":\"NEEDS_REVISION\",\"round\":1,\"reason\":\"revise plan\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let _ = planning_phase(&project.config, false);
-
-        let log_contents = project.read_log();
-        assert!(
-            log_contents.contains("Stale status detected after planning implementer revision"),
-            "should log stale implementer revision detection, got: {log_contents}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn planning_loop_forwards_disputed_reason_to_next_reviewer() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.planning_max_rounds = 3;
-        crate::state::write_state_file("task.md", "Build feature D", &project.config)
-            .expect("task.md should be writable");
-
-        // Implementer (claude): args are [-p, prompt, --dangerously-skip-permissions]
-        //   Call 1: writes initial plan (no status).
-        //   Call 2 (revision response): writes DISPUTED with reason, matching timestamp from $2.
-        //   Call 3 (revision response): writes CONSENSUS, matching timestamp from $2.
-        project.create_executable(
-            "claude",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.claude-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$2\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 2 ]; then\n  printf '{\"status\":\"DISPUTED\",\"round\":1,\"reason\":\"rollback plan is unsafe\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nelif [ \"$COUNT\" -eq 3 ]; then\n  printf '{\"status\":\"CONSENSUS\",\"round\":2,\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-        // Reviewer (codex): args are [exec, --skip-git-repo-check, --dangerously-bypass-approvals-and-sandbox, prompt]
-        //   Call 1 (round 1): writes NEEDS_REVISION (triggers implementer revision).
-        //   Call 2 (round 2): captures its prompt from $4, writes NEEDS_REVISION.
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.codex-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 1 ]; then\n  printf '{\"status\":\"NEEDS_REVISION\",\"round\":1,\"reason\":\"needs detail\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nelif [ \"$COUNT\" -eq 2 ]; then\n  printf '%s' \"$4\" > \"$PWD/.round2-reviewer-prompt.txt\"\n  printf '{\"status\":\"NEEDS_REVISION\",\"round\":2,\"reason\":\"still needs work\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config, false);
-
-        assert!(planned);
-        let round2_prompt = fs::read_to_string(project.path(".round2-reviewer-prompt.txt"))
-            .expect("round 2 reviewer prompt should be captured");
-        assert!(
-            round2_prompt.contains("IMPLEMENTER'S CONCERNS:\nrollback plan is unsafe"),
-            "round 2 reviewer prompt should include the dispute reason, got: {round2_prompt}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn planning_loop_does_not_forward_concerns_when_no_dispute() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.planning_max_rounds = 3;
-        crate::state::write_state_file("task.md", "Build feature E", &project.config)
-            .expect("task.md should be writable");
-
-        // Implementer (claude): args are [-p, prompt, --dangerously-skip-permissions]
-        //   Call 1: writes initial plan (no status).
-        //   Call 2 (revision response): writes CONSENSUS (no dispute), matching timestamp from $2.
-        project.create_executable(
-            "claude",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.claude-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$2\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 2 ]; then\n  printf '{\"status\":\"CONSENSUS\",\"round\":1,\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-        // Reviewer (codex): args are [exec, --skip-git-repo-check, --dangerously-bypass-approvals-and-sandbox, prompt]
-        //   Call 1 (round 1): captures its prompt from $4, writes NEEDS_REVISION.
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.codex-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nprintf '%s' \"$4\" > \"$PWD/.round1-reviewer-prompt.txt\"\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nprintf '{\"status\":\"NEEDS_REVISION\",\"round\":1,\"reason\":\"needs detail\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let planned = planning_phase(&project.config, false);
-
-        assert!(planned);
-        let round1_prompt = fs::read_to_string(project.path(".round1-reviewer-prompt.txt"))
-            .expect("round 1 reviewer prompt should be captured");
-        assert!(
-            !round1_prompt.contains("IMPLEMENTER'S CONCERNS:"),
-            "first round reviewer prompt should not include concerns section, got: {round1_prompt}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn decomposition_reviewer_stale_status_triggers_needs_revision_fallback() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.decomposition_max_rounds = 1;
-        crate::state::write_state_file("task.md", "Build feature U", &project.config)
-            .expect("task.md should be writable");
-        crate::state::write_state_file("plan.md", "Plan details", &project.config)
-            .expect("plan.md should be writable");
-
-        // Implementer writes tasks, does not touch status.
-        project.create_executable("claude", "#!/bin/sh\nexit 0\n");
-        // Reviewer does NOT write status.json — triggers stale detection.
-        project.create_executable("codex", "#!/bin/sh\nexit 0\n");
-
-        let _path_guard = project.with_path_override();
-        let decomposed = task_decomposition_phase(&project.config);
-
-        assert!(!decomposed);
-        let log_contents = project.read_log();
-        assert!(
-            log_contents.contains("Stale status detected after decomposition reviewer"),
-            "should log stale decomposition reviewer detection, got: {log_contents}"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn decomposition_implementer_revision_stale_status_triggers_needs_revision_fallback() {
-        let _env_guard = env_lock();
-        let mut project = new_project(false);
-        project.config.decomposition_max_rounds = 3;
-        crate::state::write_state_file("task.md", "Build feature V", &project.config)
-            .expect("task.md should be writable");
-        crate::state::write_state_file("plan.md", "Plan details", &project.config)
-            .expect("plan.md should be writable");
-        crate::state::write_state_file("tasks.md", "Initial tasks", &project.config)
-            .expect("tasks.md should be writable");
-
-        // Implementer: on revision rounds (count > 1), writes status with a deliberately stale
-        // timestamp to trigger stale detection.  On round 1 (initial decomposition) just exits.
-        project.create_executable(
-            "claude",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.claude-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -gt 1 ]; then\n  printf '{\"status\":\"PLANNING\",\"round\":2,\"timestamp\":\"1999-01-01T00:00:00.000Z\"}' > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-        // Reviewer: extracts timestamp from prompt and writes status with matching timestamp.
-        // Round 1: writes NeedsRevision (triggers revision in round 2).
-        // Round 2+: writes Consensus.
-        project.create_executable(
-            "codex",
-            "#!/bin/sh\nCOUNT_FILE=\"$PWD/.codex-count\"\nCOUNT=0\nif [ -f \"$COUNT_FILE\" ]; then COUNT=$(/bin/cat \"$COUNT_FILE\"); fi\nCOUNT=$((COUNT + 1))\necho \"$COUNT\" > \"$COUNT_FILE\"\nTS=$(echo \"$4\" | /usr/bin/grep -o '\"timestamp\": \"[^\"]*\"' | /usr/bin/head -1 | /usr/bin/sed 's/\"timestamp\": \"\\([^\"]*\\)\"/\\1/')\nSTATUS_PATH=\"$PWD/.agent-loop/state/status.json\"\nif [ \"$COUNT\" -eq 1 ]; then\n  printf '{\"status\":\"NEEDS_REVISION\",\"round\":1,\"reason\":\"improve tasks\",\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nelse\n  printf '{\"status\":\"CONSENSUS\",\"round\":2,\"timestamp\":\"%s\"}' \"$TS\" > \"$STATUS_PATH\"\nfi\nexit 0\n",
-        );
-
-        let _path_guard = project.with_path_override();
-        let decomposed = task_decomposition_phase(&project.config);
-
-        // Reviewer writes matching timestamps, so decomposition reaches consensus.
-        // But the implementer revision (round 2) is stale because claude writes an old timestamp.
-        assert!(decomposed);
-        let log_contents = project.read_log();
-        assert!(
-            log_contents.contains("Stale status detected after decomposition implementer revision"),
-            "should log stale decomposition implementer revision detection, got: {log_contents}"
-        );
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_switches_between_first_round_and_feedback_branches() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-        let first_round_prompt =
-            implementation_implementer_prompt(1, "Task", "Plan", "", &paths, "");
-        let feedback_prompt =
-            implementation_implementer_prompt(2, "Task", "Plan", "Missing tests", &paths, "");
-
-        assert!(first_round_prompt.contains("This is the first implementation round."));
-        assert!(!first_round_prompt.contains("PREVIOUS REVIEW FEEDBACK (address all issues):"));
-        assert!(
-            feedback_prompt
-                .contains("PREVIOUS REVIEW FEEDBACK (address all issues):\nMissing tests")
-        );
-        assert!(!feedback_prompt.contains("This is the first implementation round."));
-
-        let changes_path = paths.changes_md.display().to_string();
-        assert!(first_round_prompt.contains(&format!(
-            "write a summary of all changes to: {changes_path}"
-        )));
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_contains_templates_paths_and_conditional_preamble() {
-        let single_agent_config = test_config(true);
-        let dual_agent_config = test_config(false);
-        let single_paths = phase_paths(&single_agent_config);
-        let dual_paths = phase_paths(&dual_agent_config);
-
-        let single_prompt = implementation_reviewer_prompt(
-            &single_agent_config,
-            "Task",
-            "Plan",
-            "Changes",
-            "Test diff content",
-            3,
-            "2026-02-14T13:45:22.111Z",
-            &single_paths,
-            None,
-            "",
-        );
-        let dual_prompt = implementation_reviewer_prompt(
-            &dual_agent_config,
-            "Task",
-            "Plan",
-            "Changes",
-            "Test diff content",
-            3,
-            "2026-02-14T13:45:22.111Z",
-            &dual_paths,
-            None,
-            "",
-        );
-
-        assert!(single_prompt.starts_with("⚠️ SINGLE-AGENT REVIEWER MODE ⚠️"));
-        assert!(
-            dual_prompt.starts_with(
-                "You are the REVIEWER in round 3 of a collaborative development loop."
-            )
-        );
-        assert!(!dual_prompt.starts_with("⚠️ SINGLE-AGENT REVIEWER MODE ⚠️"));
-
-        assert!(single_prompt.contains("ACTUAL CODE DIFF:\nTest diff content"));
-        assert!(dual_prompt.contains("ACTUAL CODE DIFF:\nTest diff content"));
-        assert!(dual_prompt.contains("Review the ACTUAL code changes shown in the diff above"));
-
-        assert!(single_prompt.contains(&format!(
-            "Write your detailed review to: {}",
-            single_paths.review_md.display()
-        )));
-        assert!(single_prompt.contains(&format!(
-            "Then write one of these to {}:",
-            single_paths.status_json.display()
-        )));
-        assert!(single_prompt.contains(
-            "{\"status\": \"APPROVED\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"rating\": 4, \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
-        ));
-        assert!(single_prompt.contains(
-            "{\"status\": \"NEEDS_CHANGES\", \"round\": 3, \"implementer\": \"claude\", \"reviewer\": \"claude\", \"mode\": \"single-agent\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"2026-02-14T13:45:22.111Z\"}"
-        ));
-    }
-
-    #[test]
-    fn implementation_consensus_prompt_contains_consensus_and_disputed_templates() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-        let prompt = implementation_consensus_prompt(
-            &config,
-            "Looks good overall",
-            4,
-            "2026-02-14T14:20:00.500Z",
-            &paths,
-        );
-
-        assert!(prompt.contains("The reviewer has APPROVED your implementation."));
-        assert!(prompt.contains("REVIEW:\nLooks good overall"));
-        assert!(prompt.contains(&format!("write this to {}:", paths.status_json.display())));
-        assert!(prompt.contains(
-            "{\"status\": \"CONSENSUS\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
-        ));
-        assert!(prompt.contains(
-            "{\"status\": \"DISPUTED\", \"round\": 4, \"implementer\": \"claude\", \"reviewer\": \"codex\", \"mode\": \"dual-agent\", \"reason\": \"what was missed\", \"timestamp\": \"2026-02-14T14:20:00.500Z\"}"
-        ));
-    }
-
-    #[test]
-    fn format_summary_block_matches_typescript_order_and_content() {
-        let status = LoopStatus {
-            status: Status::NeedsChanges,
-            round: 7,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "  Build   implementation summary output  ".to_string(),
-            reason: Some("Reviewer requested one more test".to_string()),
-            rating: None,
-            timestamp: "2026-02-14T15:00:00.000Z".to_string(),
+    fn resolve_quality_commands_prefers_quality_commands_over_auto_test_cmd() {
+        let options = TestConfigOptions {
+            auto_test_cmd: Some("cargo test".to_string()),
+            quality_commands: vec![
+                QualityCommand {
+                    command: "cargo clippy -- -D warnings".to_string(),
+                    remediation: Some("Fix all clippy warnings.".to_string()),
+                },
+                QualityCommand {
+                    command: "cargo test".to_string(),
+                    remediation: None,
+                },
+            ],
+            ..Default::default()
         };
 
-        let border = "═".repeat(60);
-        let expected = format!(
-            "\n{border}\n  AGENT LOOP SUMMARY\n{border}\n  Status:      NEEDS_CHANGES\n  Rounds:      7\n  Implementer: claude\n  Reviewer:    codex\n  Mode:        dual-agent\n  Last Task:   Build implementation summary output\n  Note:        Reviewer requested one more test\n{border}\n\n📁 State files in: .agent-loop/state/\n   - task.md, plan.md, tasks.md, changes.md, review.md, status.json, log.txt\n"
-        );
+        let root = create_temp_project_root("phases_quality_override");
+        let config = make_test_config(&root, options);
+        let commands = resolve_quality_commands(&config);
 
-        assert_eq!(format_summary_block(&status), expected);
-    }
-
-    #[test]
-    fn format_summary_block_uses_empty_placeholder_and_omits_note() {
-        let status = LoopStatus {
-            status: Status::Pending,
-            round: 0,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "".to_string(),
-            reason: None,
-            rating: None,
-            timestamp: "2026-02-14T15:00:00.000Z".to_string(),
-        };
-
-        let output = format_summary_block(&status);
-        assert!(output.contains("  Last Task:   (empty)"));
-        assert!(!output.contains("  Note:        "));
-        assert!(!output.contains("  Rating:      "));
-    }
-
-    #[test]
-    fn implementation_loop_returns_true_on_approved_then_consensus() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::from(["baseline.txt".to_string()]);
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].command, "cargo clippy -- -D warnings");
         assert_eq!(
-            checkpoints,
-            vec![
-                "round-1-implementation: Changes body".to_string(),
-                "consensus-round-1".to_string()
-            ]
+            commands[0].remediation.as_deref(),
+            Some("Fix all clippy warnings.")
         );
-        assert_eq!(prompts.len(), 3);
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("📊 Review result: APPROVED"))
-        );
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("🎉 CONSENSUS reached in round 1!"))
-        );
-        assert!(
-            status_patches
-                .iter()
-                .any(|patch| patch.status == Some(Status::Implementing) && patch.round == Some(1))
-        );
+        assert_eq!(commands[1].command, "cargo test");
+        assert_eq!(commands[1].remediation, None);
     }
 
     #[test]
-    fn implementation_loop_continues_after_disputed_consensus_response() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut prompts = Vec::<String>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review details".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Disputed, 1, Some("missed rollback case"), &config),
-            test_loop_status(Status::NeedsChanges, 2, Some("fix tests"), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, prompt, _| {
-                prompts.push(prompt.to_string());
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert!(prompts.iter().any(|prompt| {
-            prompt.starts_with(
-                "You are the IMPLEMENTER in round 2 of a collaborative development loop.",
-            )
-        }));
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("⚠ Implementer disputed: missed rollback case"))
-        );
-        assert_eq!(
-            checkpoints,
-            vec![
-                "round-1-implementation: Changes body".to_string(),
-                "round-2-implementation: Changes body".to_string(),
-                "max-rounds-reached".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn implementation_loop_resume_starts_from_next_round() {
-        let config = test_config_with_rounds(false, 5);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut prompts = Vec::<String>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review details".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::NeedsChanges, 3, Some("continue"), &config),
-            test_loop_status(Status::Approved, 4, None, &config),
-            test_loop_status(Status::Consensus, 4, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, prompt, _| {
-                prompts.push(prompt.to_string());
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            true,
-        );
-
-        assert!(result);
-        assert_eq!(
-            checkpoints,
-            vec![
-                "round-4-implementation: Changes body".to_string(),
-                "consensus-round-4".to_string()
-            ]
-        );
-        assert!(
-            prompts.iter().any(|prompt| {
-                prompt.contains("You are the IMPLEMENTER in round 4 of a collaborative")
-            }),
-            "resume should continue from round 4"
-        );
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("Resuming implementation from round 4/5"))
-        );
-    }
-
-    #[test]
-    fn implementation_loop_writes_max_rounds_and_returns_false_when_limit_reached() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::NeedsChanges, 1, Some("add tests"), &config),
-            test_loop_status(Status::NeedsChanges, 2, Some("still failing"), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("⏰ Max rounds (2) reached without consensus"))
-        );
-        assert_eq!(
-            checkpoints,
-            vec![
-                "round-1-implementation: Changes body".to_string(),
-                "round-2-implementation: Changes body".to_string(),
-                "max-rounds-reached".to_string()
-            ]
-        );
-        assert_eq!(
-            status_patches.last().and_then(|patch| patch.status),
-            Some(Status::MaxRounds)
-        );
-        assert_eq!(status_patches.last().and_then(|patch| patch.round), Some(2));
-    }
-
-    #[test]
-    fn implementation_loop_sets_terminal_round_when_reviewer_status_round_is_malformed() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::NeedsChanges, 1, Some("add tests"), &config),
-            // Simulates normalized malformed reviewer status payload with missing/invalid round.
-            test_loop_status(Status::NeedsChanges, 0, Some("still failing"), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert_eq!(
-            status_patches.last().and_then(|patch| patch.status),
-            Some(Status::MaxRounds)
-        );
-        assert_eq!(status_patches.last().and_then(|patch| patch.round), Some(2));
-    }
-
-    #[test]
-    fn implementation_loop_with_zero_max_rounds_sets_status_and_exits_cleanly() {
-        let config = test_config_with_rounds(false, 0);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let mut run_agent_calls = 0usize;
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| {
-                run_agent_calls += 1;
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |_, _| panic!("state files should not be read when max_rounds is zero"),
-            |_| panic!("status should not be read when max_rounds is zero"),
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert_eq!(run_agent_calls, 0);
-        assert_eq!(checkpoints, vec!["max-rounds-reached".to_string()]);
-        assert!(
-            logs.iter()
-                .any(|line| line.contains(IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON))
-        );
-        assert_eq!(status_patches.len(), 1);
-        assert_eq!(status_patches[0].status, Some(Status::MaxRounds));
-        assert_eq!(status_patches[0].round, Some(0));
-        assert_eq!(
-            status_patches[0].reason.as_deref(),
-            Some(IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON)
-        );
-    }
-
-    #[test]
-    fn implementation_loop_stops_and_sets_error_when_agent_execution_fails() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Err(AgentLoopError::Agent("claude failed to start".to_string())),
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| panic!("status should not be read after agent execution failure"),
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert!(checkpoints.is_empty());
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("claude failed to start"))
-        );
-        assert!(status_patches.iter().any(|patch| {
-            patch.status == Some(Status::Error)
-                && patch.round == Some(1)
-                && patch
-                    .reason
-                    .as_deref()
-                    .is_some_and(|r| r.contains("claude failed to start"))
-        }));
-    }
-
-    #[test]
-    fn implementation_loop_stops_when_reviewer_status_is_error() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut run_agent_calls = 0usize;
-        let mut read_statuses = VecDeque::from([test_loop_status(
-            Status::Error,
-            1,
-            Some("Invalid status.json: expected value"),
-            &config,
-        )]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| {
-                run_agent_calls += 1;
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-        assert_eq!(run_agent_calls, 2);
-        assert_eq!(
-            checkpoints,
-            vec!["round-1-implementation: Changes body".to_string()]
-        );
-        assert!(
-            logs.iter()
-                .any(|line| { line.contains("❌ Invalid status.json: expected value") })
-        );
-        assert!(status_patches.iter().any(|patch| {
-            patch.status == Some(Status::Error)
-                && patch.round == Some(1)
-                && patch.reason.as_deref() == Some("Invalid status.json: expected value")
-        }));
-    }
-
-    #[test]
-    fn decomposition_forced_revision_helper_only_forces_non_needs_revision() {
-        assert_eq!(
-            decomposition_forced_revision_reason(Status::NeedsRevision),
-            None
-        );
-        assert_eq!(
-            decomposition_forced_revision_reason(Status::Consensus),
-            Some(DECOMPOSITION_REVISION_FALLBACK_REASON)
-        );
-        assert_eq!(
-            decomposition_forced_revision_reason(Status::Approved),
-            Some(DECOMPOSITION_REVISION_FALLBACK_REASON)
-        );
-    }
-
-    #[test]
-    fn planning_and_decomposition_transition_helpers_cover_key_branches() {
-        assert_eq!(
-            planning_reviewer_action(Status::Approved),
-            PlanningReviewerAction::Approved
-        );
-        assert_eq!(
-            planning_reviewer_action(Status::NeedsRevision),
-            PlanningReviewerAction::NeedsRevision
-        );
-        assert_eq!(
-            planning_reviewer_action(Status::Disputed),
-            PlanningReviewerAction::NeedsRevision
-        );
-        assert_eq!(
-            planning_reviewer_action(Status::Error),
-            PlanningReviewerAction::Error
-        );
-
-        assert!(planning_implementer_reached_consensus(Status::Consensus));
-        assert!(!planning_implementer_reached_consensus(Status::Disputed));
-
-        assert_eq!(
-            decomposition_status_decision(Status::Consensus),
-            DecompositionStatusDecision::Consensus
-        );
-        assert_eq!(
-            decomposition_status_decision(Status::NeedsRevision),
-            DecompositionStatusDecision::NeedsRevision
-        );
-        assert_eq!(
-            decomposition_status_decision(Status::Disputed),
-            DecompositionStatusDecision::ForceNeedsRevision
-        );
-        assert_eq!(
-            decomposition_status_decision(Status::Error),
-            DecompositionStatusDecision::Error
-        );
-
-        assert_eq!(
-            implementation_reviewer_decision(Status::Approved),
-            ImplementationReviewerDecision::Approved
-        );
-        assert_eq!(
-            implementation_reviewer_decision(Status::NeedsChanges),
-            ImplementationReviewerDecision::NeedsChanges
-        );
-        assert_eq!(
-            implementation_reviewer_decision(Status::Disputed),
-            ImplementationReviewerDecision::NeedsChanges
-        );
-        assert_eq!(
-            implementation_reviewer_decision(Status::Error),
-            ImplementationReviewerDecision::Error
-        );
-
-        assert_eq!(
-            implementation_consensus_decision(Status::Consensus),
-            ImplementationConsensusDecision::Consensus
-        );
-        assert_eq!(
-            implementation_consensus_decision(Status::Disputed),
-            ImplementationConsensusDecision::Disputed
-        );
-        assert_eq!(
-            implementation_consensus_decision(Status::Approved),
-            ImplementationConsensusDecision::Continue
-        );
-        assert_eq!(
-            implementation_consensus_decision(Status::Error),
-            ImplementationConsensusDecision::Error
-        );
-
-        assert!(round_limit_reached(3, 3));
-        assert!(!round_limit_reached(2, 3));
-    }
-
-    #[test]
-    fn planning_next_step_command_points_to_current_rust_cli() {
-        assert_eq!(
-            planning_next_step_command(),
-            "agent-loop run \"Task 1: ...\""
-        );
-        assert!(!planning_next_step_command().contains("tsx"));
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_includes_rating_field_and_rubric() {
-        let config = test_config(false);
-        let paths = phase_paths(&config);
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "Test diff content",
-            1,
-            "2026-02-14T00:00:00.000Z",
-            &paths,
-            None,
-            "",
-        );
-
-        assert!(prompt.contains("quality rating from 1-5"));
-        assert!(prompt.contains("1 = poor"));
-        assert!(prompt.contains("5 = excellent"));
-        assert!(prompt.contains("\"rating\": 4"));
-        assert!(prompt.contains("\"rating\": 2"));
-    }
-
-    #[test]
-    fn implementation_checkpoint_message_preserves_round_and_adds_summary() {
-        assert_eq!(
-            implementation_checkpoint_message(3, "Updated admin order editing flow and tests"),
-            "round-3-implementation: Updated admin order editing flow and tests"
-        );
-        assert_eq!(
-            implementation_checkpoint_message(2, "   "),
-            "round-2-implementation: implementation updates"
-        );
-    }
-
-    #[test]
-    fn format_summary_block_includes_rating_when_present() {
-        let status = LoopStatus {
-            status: Status::Consensus,
-            round: 1,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "Build feature".to_string(),
-            reason: None,
-            rating: Some(4),
-            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
-        };
-
-        let output = format_summary_block(&status);
-        assert!(output.contains("  Rating:      4/5"));
-    }
-
-    #[test]
-    fn implementation_loop_preserves_reviewer_rating_when_consensus_omits_it() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer returns APPROVED with rating=4, then consensus status has no rating
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(4), &config),
-            test_loop_status(Status::Consensus, 1, None, &config), // rating: None
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        // Should have a rating-preserving patch
-        assert!(
-            status_patches.iter().any(|patch| patch.rating == Some(4)),
-            "a status patch should preserve the reviewer rating of 4"
-        );
-    }
-
-    #[test]
-    fn transition_label_returns_status_name_or_contextual_fallback() {
-        assert_eq!(
-            transition_label(&StatusPatch {
-                status: Some(Status::Implementing),
-                ..StatusPatch::default()
-            }),
-            "IMPLEMENTING"
-        );
-        assert_eq!(
-            transition_label(&StatusPatch {
-                status: Some(Status::Error),
-                ..StatusPatch::default()
-            }),
-            "ERROR"
-        );
-        assert_eq!(
-            transition_label(&StatusPatch {
-                rating: Some(4),
-                ..StatusPatch::default()
-            }),
-            "rating-update"
-        );
-        assert_eq!(transition_label(&StatusPatch::default()), "status-update");
-    }
-
-    #[test]
-    fn warn_on_status_write_logs_failure_when_status_path_is_blocked() {
-        let project = new_project(false);
-        // Ensure the state dir and log.txt exist so logging works.
-        fs::create_dir_all(&project.config.state_dir).expect("state dir should be created");
-        fs::write(project.config.state_dir.join("log.txt"), "").expect("log.txt seed");
-
-        // Block status.json by creating a directory at that path.
-        // write_status will fail because it cannot write a file where a directory exists.
-        let status_path = project.config.state_dir.join("status.json");
-        fs::create_dir_all(&status_path).expect("status.json dir should be created");
-
-        warn_on_status_write(
-            "test-transition",
-            StatusPatch {
-                status: Some(Status::Planning),
-                ..StatusPatch::default()
-            },
-            &project.config,
-        );
-
-        let log_contents = fs::read_to_string(project.config.state_dir.join("log.txt"))
-            .expect("log.txt should be readable");
-        assert!(
-            log_contents.contains("failed to write status transition 'test-transition'"),
-            "log should contain the transition name, got: {log_contents}"
-        );
-        // The error message should contain some indication of the I/O failure.
-        assert!(
-            log_contents.contains("WARN:"),
-            "log should contain WARN prefix, got: {log_contents}"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_does_not_overwrite_rating_when_consensus_includes_it() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer APPROVED with rating=4, consensus also has rating=5
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(4), &config),
-            test_loop_status_with_rating(Status::Consensus, 1, None, Some(5), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        // Should NOT have a rating-preserving patch since consensus already has rating
-        assert!(
-            !status_patches.iter().any(|patch| patch.rating == Some(4)),
-            "should not overwrite existing consensus rating"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_passes_diff_to_reviewer_prompt() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "diff --git a/file.rs b/file.rs\n+new line".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        // Find the reviewer prompt (second prompt: implementer, reviewer, consensus)
-        let reviewer_prompt = prompts
-            .iter()
-            .find(|(agent, _)| *agent == Agent::Codex)
-            .expect("reviewer prompt should exist");
-        assert!(
-            reviewer_prompt.1.contains("ACTUAL CODE DIFF:"),
-            "reviewer prompt should contain ACTUAL CODE DIFF section"
-        );
-        assert!(
-            reviewer_prompt
-                .1
-                .contains("diff --git a/file.rs b/file.rs\n+new line"),
-            "reviewer prompt should contain the actual diff content"
-        );
-    }
-
-    const STALE_TEST_TIMESTAMP: &str = "2025-01-01T00:00:00.000Z";
-
-    fn stale_loop_status(
-        status: Status,
-        round: u32,
-        reason: Option<&str>,
-        config: &Config,
-    ) -> LoopStatus {
-        LoopStatus {
-            status,
-            round,
-            implementer: config.implementer.to_string(),
-            reviewer: config.reviewer.to_string(),
-            mode: config.run_mode.to_string(),
-            last_run_task: "Implement task".to_string(),
-            reason: reason.map(ToOwned::to_owned),
-            rating: None,
-            timestamp: STALE_TEST_TIMESTAMP.to_string(),
-        }
-    }
-
-    #[test]
-    fn implementation_loop_stale_reviewer_status_writes_needs_changes_with_stale_reason() {
-        let config = test_config_with_rounds(false, 1);
-        let baseline_files = HashSet::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Round 1: read_status returns stale → triggers NeedsChanges fallback.
-        // After correction: NeedsChanges (matching timestamp).
-        // Round 1 == max_rounds → exits with MaxRounds.
-        let mut read_statuses = VecDeque::from([
-            stale_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(
-                Status::NeedsChanges,
-                1,
-                Some(STALE_TIMESTAMP_REASON),
-                &config,
-            ),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-
-        // Verify stale detection was logged
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("Stale status detected after implementation reviewer")),
-            "should log stale detection for reviewer"
-        );
-
-        // Verify NeedsChanges fallback was written with stale reason
-        assert!(
-            status_patches.iter().any(|patch| {
-                patch.status == Some(Status::NeedsChanges)
-                    && patch.reason.as_deref() == Some(STALE_TIMESTAMP_REASON)
-            }),
-            "should write NeedsChanges with stale timestamp reason"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_stale_consensus_status_writes_disputed_with_stale_reason() {
-        let config = test_config_with_rounds(false, 1);
-        let baseline_files = HashSet::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer: fresh APPROVED → proceeds to consensus.
-        // Consensus: stale → Disputed fallback written.
-        // Re-read: corrected Disputed.
-        // Round 1 == max_rounds → exits with MaxRounds.
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            stale_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Disputed, 1, Some(STALE_TIMESTAMP_REASON), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result);
-
-        // Verify stale detection was logged
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("Stale status detected after implementation consensus")),
-            "should log stale detection for consensus"
-        );
-
-        // Verify Disputed fallback was written with stale reason
-        assert!(
-            status_patches.iter().any(|patch| {
-                patch.status == Some(Status::Disputed)
-                    && patch.reason.as_deref() == Some(STALE_TIMESTAMP_REASON)
-            }),
-            "should write Disputed with stale timestamp reason"
-        );
-    }
-
-    #[test]
-    fn unexpected_status_produces_conservative_fallback() {
-        // Planning: unexpected statuses -> NeedsRevision
-        assert_eq!(
-            planning_reviewer_action(Status::Pending),
-            PlanningReviewerAction::NeedsRevision
-        );
-        assert_eq!(
-            planning_reviewer_action(Status::Disputed),
-            PlanningReviewerAction::NeedsRevision
-        );
-        assert_eq!(
-            planning_reviewer_action(Status::Implementing),
-            PlanningReviewerAction::NeedsRevision
-        );
-
-        // Implementation: unexpected statuses -> NeedsChanges
-        assert_eq!(
-            implementation_reviewer_decision(Status::Pending),
-            ImplementationReviewerDecision::NeedsChanges
-        );
-        assert_eq!(
-            implementation_reviewer_decision(Status::Disputed),
-            ImplementationReviewerDecision::NeedsChanges
-        );
-        assert_eq!(
-            implementation_reviewer_decision(Status::Planning),
-            ImplementationReviewerDecision::NeedsChanges
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Quality check tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn detect_project_type_identifies_rust_project() {
-        let project = TestProject::builder("detect_project_rust").build();
-        project.write_file("Cargo.toml", "[package]\nname = \"test\"");
-        assert_eq!(detect_project_type(&project.root), ProjectType::Rust);
-    }
-
-    #[test]
-    fn detect_project_type_identifies_jsts_project() {
-        let project = TestProject::builder("detect_project_jsts").build();
-        project.write_file("package.json", "{\"name\": \"test\"}");
-        assert_eq!(detect_project_type(&project.root), ProjectType::JsTs);
-    }
-
-    #[test]
-    fn detect_project_type_rust_takes_precedence_over_jsts() {
-        let project = TestProject::builder("detect_project_both").build();
-        project.write_file("Cargo.toml", "[package]\nname = \"test\"");
-        project.write_file("package.json", "{\"name\": \"test\"}");
-        assert_eq!(detect_project_type(&project.root), ProjectType::Rust);
-    }
-
-    #[test]
-    fn detect_project_type_returns_unknown_for_empty_dir() {
-        let project = TestProject::builder("detect_project_unknown").build();
-        assert_eq!(detect_project_type(&project.root), ProjectType::Unknown);
-    }
-
-    #[test]
-    fn is_npm_script_stub_detects_common_stubs() {
-        assert!(is_npm_script_stub(""));
-        assert!(is_npm_script_stub("   "));
-        assert!(is_npm_script_stub(
-            "echo \"Error: no test specified\" && exit 1"
-        ));
-        assert!(is_npm_script_stub("echo \"no test command\" && exit 1"));
-        assert!(is_npm_script_stub("echo \"Error: ...\" && exit 1"));
-    }
-
-    #[test]
-    fn is_npm_script_stub_accepts_real_scripts() {
-        assert!(!is_npm_script_stub("jest"));
-        assert!(!is_npm_script_stub("vitest run"));
-        assert!(!is_npm_script_stub("eslint ."));
-        assert!(!is_npm_script_stub("tsc --noEmit"));
-    }
-
-    #[test]
-    fn resolve_jsts_commands_includes_real_scripts_only() {
-        let project = TestProject::builder("resolve_jsts_cmds").build();
-        let package_json = r#"{
-            "scripts": {
-                "build": "tsc",
-                "test": "echo \"Error: no test specified\" && exit 1",
-                "lint": "eslint .",
-                "dev": "vite"
-            }
-        }"#;
-        project.write_file("package.json", package_json);
-
-        let commands = resolve_jsts_commands(&project.root);
-        let labels: Vec<&str> = commands.iter().map(|c| c.label.as_str()).collect();
-        assert!(labels.contains(&"npm run build"));
-        assert!(!labels.contains(&"npm run test")); // stub
-        assert!(labels.contains(&"npm run lint"));
-        assert!(!labels.contains(&"npm run dev")); // not in build/test/lint
-    }
-
-    #[test]
-    fn resolve_quality_commands_uses_override_when_set() {
-        let project = TestProject::builder("resolve_override")
-            .auto_test(true)
-            .auto_test_cmd(Some("make test".to_string()))
-            .build();
-        project.write_file("Cargo.toml", "[package]\nname = \"test\"");
-
-        let commands = resolve_quality_commands(&project.config);
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].label, "custom");
-        assert_eq!(commands[0].command, "make test");
-    }
-
-    #[test]
-    fn resolve_quality_commands_returns_empty_for_unknown_project_type() {
-        let project = TestProject::builder("resolve_unknown")
-            .auto_test(true)
-            .build();
-
-        let commands = resolve_quality_commands(&project.config);
-        assert!(commands.is_empty());
-    }
-
-    #[test]
-    fn truncate_output_keeps_all_lines_under_limit() {
-        let input = "line 1\nline 2\nline 3";
-        let (output, truncated) = truncate_output(input, 5);
-        assert_eq!(output, input);
-        assert!(!truncated);
-    }
-
-    #[test]
-    fn truncate_output_caps_at_max_lines_showing_tail() {
-        let lines: Vec<String> = (1..=150).map(|i| format!("line {i}")).collect();
-        let input = lines.join("\n");
-        let (output, truncated) = truncate_output(&input, 100);
-        assert!(truncated);
-        assert!(output.contains("(50 lines truncated, showing last 100)"));
-        assert!(output.contains("line 51")); // first kept line
-        assert!(output.contains("line 150")); // last line
-        assert!(!output.contains("\nline 50\n")); // dropped line
-    }
-
-    #[test]
-    fn format_quality_checks_builds_expected_output() {
-        let results = vec![
-            CheckResult {
-                label: "cargo test".to_string(),
-                success: true,
-                timed_out: false,
-                output: "test result: ok. 5 passed".to_string(),
-            },
-            CheckResult {
-                label: "cargo clippy".to_string(),
-                success: false,
-                timed_out: false,
-                output: "warning: unused variable".to_string(),
-            },
-            CheckResult {
-                label: "slow cmd".to_string(),
-                success: false,
-                timed_out: true,
-                output: "partial output...".to_string(),
-            },
-        ];
-
-        let formatted = format_quality_checks(&results);
-        assert!(formatted.starts_with("QUALITY CHECKS:"));
-        assert!(formatted.contains("--- cargo test [PASS] ---"));
-        assert!(formatted.contains("test result: ok. 5 passed"));
-        assert!(formatted.contains("--- cargo clippy [FAIL] ---"));
-        assert!(formatted.contains("warning: unused variable"));
-        assert!(formatted.contains("--- slow cmd [TIMEOUT] ---"));
-        assert!(formatted.contains("partial output..."));
-    }
-
-    #[test]
-    fn run_quality_checks_returns_none_when_disabled() {
-        let project = TestProject::builder("quality_disabled")
-            .auto_test(false)
-            .build();
-        project.write_file("Cargo.toml", "[package]\nname = \"test\"");
-
-        assert!(run_quality_checks(&project.config).is_none());
-    }
-
-    #[test]
-    fn run_quality_checks_returns_none_for_unknown_project() {
-        let project = TestProject::builder("quality_unknown")
-            .auto_test(true)
-            .build();
-
-        assert!(run_quality_checks(&project.config).is_none());
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_single_check_captures_output_and_exit_status() {
-        let project = TestProject::builder("single_check_pass").build();
-        let check = CheckCommand {
-            label: "echo test".to_string(),
-            command: "echo hello && echo world".to_string(),
-        };
-
-        let result = run_single_check(&check, &project.root);
-        assert!(result.success);
-        assert!(!result.timed_out);
-        assert!(result.output.contains("hello"));
-        assert!(result.output.contains("world"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_single_check_reports_failure_on_nonzero_exit() {
-        let project = TestProject::builder("single_check_fail").build();
-        let check = CheckCommand {
-            label: "failing cmd".to_string(),
-            command: "echo error output && exit 1".to_string(),
-        };
-
-        let result = run_single_check(&check, &project.root);
-        assert!(!result.success);
-        assert!(!result.timed_out);
-        assert!(result.output.contains("error output"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_single_check_times_out_and_kills_process_group() {
-        // Use run_single_check_with_timeout with a 2-second timeout and a
-        // command that sleeps much longer. This exercises the real timeout path:
-        // child process wait → deadline exceeded → SIGTERM/SIGKILL → reap.
-        let project = TestProject::builder("single_check_timeout").build();
-
-        let check = CheckCommand {
-            label: "slow cmd".to_string(),
-            // trap '' TERM: ignore SIGTERM so only SIGKILL will kill it.
-            // echo partial output before sleeping to verify output capture.
-            command: "trap '' TERM; echo before-timeout; sleep 300".to_string(),
-        };
-
-        let start = Instant::now();
-        let result = run_single_check_with_timeout(&check, &project.root, 2);
-        let elapsed = start.elapsed();
-
-        assert!(result.timed_out, "command should be marked as timed out");
-        assert!(
-            !result.success,
-            "timed-out command should not be marked successful"
-        );
-        assert!(
-            elapsed < Duration::from_secs(15),
-            "timeout should complete well within 15 seconds, took {:?}",
-            elapsed
-        );
-        assert!(
-            result.output.contains("before-timeout"),
-            "should capture partial output written before timeout"
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_single_check_timeout_kills_background_descendants() {
-        // Verifies that background processes holding pipe FDs are also killed,
-        // preventing reader thread joins from blocking indefinitely.
-        // The shell exits quickly but spawns a background child that holds
-        // stdout open and sleeps forever.
-        let project = TestProject::builder("timeout_descendants").build();
-
-        let check = CheckCommand {
-            label: "bg descendants".to_string(),
-            command: "echo started; (trap '' TERM; sleep 300) & sleep 300".to_string(),
-        };
-
-        let start = Instant::now();
-        let result = run_single_check_with_timeout(&check, &project.root, 2);
-        let elapsed = start.elapsed();
-
-        assert!(result.timed_out, "should time out");
-        assert!(
-            elapsed < Duration::from_secs(15),
-            "should not block on descendant pipe FDs, took {:?}",
-            elapsed
-        );
-    }
-
-    #[test]
-    fn resolve_rust_commands_includes_build_and_test() {
-        // resolve_rust_commands always includes cargo build and cargo test
-        let commands = resolve_rust_commands();
-        let labels: Vec<&str> = commands.iter().map(|c| c.label.as_str()).collect();
-        assert!(
-            labels.contains(&"cargo build"),
-            "Rust commands should include cargo build"
-        );
-        assert!(
-            labels.contains(&"cargo test"),
-            "Rust commands should include cargo test"
-        );
-        // cargo clippy is conditional on availability; just verify it's either
-        // present or absent (no panic)
-        assert!(commands.len() >= 2);
-        if labels.contains(&"cargo clippy") {
-            assert_eq!(commands.len(), 3);
-            assert_eq!(commands[2].command, "cargo clippy -- -D warnings");
-        }
-    }
-
-    #[test]
-    fn line_buf_keeps_last_n_lines() {
-        let mut buf = LineBuf::new(3);
-        buf.push("a".to_string());
-        buf.push("b".to_string());
-        assert_eq!(buf.total, 2);
-        let (output, truncated) = buf.into_output();
-        assert!(!truncated);
-        assert_eq!(output, "a\nb");
-    }
-
-    #[test]
-    fn line_buf_truncates_when_exceeding_capacity() {
-        let mut buf = LineBuf::new(2);
-        buf.push("a".to_string());
-        buf.push("b".to_string());
-        buf.push("c".to_string());
-        buf.push("d".to_string());
-        assert_eq!(buf.total, 4);
-        assert_eq!(buf.lines.len(), 2);
-        let (output, truncated) = buf.into_output();
-        assert!(truncated);
-        assert!(output.contains("2 lines truncated, showing last 2"));
-        assert!(output.contains("c"));
-        assert!(output.contains("d"));
-        assert!(!output.contains("\na\n"));
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn run_quality_checks_with_custom_override() {
-        let project = TestProject::builder("quality_custom_cmd")
-            .auto_test(true)
-            .auto_test_cmd(Some("echo custom-check-passed".to_string()))
-            .build();
-
-        let result = run_quality_checks(&project.config);
-        assert!(result.is_some());
-        let output = result.unwrap();
-        assert!(output.contains("QUALITY CHECKS:"));
-        assert!(output.contains("custom-check-passed"));
-        assert!(output.contains("[PASS]"));
-    }
-
-    #[test]
-    fn implementation_loop_includes_quality_checks_in_reviewer_prompt_when_enabled() {
-        let mut config = test_config_with_rounds(false, 3);
-        config.auto_test = true;
-        config.auto_test_cmd = Some("echo quality-ok".to_string());
-        // Point to an existing temp dir so the command can run
-        let project = TestProject::builder("quality_in_loop")
-            .auto_test(true)
-            .auto_test_cmd(Some("echo quality-ok".to_string()))
-            .build();
-
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &project.config),
-            test_loop_status(Status::Consensus, 1, None, &project.config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &project.config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        let reviewer_prompt = prompts
-            .iter()
-            .find(|(agent, _)| *agent == Agent::Codex)
-            .expect("reviewer prompt should exist");
-        assert!(
-            reviewer_prompt.1.contains("QUALITY CHECKS:"),
-            "reviewer prompt should contain QUALITY CHECKS section when auto_test is enabled"
-        );
-        assert!(
-            reviewer_prompt.1.contains("quality-ok"),
-            "reviewer prompt should contain quality check output"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_omits_quality_checks_when_disabled() {
-        let config = test_config_with_rounds(false, 3);
-        // auto_test defaults to false in test_config
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        let reviewer_prompt = prompts
-            .iter()
-            .find(|(agent, _)| *agent == Agent::Codex)
-            .expect("reviewer prompt should exist");
-        assert!(
-            !reviewer_prompt.1.contains("QUALITY CHECKS:"),
-            "reviewer prompt should NOT contain QUALITY CHECKS when auto_test is disabled"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_passes_history_to_implementer_and_reviewer_prompts() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-        let mut history_read_count = 0u32;
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, max_lines| {
-                history_read_count += 1;
-                assert_eq!(max_lines, HISTORY_MAX_LINES);
-                "Round 0 init: Setup".to_string()
-            },
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-        // History should be read twice per round: once before implementer, once before reviewer
-        assert_eq!(
-            history_read_count, 2,
-            "read_history_fn should be called twice in one round (impl + reviewer)"
-        );
-
-        // Implementer prompt should contain ROUND HISTORY
-        let impl_prompt = &prompts[0].1;
-        assert!(
-            impl_prompt.contains("ROUND HISTORY:\nRound 0 init: Setup"),
-            "implementer prompt should include round history"
-        );
-
-        // Reviewer prompt should also contain ROUND HISTORY
-        let reviewer_prompt = &prompts[1].1;
-        assert!(
-            reviewer_prompt.contains("ROUND HISTORY:\nRound 0 init: Setup"),
-            "reviewer prompt should include round history"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_appends_history_for_implementation_review_and_consensus() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
-        );
-
-        assert!(result);
-        // Should have 3 appends: implementation, review, consensus
-        assert_eq!(
-            appended.len(),
-            3,
-            "should append history for implementation, review, and consensus; got: {appended:?}"
-        );
-        assert_eq!(appended[0].1, "implementation");
-        assert_eq!(appended[0].2, "Changes body");
-        assert_eq!(appended[1].1, "review");
-        assert!(appended[1].2.contains("APPROVED"));
-        assert_eq!(appended[2].1, "consensus");
-        assert!(appended[2].2.contains("CONSENSUS"));
-    }
-
-    #[test]
-    fn implementation_loop_appends_history_for_disputed_consensus() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config),
-            test_loop_status(Status::Disputed, 1, Some("missed rollback case"), &config),
-            test_loop_status(Status::NeedsChanges, 2, Some("fix tests"), &config),
-        ]);
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
-        );
-
-        assert!(!result);
-        // Round 1: implementation, review (APPROVED), consensus (DISPUTED)
-        // Round 2: implementation, review (NEEDS_CHANGES)
-        assert_eq!(
-            appended.len(),
-            5,
-            "should have 5 appends across 2 rounds; got: {appended:?}"
-        );
-        assert_eq!(appended[2].1, "consensus");
-        assert!(
-            appended[2].2.contains("DISPUTED"),
-            "consensus append should be DISPUTED, got: {}",
-            appended[2].2
-        );
-        assert!(
-            appended[2].2.contains("missed rollback case"),
-            "consensus append should include reason"
-        );
-    }
-
-    #[test]
-    fn implementation_loop_reviewer_history_sees_implementation_append() {
-        use std::cell::Cell;
-
-        // Verify that the reviewer's history read happens AFTER the implementation append.
-        let config = test_config_with_rounds(false, 1);
-        let baseline_files = HashSet::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        let mut read_statuses = VecDeque::from([test_loop_status(
-            Status::NeedsChanges,
-            1,
-            Some("fix tests"),
-            &config,
-        )]);
-        let mut history_reads: Vec<String> = Vec::new();
-        let appended_count = Cell::new(0u32);
-
-        let _result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| {
-                // Return different content based on how many appends have occurred
-                let count = appended_count.get();
-                let result = format!("history-after-{count}-appends");
-                history_reads.push(result.clone());
-                result
-            },
-            |_, _, _, _| {
-                appended_count.set(appended_count.get() + 1);
-            },
-            false,
-        );
-
-        // First history read (for implementer): before any appends
-        assert_eq!(history_reads[0], "history-after-0-appends");
-        // Second history read (for reviewer): after the implementation append
-        assert_eq!(history_reads[1], "history-after-1-appends");
-    }
-
-    // -----------------------------------------------------------------------
-    // Adversarial second review tests (Task 20)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn dual_agent_5_5_adversarial_also_approved_reaches_consensus() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "First review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer returns APPROVED with rating=5, then adversarial returns APPROVED
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(result);
-
-        // Should use the reviewer agent for the adversarial call (3rd call: implementer, reviewer, adversarial-reviewer)
-        assert_eq!(prompts.len(), 3, "should have 3 agent calls");
-        assert_eq!(
-            prompts[0].0,
-            Agent::Claude,
-            "first call should be implementer"
-        );
-        assert_eq!(prompts[1].0, Agent::Codex, "second call should be reviewer");
-        assert_eq!(
-            prompts[2].0,
-            Agent::Codex,
-            "third (adversarial) call should use reviewer agent"
-        );
-
-        // Adversarial prompt should contain adversarial framing and first review
-        assert!(
-            prompts[2].1.contains("find what the first reviewer missed"),
-            "adversarial prompt should contain adversarial framing"
-        );
-        assert!(
-            prompts[2].1.contains("First review body"),
-            "adversarial prompt should contain the first review"
-        );
-        assert!(
-            prompts[2].1.contains("(test diff)"),
-            "adversarial prompt should contain the diff"
-        );
-
-        // Intermediate Reviewing status should be written before adversarial call
-        assert!(
-            status_patches
-                .iter()
-                .any(|p| p.status == Some(Status::Reviewing)),
-            "should write intermediate Reviewing status before adversarial call"
-        );
-
-        // Status patches should include Consensus with rating=5
-        assert!(
-            status_patches
-                .iter()
-                .any(|p| p.status == Some(Status::Consensus) && p.rating == Some(5)),
-            "should write Consensus with rating=5"
-        );
-
-        // Reviewing must come before Consensus in the patch sequence
-        let reviewing_idx = status_patches
-            .iter()
-            .position(|p| p.status == Some(Status::Reviewing))
-            .unwrap();
-        let consensus_idx = status_patches
-            .iter()
-            .position(|p| p.status == Some(Status::Consensus))
-            .unwrap();
-        assert!(
-            reviewing_idx < consensus_idx,
-            "Reviewing patch should precede Consensus patch"
-        );
-
-        // Log should mention adversarial
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("adversarial second review")),
-            "log should mention adversarial second review"
-        );
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("CONSENSUS") && line.contains("adversarial confirmed")),
-            "log should confirm adversarial consensus"
-        );
-
-        assert_eq!(
-            checkpoints,
-            vec![
-                "round-1-implementation: Changes body".to_string(),
-                "consensus-round-1".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn dual_agent_5_5_adversarial_needs_changes_continues_loop() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut logs = Vec::<String>::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "First review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Round 1: reviewer APPROVED 5/5, adversarial NEEDS_CHANGES
-        // Round 2: reviewer APPROVED 4/5, normal consensus → CONSENSUS
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-            test_loop_status_with_rating(
-                Status::NeedsChanges,
-                1,
-                Some("missing edge case test"),
-                Some(3),
-                &config,
-            ),
-            test_loop_status_with_rating(Status::Approved, 2, None, Some(4), &config),
-            test_loop_status(Status::Consensus, 2, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |message, _| logs.push(message.to_string()),
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
-        );
-
-        assert!(result, "should reach consensus in round 2");
-
-        // Log should show adversarial found issues
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("Adversarial review found issues")),
-            "log should show adversarial found issues"
-        );
-
-        // History should have adversarial-review entry in round 1
-        assert!(
-            appended.iter().any(|(round, phase, summary)| {
-                *round == 1
-                    && phase == "adversarial-review"
-                    && summary.contains("NEEDS_CHANGES (adversarial)")
-            }),
-            "should append adversarial-review history entry; got: {appended:?}"
-        );
-
-        // Round 2 should use normal consensus flow (not adversarial)
-        // The round 2 consensus call should be to the implementer (not reviewer)
-        let round2_consensus_calls: Vec<_> = prompts
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, prompt))| {
-                prompt.contains("The reviewer has APPROVED your implementation")
-            })
+    fn make_quality_shell_command_uses_platform_native_shell() {
+        let root = create_temp_project_root("phases_native_shell");
+        let command = make_quality_shell_command("echo quality-check", &root);
+        let program = command.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert!(
-            !round2_consensus_calls.is_empty(),
-            "round 2 should use the normal consensus prompt (rating 4, not 5)"
-        );
+
+        #[cfg(windows)]
+        {
+            assert_eq!(program, "cmd");
+            assert_eq!(
+                args,
+                vec!["/C".to_string(), "echo quality-check".to_string()]
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            assert_eq!(program, "sh");
+            assert_eq!(
+                args,
+                vec!["-c".to_string(), "echo quality-check".to_string()]
+            );
+        }
     }
 
     #[test]
-    fn single_agent_5_5_auto_consensus() {
-        let config = test_config_with_rounds(true, 3);
-        let baseline_files = HashSet::new();
-        let mut checkpoints = Vec::<String>::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer returns APPROVED with rating=5
-        let mut read_statuses = VecDeque::from([test_loop_status_with_rating(
-            Status::Approved,
-            1,
-            None,
-            Some(5),
-            &config,
-        )]);
+    fn format_quality_checks_prepends_remediation_hint_when_present() {
+        let checks = vec![CheckResult {
+            label: "cargo clippy -- -D warnings".to_string(),
+            success: false,
+            timed_out: false,
+            remediation: Some("Run cargo clippy --fix first.".to_string()),
+            output: "warning: dead_code".to_string(),
+        }];
 
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
+        let rendered = format_quality_checks(&checks);
+        assert!(rendered.contains("REMEDIATION: Run cargo clippy --fix first."));
+        assert!(rendered.contains("warning: dead_code"));
+    }
+
+    #[test]
+    fn compound_phase_respects_compound_flag() {
+        let mut enabled = test_config();
+        enabled.compound = true;
+
+        let mut disabled = test_config();
+        disabled.compound = false;
+
+        let mut enabled_calls = 0u32;
+        run_compound_phase_with_runner(
+            "Task",
+            "Plan",
+            &enabled,
+            &mut |_agent, _prompt, _config| {
+                enabled_calls += 1;
                 Ok(())
             },
-            |message, _, _| checkpoints.push(message.to_string()),
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
+            &mut |_message, _config| {},
         );
+        assert_eq!(enabled_calls, 1, "compound should run when enabled");
 
-        assert!(result);
-
-        // Only 2 agent calls: implementer + reviewer (no consensus/adversarial call)
-        assert_eq!(
-            prompts.len(),
-            2,
-            "single-agent 5/5 should have only 2 agent calls (implementer + reviewer)"
-        );
-
-        // Status should include Consensus with rating=5
-        assert!(
-            status_patches
-                .iter()
-                .any(|p| p.status == Some(Status::Consensus) && p.rating == Some(5)),
-            "should write Consensus with rating=5"
-        );
-
-        // Log should mention auto-consensus
-        assert!(
-            logs.iter().any(|line| line.contains("auto-consensus")),
-            "log should mention auto-consensus"
-        );
-
-        // History should have auto-consensus entry
-        assert!(
-            appended.iter().any(|(_, phase, summary)| {
-                phase == "consensus" && summary.contains("AUTO-CONSENSUS (single-agent 5/5)")
-            }),
-            "should append auto-consensus history entry; got: {appended:?}"
-        );
-
-        assert_eq!(
-            checkpoints,
-            vec![
-                "round-1-implementation: Changes body".to_string(),
-                "consensus-round-1".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn dual_agent_approved_rating_4_uses_normal_consensus() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer returns APPROVED with rating=4, then normal consensus → CONSENSUS
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(4), &config),
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
+        let mut disabled_calls = 0u32;
+        run_compound_phase_with_runner(
+            "Task",
+            "Plan",
+            &disabled,
+            &mut |_agent, _prompt, _config| {
+                disabled_calls += 1;
                 Ok(())
             },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
+            &mut |_message, _config| {},
         );
-
-        assert!(result);
-        // 3 agent calls: implementer, reviewer, consensus (implementer)
-        assert_eq!(prompts.len(), 3, "rating 4 should use normal 3-call flow");
-        assert_eq!(
-            prompts[2].0,
-            Agent::Claude,
-            "third call (consensus) should use implementer agent, not reviewer"
-        );
-        // Should use normal consensus prompt, not adversarial
-        assert!(
-            prompts[2]
-                .1
-                .contains("The reviewer has APPROVED your implementation"),
-            "should use consensus prompt for rating 4"
-        );
-        assert!(
-            !prompts[2].1.contains("find what the first reviewer missed"),
-            "should NOT use adversarial prompt for rating 4"
-        );
+        assert_eq!(disabled_calls, 0, "compound should be skipped when disabled");
     }
 
     #[test]
-    fn dual_agent_approved_no_rating_uses_normal_consensus() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut prompts = Vec::<(Agent, String)>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "Review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer returns APPROVED with no rating, then normal consensus → CONSENSUS
-        let mut read_statuses = VecDeque::from([
-            test_loop_status(Status::Approved, 1, None, &config), // rating: None
-            test_loop_status(Status::Consensus, 1, None, &config),
-        ]);
+    fn record_struggle_signal_appends_expected_shape() {
+        let config = test_config();
+        record_struggle_signal("Task 7: Handle retries", "timeout", 3, &config);
 
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |agent, prompt, _| {
-                prompts.push((agent, prompt.to_string()));
-                Ok(())
-            },
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
+        let content = crate::state::read_decisions(&config);
+        assert!(content.contains("- [STRUGGLE] Task:"));
+        assert!(content.contains("| Issue: timeout"));
+        assert!(content.contains("| Round: 3 | Date: "));
 
-        assert!(result);
-        // 3 agent calls: implementer, reviewer, consensus (implementer)
-        assert_eq!(
-            prompts.len(),
-            3,
-            "no-rating APPROVED should use normal 3-call flow"
-        );
-        assert_eq!(
-            prompts[2].0,
-            Agent::Claude,
-            "third call (consensus) should use implementer agent"
-        );
-        // Should use normal consensus prompt
-        assert!(
-            prompts[2]
-                .1
-                .contains("The reviewer has APPROVED your implementation"),
-            "should use consensus prompt for no-rating"
-        );
-    }
-
-    #[test]
-    fn dual_agent_5_5_adversarial_stale_timestamp_falls_back_to_needs_changes() {
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "First review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Round 1: reviewer APPROVED 5/5, adversarial returns stale status, then corrected NeedsChanges
-        // Round 2: max rounds
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-            stale_loop_status(Status::Approved, 1, None, &config), // adversarial stale
-            test_loop_status(
-                Status::NeedsChanges,
-                1,
-                Some(STALE_TIMESTAMP_REASON),
-                &config,
-            ), // corrected
-            test_loop_status(Status::NeedsChanges, 2, Some("still failing"), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |_, _, _, _| {},
-            false,
-        );
-
-        assert!(!result, "should not reach consensus (max rounds)");
-
-        // Verify stale detection was logged
-        assert!(
-            logs.iter()
-                .any(|line| line.contains("Stale status after adversarial review")),
-            "should log stale detection for adversarial review"
-        );
-
-        // Verify NeedsChanges fallback was written with stale reason
-        assert!(
-            status_patches.iter().any(|patch| {
-                patch.status == Some(Status::NeedsChanges)
-                    && patch.reason.as_deref() == Some(STALE_TIMESTAMP_REASON)
-            }),
-            "should write NeedsChanges with stale timestamp reason"
-        );
-    }
-
-    #[test]
-    fn dual_agent_5_5_adversarial_history_tracking() {
-        let config = test_config_with_rounds(false, 3);
-        let baseline_files = HashSet::new();
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "First review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Reviewer APPROVED 5/5, adversarial also APPROVED
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |_, _| {},
-            |_, _| {},
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
-        );
-
-        assert!(result);
-        // Should have: implementation, review, adversarial-review, consensus
-        assert_eq!(
-            appended.len(),
-            4,
-            "should have 4 appends: implementation, review, adversarial-review, consensus; got: {appended:?}"
-        );
-        assert_eq!(appended[0].1, "implementation");
-        assert_eq!(appended[1].1, "review");
-        assert!(appended[1].2.contains("APPROVED"));
-        assert_eq!(appended[2].1, "adversarial-review");
-        assert!(appended[2].2.contains("APPROVED (adversarial)"));
-        assert_eq!(appended[3].1, "consensus");
-        assert!(appended[3].2.contains("CONSENSUS (adversarial confirmed)"));
-    }
-
-    #[test]
-    fn dual_agent_5_5_adversarial_unchanged_status_prevents_false_consensus() {
-        // Regression test: if the adversarial agent does not write a new status,
-        // the intermediate Reviewing status prevents false consensus even when
-        // timestamps match (coarse clock edge case).
-        let config = test_config_with_rounds(false, 2);
-        let baseline_files = HashSet::new();
-        let mut logs = Vec::<String>::new();
-        let mut status_patches = Vec::<StatusPatch>::new();
-        let mut appended: Vec<(u32, String, String)> = Vec::new();
-        let state_files = HashMap::from([
-            ("task.md".to_string(), "Task body".to_string()),
-            ("plan.md".to_string(), "Plan body".to_string()),
-            ("review.md".to_string(), "First review body".to_string()),
-            ("changes.md".to_string(), "Changes body".to_string()),
-        ]);
-        // Round 1: reviewer APPROVED 5/5
-        // Then adversarial read returns Reviewing (agent didn't write — intermediate status
-        // persists) with matching timestamp (simulating coarse clock)
-        // Round 2: reviewer returns NeedsChanges → max rounds
-        let mut read_statuses = VecDeque::from([
-            test_loop_status_with_rating(Status::Approved, 1, None, Some(5), &config),
-            // Adversarial agent didn't update status; intermediate Reviewing persists.
-            // Timestamp matches TEST_TIMESTAMP (coarse clock), so stale check doesn't fire.
-            LoopStatus {
-                status: Status::Reviewing,
-                round: 1,
-                implementer: config.implementer.to_string(),
-                reviewer: config.reviewer.to_string(),
-                mode: config.run_mode.to_string(),
-                last_run_task: "Implement task".to_string(),
-                reason: Some("Awaiting adversarial second review".to_string()),
-                rating: None,
-                timestamp: TEST_TIMESTAMP.to_string(),
-            },
-            test_loop_status(Status::NeedsChanges, 2, Some("still failing"), &config),
-        ]);
-
-        let result = implementation_loop_internal(
-            &config,
-            &baseline_files,
-            |_, _, _| Ok(()),
-            |_, _, _| {},
-            |message, _| logs.push(message.to_string()),
-            |patch, _| status_patches.push(patch),
-            |name, _| state_files.get(name).cloned().unwrap_or_default(),
-            |_| {
-                read_statuses
-                    .pop_front()
-                    .expect("test should provide enough status reads")
-            },
-            |_, _| "(test diff)".to_string(),
-            || TEST_TIMESTAMP.to_string(),
-            |_, _| String::new(),
-            |round, phase, summary, _| {
-                appended.push((round, phase.to_string(), summary.to_string()));
-            },
-            false,
-        );
-
-        assert!(
-            !result,
-            "should NOT reach consensus when adversarial agent didn't write status"
-        );
-
-        // Should NOT have Consensus in status patches
-        assert!(
-            !status_patches
-                .iter()
-                .any(|p| p.status == Some(Status::Consensus)),
-            "should not write Consensus when adversarial agent didn't update status"
-        );
-
-        // Should have intermediate Reviewing patch
-        assert!(
-            status_patches
-                .iter()
-                .any(|p| p.status == Some(Status::Reviewing)),
-            "should write intermediate Reviewing status"
-        );
-
-        // Adversarial review history should show unexpected status, not APPROVED
-        let adversarial_entry = appended
-            .iter()
-            .find(|(_, phase, _)| phase == "adversarial-review");
-        assert!(
-            adversarial_entry.is_some(),
-            "should have adversarial-review history entry"
-        );
-        assert!(
-            !adversarial_entry
-                .unwrap()
-                .2
-                .contains("APPROVED (adversarial)"),
-            "adversarial history should NOT show APPROVED when agent didn't write status"
-        );
+        // Date should be YYYY-MM-DD (10 chars) right after the Date label.
+        let date_start = content
+            .find("| Date: ")
+            .expect("date field should exist")
+            + "| Date: ".len();
+        let date = &content[date_start..date_start + 10];
+        assert_eq!(date.len(), 10);
+        assert!(date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-');
     }
 }

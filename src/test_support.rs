@@ -12,8 +12,9 @@ use std::{
 };
 
 use crate::config::{
-    Agent, Config, DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS,
-    DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS, RunMode,
+    Agent, Config, DEFAULT_DECISIONS_MAX_LINES, DEFAULT_DECOMPOSITION_MAX_ROUNDS,
+    DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS, DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS,
+    QualityCommand, RunMode,
 };
 
 #[derive(Debug, Clone)]
@@ -27,10 +28,14 @@ pub struct TestConfigOptions {
     pub auto_commit: bool,
     pub auto_test: bool,
     pub auto_test_cmd: Option<String>,
+    pub quality_commands: Vec<QualityCommand>,
+    pub compound: bool,
+    pub decisions_max_lines: u32,
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
     pub planning_context_excerpt_lines: Option<u32>,
     pub max_parallel: u32,
+    pub batch_implement: bool,
     pub verbose: bool,
 }
 
@@ -46,10 +51,14 @@ impl Default for TestConfigOptions {
             auto_commit: true,
             auto_test: false,
             auto_test_cmd: None,
+            quality_commands: Vec::new(),
+            compound: true,
+            decisions_max_lines: DEFAULT_DECISIONS_MAX_LINES,
             diff_max_lines: None,
             context_line_cap: None,
             planning_context_excerpt_lines: None,
             max_parallel: DEFAULT_MAX_PARALLEL,
+            batch_implement: true,
             verbose: false,
         }
     }
@@ -83,10 +92,14 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         auto_commit: options.auto_commit,
         auto_test: options.auto_test,
         auto_test_cmd: options.auto_test_cmd.clone(),
+        quality_commands: options.quality_commands.clone(),
+        compound: options.compound,
+        decisions_max_lines: options.decisions_max_lines,
         diff_max_lines: options.diff_max_lines,
         context_line_cap: options.context_line_cap,
         planning_context_excerpt_lines: options.planning_context_excerpt_lines,
         max_parallel: options.max_parallel,
+        batch_implement: options.batch_implement,
         verbose: options.verbose,
     }
 }
@@ -176,6 +189,7 @@ impl TestProject {
         }
     }
 
+    #[allow(dead_code)]
     pub fn path(&self, relative: &str) -> PathBuf {
         self.root.join(relative)
     }
@@ -290,6 +304,7 @@ impl TestProjectBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn single_agent(mut self, value: bool) -> Self {
         self.options.single_agent = value;
         self
@@ -300,13 +315,39 @@ impl TestProjectBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn auto_test(mut self, value: bool) -> Self {
         self.options.auto_test = value;
         self
     }
 
+    #[allow(dead_code)]
     pub fn auto_test_cmd(mut self, value: Option<String>) -> Self {
         self.options.auto_test_cmd = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn quality_commands(mut self, value: Vec<QualityCommand>) -> Self {
+        self.options.quality_commands = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn compound(mut self, value: bool) -> Self {
+        self.options.compound = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn decisions_max_lines(mut self, value: u32) -> Self {
+        self.options.decisions_max_lines = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn batch_implement(mut self, value: bool) -> Self {
+        self.options.batch_implement = value;
         self
     }
 

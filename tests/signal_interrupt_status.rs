@@ -66,10 +66,15 @@ exit 0
             .join("state")
             .join("status.json");
 
-        // Spawn agent-loop run with --single-agent to simplify.
+        // Spawn agent-loop implement with --single-agent to simplify.
         // AUTO_COMMIT=0 avoids requiring git in PATH.
         let mut child = Command::new(agent_loop_bin())
-            .args(["run", "test task for signal handling", "--single-agent"])
+            .args([
+                "implement",
+                "--task",
+                "test task for signal handling",
+                "--single-agent",
+            ])
             .env("PATH", &bin_dir)
             .env("TIMEOUT", "300")
             .env("MAX_ROUNDS", "1")

@@ -43,6 +43,28 @@ pub(crate) fn gather_project_context(
         line_cap,
         excerpt_max_lines,
     );
+    // Append additional optional repository guides if budget remains.
+    append_file_excerpt(
+        project_dir,
+        "ARCHITECTURE.md",
+        &mut lines,
+        line_cap,
+        excerpt_max_lines,
+    );
+    append_file_excerpt(
+        project_dir,
+        "CONVENTIONS.md",
+        &mut lines,
+        line_cap,
+        excerpt_max_lines,
+    );
+    append_file_excerpt(
+        project_dir,
+        "AGENTS.md",
+        &mut lines,
+        line_cap,
+        excerpt_max_lines,
+    );
 
     // Enforce the global line cap (the header counts as line 1).
     lines.truncate(line_cap);
@@ -139,6 +161,22 @@ CRITICAL INSTRUCTIONS:
 
 ";
 
+const DECISION_CAPTURE_INSTRUCTIONS: &str = "DECISION CAPTURE: If you make an important architectural decision, discover a constraint,
+choose a reusable pattern, hit a gotcha, or identify a key dependency — append a one-line
+entry to `.agent-loop/decisions.md` with format:
+- [CATEGORY] description
+where CATEGORY is one of: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY";
+
+fn prior_decisions_section(decisions: &str) -> String {
+    if decisions.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nPRIOR DECISIONS & LEARNINGS (from previous sessions — respect these):\n{decisions}"
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PhasePaths {
     pub(crate) task_md: PathBuf,
@@ -175,6 +213,7 @@ pub(crate) fn single_agent_reviewer_preamble(config: &Config) -> String {
 pub(crate) fn planning_initial_prompt(
     task: &str,
     project_context: &str,
+    decisions: &str,
     paths: &PhasePaths,
 ) -> String {
     let context_section = if project_context.is_empty() {
@@ -182,9 +221,10 @@ pub(crate) fn planning_initial_prompt(
     } else {
         format!("\n{project_context}\n")
     };
+    let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nRead the task below and propose a detailed development plan.\n\nTASK:\n{task}\n\nWrite your plan to the file: {}\n\nYour plan should include:\n- Overview of approach\n- Step-by-step implementation strategy\n- Files to create/modify\n- Key technical decisions\n- Testing strategy",
+        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nRead the task below and propose a detailed development plan.\n\nTASK:\n{task}{decisions_section}\n\nWrite your plan to the file: {}\n\nYour plan should include:\n- Overview of approach\n- Step-by-step implementation strategy\n- Files to create/modify\n- Key technical decisions\n- Testing strategy",
         path_text(&paths.plan_md)
     )
 }
@@ -255,7 +295,7 @@ pub(crate) fn decomposition_initial_prompt(
     };
 
     format!(
-        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nBoth agents have agreed on the following development plan. Your job now is to break it down into discrete, implementable tasks.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCreate a task breakdown file at {} with the following structure:\n\n# Implementation Tasks\n\nFor each task, include:\n- Task number and title\n- Brief description (2-3 sentences)\n- Estimated complexity (Low/Medium/High)\n- Dependencies (which tasks must complete first)\n- Key deliverables\n- Testing requirements\n\nGuidelines:\n- Each task should be completable in a single agent-loop run (4-8 hours of work)\n- Break large features into smaller incremental tasks\n- Ensure tasks have clear success criteria\n- Order tasks by dependencies (foundational work first)\n- Include verification/testing as separate tasks if needed",
+        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nBoth agents have agreed on the following development plan. Your job now is to break it down into discrete, implementable tasks.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCreate a task breakdown file at {} with the following structure:\n\n# Implementation Tasks\n\nFor each task, include:\n- Task number and title\n- Brief description (2-3 sentences)\n- Estimated complexity (Low/Medium/High)\n- Dependencies (which tasks must complete first)\n- Key deliverables\n- Testing requirements\n\nGuidelines:\n- Each task should be completable in a single implementation session (4-8 hours of work)\n- Break large features into smaller incremental tasks\n- Ensure tasks have clear success criteria\n- Order tasks by dependencies (foundational work first)\n- Include verification/testing as separate tasks if needed",
         path_text(&paths.tasks_md)
     )
 }
@@ -308,6 +348,7 @@ pub(crate) fn implementation_implementer_prompt(
     task: &str,
     plan: &str,
     previous_review: &str,
+    decisions: &str,
     paths: &PhasePaths,
     round_history: &str,
 ) -> String {
@@ -322,9 +363,10 @@ pub(crate) fn implementation_implementer_prompt(
     } else {
         format!("\n\nROUND HISTORY:\n{round_history}")
     };
+    let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}\n\n{review_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Adding tests where appropriate",
+        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Adding tests where appropriate\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
         path_text(&paths.changes_md)
     )
 }
@@ -340,6 +382,7 @@ pub(crate) fn implementation_reviewer_prompt(
     prompt_timestamp: &str,
     paths: &PhasePaths,
     quality_checks: Option<&str>,
+    decisions: &str,
     round_history: &str,
 ) -> String {
     let quality_section = match quality_checks {
@@ -352,9 +395,10 @@ pub(crate) fn implementation_reviewer_prompt(
     } else {
         format!("\n\nROUND HISTORY:\n{round_history}")
     };
+    let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
         path_text(&paths.status_json),
@@ -369,20 +413,71 @@ pub(crate) fn implementation_reviewer_prompt(
 
 pub(crate) fn implementation_consensus_prompt(
     config: &Config,
+    task: &str,
+    plan: &str,
     review: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has APPROVED your implementation.\n\nREVIEW:\n{review}\n\nIf you agree the implementation is complete and the review is fair, write this to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you disagree or think something was missed, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"what was missed\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "The reviewer has APPROVED your implementation. Before confirming consensus,
+perform your own final review:
+
+1. Re-read the TASK requirements below — verify every requirement is met
+2. Check for edge cases, error handling gaps, or missing tests the reviewer may have overlooked
+3. Verify the code follows project conventions and the agreed plan
+4. Look for any regressions or unintended side effects
+
+TASK:
+{task}
+
+PLAN:
+{plan}
+
+REVIEW:
+{review}
+
+Write a brief summary of your self-review findings.
+
+If everything checks out, write CONSENSUS [JSON].
+If you find issues the reviewer missed, write DISPUTED [JSON] with specific
+details of what was missed.
+
+CONSENSUS [JSON] to {}:
+{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}
+
+DISPUTED [JSON] to {}:
+{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"what was missed\", \"timestamp\": \"{prompt_timestamp}\"}}",
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
         config.run_mode,
+        path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
         config.run_mode,
+    )
+}
+
+pub(crate) fn compound_prompt(task: &str, plan: &str) -> String {
+    format!(
+        "You are the IMPLEMENTER running a post-consensus compound reflection phase.
+
+Review the full session: task goals, plan, implementation rounds, review feedback,
+and any struggles encountered. Extract only reusable, cross-session learnings.
+Do not record one-off or session-specific details.
+
+TASK:
+{task}
+
+PLAN:
+{plan}
+
+Append each learning to `.agent-loop/decisions.md` using one line per entry:
+- [CATEGORY] description
+
+Allowed categories: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY."
     )
 }
 
@@ -578,6 +673,39 @@ mod tests {
     }
 
     #[test]
+    fn gather_project_context_includes_additional_repository_guides() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        fs::write(dir.join("README.md"), "readme line").unwrap();
+        fs::write(dir.join("CLAUDE.md"), "claude line").unwrap();
+        fs::write(dir.join("ARCHITECTURE.md"), "architecture line").unwrap();
+        fs::write(dir.join("CONVENTIONS.md"), "conventions line").unwrap();
+        fs::write(dir.join("AGENTS.md"), "agents line").unwrap();
+
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
+        assert!(output.contains("README.md (first 100 lines):"));
+        assert!(output.contains("CLAUDE.md (first 100 lines):"));
+        assert!(output.contains("ARCHITECTURE.md (first 100 lines):"));
+        assert!(output.contains("CONVENTIONS.md (first 100 lines):"));
+        assert!(output.contains("AGENTS.md (first 100 lines):"));
+    }
+
+    #[test]
+    fn gather_project_context_skips_missing_additional_repository_guides() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        fs::write(dir.join("README.md"), "readme line").unwrap();
+        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
+
+        assert!(output.contains("README.md (first 100 lines):"));
+        assert!(!output.contains("ARCHITECTURE.md"));
+        assert!(!output.contains("CONVENTIONS.md"));
+        assert!(!output.contains("AGENTS.md"));
+    }
+
+    #[test]
     fn gather_project_context_handles_missing_readme_gracefully() {
         let dir = make_temp_dir();
         let _guard = TempDir(dir.clone());
@@ -645,15 +773,32 @@ mod tests {
             status_json: PathBuf::from("/state/status.json"),
         };
 
-        let with_context =
-            planning_initial_prompt("My task", "PROJECT STRUCTURE:\nsrc/\n  main.rs", &paths);
-        let without_context = planning_initial_prompt("My task", "", &paths);
+        let with_context = planning_initial_prompt(
+            "My task",
+            "PROJECT STRUCTURE:\nsrc/\n  main.rs",
+            "",
+            &paths,
+        );
+        let without_context = planning_initial_prompt("My task", "", "", &paths);
 
         assert!(with_context.contains("PROJECT STRUCTURE:\nsrc/\n  main.rs"));
         assert!(!without_context.contains("PROJECT STRUCTURE:"));
         // Both should contain the task
         assert!(with_context.contains("TASK:\nMy task"));
         assert!(without_context.contains("TASK:\nMy task"));
+    }
+
+    #[test]
+    fn planning_initial_prompt_injects_prior_decisions_when_present() {
+        let paths = test_phase_paths();
+        let prompt = planning_initial_prompt(
+            "Task",
+            "",
+            "- [PATTERN] Reuse parser logic",
+            &paths,
+        );
+        assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
+        assert!(prompt.contains("- [PATTERN] Reuse parser logic"));
     }
 
     fn test_config_for_prompts() -> Config {
@@ -771,6 +916,7 @@ mod tests {
             &paths,
             None,
             "",
+            "",
         );
 
         assert!(!prompt.contains("QUALITY CHECKS:"));
@@ -792,6 +938,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             Some(checks),
+            "",
             "",
         );
 
@@ -818,6 +965,7 @@ mod tests {
             &paths,
             Some("   "),
             "",
+            "",
         );
 
         assert!(!prompt.contains("QUALITY CHECKS:"));
@@ -827,8 +975,15 @@ mod tests {
     fn implementation_implementer_prompt_includes_round_history_when_provided() {
         let paths = test_phase_paths();
         let history = "Round 1 implementation: Added auth\nRound 1 review: NEEDS_CHANGES — missing validation";
-        let prompt =
-            implementation_implementer_prompt(2, "Task", "Plan", "Fix validation", &paths, history);
+        let prompt = implementation_implementer_prompt(
+            2,
+            "Task",
+            "Plan",
+            "Fix validation",
+            "",
+            &paths,
+            history,
+        );
 
         assert!(prompt.contains("ROUND HISTORY:\nRound 1 implementation: Added auth\nRound 1 review: NEEDS_CHANGES — missing validation"));
         // History should appear after PLAN and before review feedback
@@ -842,7 +997,7 @@ mod tests {
     #[test]
     fn implementation_implementer_prompt_omits_round_history_when_empty() {
         let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", &paths, "");
+        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", &paths, "");
 
         assert!(!prompt.contains("ROUND HISTORY:"));
     }
@@ -850,9 +1005,74 @@ mod tests {
     #[test]
     fn implementation_implementer_prompt_omits_round_history_when_whitespace_only() {
         let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", &paths, "   \n  ");
+        let prompt =
+            implementation_implementer_prompt(1, "Task", "Plan", "", "", &paths, "   \n  ");
 
         assert!(!prompt.contains("ROUND HISTORY:"));
+    }
+
+    #[test]
+    fn implementation_prompts_include_decision_capture_categories() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+
+        let implementer = implementation_implementer_prompt(
+            1,
+            "Task",
+            "Plan",
+            "",
+            "- [CONSTRAINT] Keep compatibility",
+            &paths,
+            "",
+        );
+        assert!(implementer.contains("DECISION CAPTURE"));
+        assert!(implementer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
+        assert!(implementer.contains("PRIOR DECISIONS & LEARNINGS"));
+
+        let reviewer = implementation_reviewer_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "Changes",
+            "diff",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+            None,
+            "- [GOTCHA] Handle stale status writes",
+            "",
+        );
+        assert!(reviewer.contains("DECISION CAPTURE"));
+        assert!(reviewer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
+        assert!(reviewer.contains("PRIOR DECISIONS & LEARNINGS"));
+    }
+
+    #[test]
+    fn implementation_consensus_prompt_includes_self_review_checklist_and_context() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = implementation_consensus_prompt(
+            &config,
+            "Task body",
+            "Plan body",
+            "Reviewer approved",
+            2,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(prompt.contains("perform your own final review"));
+        assert!(prompt.contains("TASK:\nTask body"));
+        assert!(prompt.contains("PLAN:\nPlan body"));
+        assert!(prompt.contains("If everything checks out, write CONSENSUS [JSON]."));
+        assert!(prompt.contains("If you find issues the reviewer missed, write DISPUTED [JSON]"));
+    }
+
+    #[test]
+    fn compound_prompt_includes_categories_and_decisions_path() {
+        let prompt = compound_prompt("Task", "Plan");
+        assert!(prompt.contains(".agent-loop/decisions.md"));
+        assert!(prompt.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
     }
 
     #[test]
@@ -870,6 +1090,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
             history,
         );
 
@@ -898,6 +1119,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
             "",
         );
 
@@ -944,6 +1166,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
             "",
         );
 
@@ -995,6 +1218,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
             "",
         );
 

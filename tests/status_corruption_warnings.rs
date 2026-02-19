@@ -71,7 +71,7 @@ fn status_with_corrupt_json_shows_warnings_and_recovery_hint() {
         "stdout should contain Warnings section, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init recovery hint, got:\n{stdout}"
     );
     assert!(
@@ -81,7 +81,7 @@ fn status_with_corrupt_json_shows_warnings_and_recovery_hint() {
 
     // Also gets resume hint
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint for ERROR status, got:\n{stdout}"
     );
 
@@ -110,7 +110,7 @@ fn status_with_missing_fields_shows_per_field_warnings() {
 
     // Should contain recovery hint
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init hint, got:\n{stdout}"
     );
 
@@ -141,11 +141,11 @@ fn status_with_max_rounds_shows_resume_hint() {
         "stdout should show MAX_ROUNDS status, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init hint, got:\n{stdout}"
     );
 
@@ -177,11 +177,11 @@ fn status_with_interrupted_shows_resume_hint() {
         "stdout should show INTERRUPTED, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init hint, got:\n{stdout}"
     );
 
@@ -213,7 +213,7 @@ fn status_with_error_shows_resume_hint() {
         "stdout should show ERROR, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint, got:\n{stdout}"
     );
 
@@ -244,7 +244,7 @@ fn status_with_valid_active_status_shows_no_warnings_or_hints() {
         "valid status should not show warnings, got:\n{stdout}"
     );
     assert!(
-        !stdout.contains("agent-loop resume"),
+        !stdout.contains("agent-loop implement --resume"),
         "active status should not show resume hint, got:\n{stdout}"
     );
     assert!(
@@ -284,11 +284,11 @@ fn status_with_stale_timestamp_reason_on_non_terminal_status_shows_resume_hint()
         "stdout should show NEEDS_CHANGES status, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint for stale reason, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init hint for stale reason, got:\n{stdout}"
     );
     assert!(
@@ -324,11 +324,11 @@ fn status_with_timestamp_in_reason_on_non_terminal_status_shows_resume_hint() {
         "stdout should show DISPUTED status, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop resume"),
+        stdout.contains("agent-loop implement --resume"),
         "stdout should contain resume hint for timestamp reason, got:\n{stdout}"
     );
     assert!(
-        stdout.contains("agent-loop init"),
+        stdout.contains("agent-loop reset"),
         "stdout should contain init hint for timestamp reason, got:\n{stdout}"
     );
 
@@ -356,7 +356,7 @@ fn status_with_non_stale_reason_on_non_terminal_status_shows_no_hints() {
 
     assert_eq!(code, 0);
     assert!(
-        !stdout.contains("agent-loop resume"),
+        !stdout.contains("agent-loop implement --resume"),
         "non-stale non-terminal status should not show resume hint, got:\n{stdout}"
     );
     assert!(

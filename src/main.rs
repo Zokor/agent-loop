@@ -29,16 +29,18 @@ use state::{
     TaskStatusEntry, TaskStatusFile,
 };
 
-const KNOWN_SUBCOMMANDS: [&str; 9] = [
-    "run",
+const KNOWN_SUBCOMMANDS: [&str; 11] = [
     "plan",
-    "resume",
     "tasks",
-    "run-tasks",
-    "init",
+    "implement",
+    "reset",
     "status",
     "version",
     "help",
+    "run",
+    "run-tasks",
+    "init",
+    "resume",
 ];
 
 #[derive(Debug, Parser)]
@@ -54,22 +56,26 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Run a task through the implementation/review loop
-    Run(RunArgs),
-    /// Plan and decompose a task (no implementation)
+    /// Plan only
     Plan(PlanArgs),
-    /// Resume an interrupted loop from saved state
-    Resume(ResumeArgs),
-    /// Execute all tasks from the tasks file
+    /// Decompose plan into tasks only
     Tasks(TasksArgs),
-    #[command(name = "run-tasks", hide = true)]
-    RunTasksDeprecated(TasksArgs),
-    /// Create .agent-loop/state/ in current directory
-    Init,
+    /// Implement from tasks.md, inline task text, or task file
+    Implement(ImplementArgs),
+    /// Clear .agent-loop/state while preserving decisions.md
+    Reset,
     /// Show current loop status
     Status,
     /// Print version
     Version,
+    #[command(name = "run", hide = true)]
+    Run(RunArgs),
+    #[command(name = "run-tasks", hide = true)]
+    RunTasksDeprecated(LegacyRunTasksArgs),
+    #[command(name = "init", hide = true)]
+    Init,
+    #[command(name = "resume", hide = true)]
+    Resume(ResumeArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -97,28 +103,15 @@ struct PlanArgs {
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-struct ResumeArgs {
-    #[arg(long)]
-    single_agent: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResumeDispatch {
-    args: ResumeArgs,
-    planning_only_legacy_override: Option<bool>,
-    /// When set, overrides the max rounds in Config (used by tasks retry loop).
-    max_rounds_override: Option<u32>,
-    /// When true, skip workflow resolution and force implementation mode
-    /// (used by tasks retry loop where resume always means "continue implementing").
-    force_implementation: bool,
-}
-
-#[derive(Debug, Clone, Args, PartialEq, Eq)]
-struct TasksArgs {
+struct ImplementArgs {
+    #[arg(long, value_name = "TASK")]
+    task: Option<String>,
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
-    #[arg(long, value_name = "PATH", hide = true)]
-    tasks_file: Option<PathBuf>,
+    #[arg(long)]
+    per_task: bool,
+    #[arg(long)]
+    resume: bool,
     #[arg(long, default_value_t = 2)]
     max_retries: u32,
     #[arg(long, default_value_t = 2)]
@@ -133,23 +126,81 @@ struct TasksArgs {
     max_parallel: Option<u32>,
 }
 
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct ResumeArgs {
+    #[arg(long)]
+    single_agent: bool,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct LegacyRunTasksArgs {
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    tasks_file: Option<PathBuf>,
+    #[arg(long)]
+    per_task: bool,
+    #[arg(long, default_value_t = 2)]
+    max_retries: u32,
+    #[arg(long, default_value_t = 2)]
+    round_step: u32,
+    #[arg(long)]
+    single_agent: bool,
+    #[arg(long)]
+    continue_on_fail: bool,
+    #[arg(long)]
+    fail_fast: bool,
+    #[arg(long)]
+    max_parallel: Option<u32>,
+}
+
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+struct TasksArgs {
+    #[arg(long)]
+    resume: bool,
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", hide = true)]
+    tasks_file: Option<PathBuf>,
+    #[arg(long)]
+    single_agent: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Dispatch {
     ShowHelp,
-    Run(RunArgs),
     Plan(PlanArgs),
-    Resume(ResumeDispatch),
     Tasks(TasksArgs),
-    Init,
+    Implement(ImplementArgs),
+    Reset,
     Status,
     Version,
+    MigrationError(String),
 }
 
 impl TasksArgs {
     fn validate(&self) -> Result<(), AgentLoopError> {
-        if self.file.is_some() && self.tasks_file.is_some() {
+        Ok(())
+    }
+}
+
+impl ImplementArgs {
+    fn validate(&self) -> Result<(), AgentLoopError> {
+        if self.task.is_some() && self.file.is_some() {
             return Err(AgentLoopError::Config(
-                "--file and --tasks-file cannot be used together.".to_string(),
+                "--task and --file cannot be used together.".to_string(),
+            ));
+        }
+
+        if self.resume && (self.task.is_some() || self.file.is_some()) {
+            return Err(AgentLoopError::Config(
+                "--resume cannot be combined with --task or --file.".to_string(),
+            ));
+        }
+
+        if self.per_task && (self.task.is_some() || self.file.is_some() || self.resume) {
+            return Err(AgentLoopError::Config(
+                "--per-task cannot be combined with --task, --file, or --resume.".to_string(),
             ));
         }
 
@@ -172,22 +223,6 @@ impl TasksArgs {
         }
 
         Ok(())
-    }
-
-    fn effective_file(&self, project_dir: &Path) -> PathBuf {
-        if let Some(ref file) = self.file {
-            return file.clone();
-        }
-
-        if let Some(ref tasks_file) = self.tasks_file {
-            eprintln!("Warning: --tasks-file is deprecated. Use --file instead.");
-            return tasks_file.clone();
-        }
-
-        project_dir
-            .join(".agent-loop")
-            .join("state")
-            .join("tasks.md")
     }
 }
 
@@ -224,20 +259,7 @@ fn run() -> Result<i32, AgentLoopError> {
     let parse_outcome = parse_cli_from(std::env::args_os())?;
     match parse_outcome {
         ParseOutcome::Exit(code) => Ok(code),
-        ParseOutcome::Parsed(cli) => {
-            let dispatch = dispatch_from_cli(cli)?;
-            execute_dispatch(
-                dispatch,
-                run_command,
-                plan_command,
-                resume_command,
-                tasks_command,
-                init_command,
-                status_command,
-                version_command,
-                print_help_message,
-            )
-        }
+        ParseOutcome::Parsed(cli) => execute_dispatch(dispatch_from_cli(cli)?),
     }
 }
 
@@ -267,103 +289,63 @@ where
 
 fn dispatch_from_cli(cli: Cli) -> Result<Dispatch, AgentLoopError> {
     match cli.command {
-        Some(Commands::Run(args)) if args.resume && args.planning_only => {
-            // Legacy: `run --planning-only --resume`
-            if args.task.is_some() || args.file.is_some() {
-                return Err(AgentLoopError::Config(
-                    "--resume cannot be combined with TASK text or --file.".to_string(),
-                ));
-            }
-            eprintln!(
-                "Warning: 'run --planning-only --resume' is deprecated. Use 'resume' instead."
-            );
-            Ok(Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: args.single_agent,
-                },
-                planning_only_legacy_override: Some(true),
-                max_rounds_override: None,
-                force_implementation: false,
-            }))
-        }
-        Some(Commands::Run(args)) if args.resume => {
-            // Legacy: `run --resume`
-            if args.task.is_some() || args.file.is_some() {
-                return Err(AgentLoopError::Config(
-                    "--resume cannot be combined with TASK text or --file.".to_string(),
-                ));
-            }
-            eprintln!("Warning: 'run --resume' is deprecated. Use 'resume' instead.");
-            Ok(Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: args.single_agent,
-                },
-                planning_only_legacy_override: None,
-                max_rounds_override: None,
-                force_implementation: false,
-            }))
-        }
-        Some(Commands::Run(args)) if args.planning_only => {
-            // Legacy: `run --planning-only`
-            eprintln!("Warning: 'run --planning-only' is deprecated. Use 'plan' instead.");
-            Ok(Dispatch::Plan(PlanArgs {
-                task: args.task,
-                file: args.file,
-                single_agent: args.single_agent,
-            }))
-        }
-        Some(Commands::Run(args)) => Ok(Dispatch::Run(args)),
         Some(Commands::Plan(args)) => Ok(Dispatch::Plan(args)),
-        Some(Commands::Resume(args)) => Ok(Dispatch::Resume(ResumeDispatch {
-            args,
-            planning_only_legacy_override: None,
-            max_rounds_override: None,
-            force_implementation: false,
-        })),
-        Some(Commands::Tasks(args)) => Ok(Dispatch::Tasks(args)),
-        Some(Commands::RunTasksDeprecated(args)) => {
-            eprintln!("Warning: 'run-tasks' is deprecated. Use 'tasks' instead.");
+        Some(Commands::Tasks(args)) => {
+            if args.tasks_file.is_some() {
+                return Ok(Dispatch::MigrationError(
+                    "'--tasks-file' has been removed. Use '--file' instead.".to_string(),
+                ));
+            }
             Ok(Dispatch::Tasks(args))
         }
-        Some(Commands::Init) => Ok(Dispatch::Init),
+        Some(Commands::Implement(args)) => Ok(Dispatch::Implement(args)),
+        Some(Commands::Reset) => Ok(Dispatch::Reset),
         Some(Commands::Status) => Ok(Dispatch::Status),
         Some(Commands::Version) => Ok(Dispatch::Version),
+        Some(Commands::Run(args)) => {
+            if args.planning_only {
+                Ok(Dispatch::MigrationError(
+                    "'run --planning-only' has been removed. Use 'plan'.".to_string(),
+                ))
+            } else if args.resume {
+                Ok(Dispatch::MigrationError(
+                    "'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
+                        .to_string(),
+                ))
+            } else {
+                Ok(Dispatch::MigrationError(
+                    "'run' has been removed. Use 'implement'.".to_string(),
+                ))
+            }
+        }
+        Some(Commands::RunTasksDeprecated(_)) => Ok(Dispatch::MigrationError(
+            "'run-tasks' has been removed. Use 'implement'.".to_string(),
+        )),
+        Some(Commands::Init) => Ok(Dispatch::MigrationError(
+            "'init' has been removed. Use 'plan' or 'implement' — state is created automatically."
+                .to_string(),
+        )),
+        Some(Commands::Resume(_)) => Ok(Dispatch::MigrationError(
+            "'resume' has been removed. Use 'implement --resume' or 'tasks --resume'.".to_string(),
+        )),
         None => Ok(Dispatch::ShowHelp),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_dispatch<FRun, FPlan, FResume, FTasks, FInit, FStatus, FVersion, FHelp>(
-    dispatch: Dispatch,
-    run_handler: FRun,
-    plan_handler: FPlan,
-    resume_handler: FResume,
-    tasks_handler: FTasks,
-    init_handler: FInit,
-    status_handler: FStatus,
-    version_handler: FVersion,
-    help_handler: FHelp,
-) -> Result<i32, AgentLoopError>
-where
-    FRun: FnOnce(RunArgs) -> Result<i32, AgentLoopError>,
-    FPlan: FnOnce(PlanArgs) -> Result<i32, AgentLoopError>,
-    FResume: FnOnce(ResumeDispatch) -> Result<i32, AgentLoopError>,
-    FTasks: FnOnce(TasksArgs) -> Result<i32, AgentLoopError>,
-    FInit: FnOnce() -> Result<i32, AgentLoopError>,
-    FStatus: FnOnce() -> Result<i32, AgentLoopError>,
-    FVersion: FnOnce() -> Result<i32, AgentLoopError>,
-    FHelp: FnOnce() -> Result<(), AgentLoopError>,
-{
+fn execute_dispatch(dispatch: Dispatch) -> Result<i32, AgentLoopError> {
     match dispatch {
-        Dispatch::Run(args) => run_handler(args),
-        Dispatch::Plan(args) => plan_handler(args),
-        Dispatch::Resume(dispatch) => resume_handler(dispatch),
-        Dispatch::Tasks(args) => tasks_handler(args),
-        Dispatch::Init => init_handler(),
-        Dispatch::Status => status_handler(),
-        Dispatch::Version => version_handler(),
+        Dispatch::Plan(args) => plan_command(args),
+        Dispatch::Tasks(args) => tasks_command(args),
+        Dispatch::Implement(args) => implement_command(args),
+        Dispatch::Reset => reset_command(),
+        Dispatch::Status => status_command(),
+        Dispatch::Version => version_command(),
+        Dispatch::MigrationError(message) => {
+            eprintln!("Error: {message}");
+            Ok(1)
+        }
         Dispatch::ShowHelp => {
-            help_handler()?;
+            print_help_message()?;
             Ok(0)
         }
     }
@@ -374,20 +356,8 @@ where
     I: IntoIterator<Item = S>,
     S: Into<OsString>,
 {
-    let mut normalized = args.into_iter().map(Into::into).collect::<Vec<_>>();
-    if normalized.len() <= 1 {
-        return normalized;
-    }
-
-    let first_user_arg = normalized[1].to_string_lossy();
-    let is_flag = first_user_arg.starts_with('-');
-    let is_known_subcommand = KNOWN_SUBCOMMANDS.contains(&first_user_arg.as_ref());
-
-    if !is_flag && !is_known_subcommand {
-        normalized.insert(1, OsString::from("run"));
-    }
-
-    normalized
+    let _ = KNOWN_SUBCOMMANDS.len();
+    args.into_iter().map(Into::into).collect::<Vec<_>>()
 }
 
 fn print_help_message() -> Result<(), AgentLoopError> {
@@ -401,7 +371,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop run <task>      Run implementation/review loop\n  agent-loop plan <task>     Plan and decompose only (no code)\n  agent-loop resume          Continue from saved state\n  agent-loop tasks           Execute all tasks from tasks file\n\nDeprecated flags (still supported):\n  agent-loop run --planning-only   → use 'plan' instead\n  agent-loop run --resume          → use 'resume' instead\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands (--single-agent, plan, resume, tasks)\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent: claude|codex\n  REVIEWER                              Reviewer agent: claude|codex (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent: claude|codex\n  REVIEWER                              Reviewer agent: claude|codex (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -471,6 +441,37 @@ fn resolve_task_for_plan(args: &PlanArgs) -> Result<String, AgentLoopError> {
     ))
 }
 
+fn resolve_task_for_implement(args: &ImplementArgs) -> Result<String, AgentLoopError> {
+    if let Some(task_file_path) = args.file.as_ref() {
+        let file_contents = fs::read_to_string(task_file_path).map_err(|err| {
+            AgentLoopError::Config(format!(
+                "Failed to read task file '{}': {err}",
+                task_file_path.display()
+            ))
+        })?;
+
+        if file_contents.trim().is_empty() {
+            return Err(AgentLoopError::Config(format!(
+                "Task file '{}' is empty.",
+                task_file_path.display()
+            )));
+        }
+
+        return Ok(file_contents);
+    }
+
+    if let Some(task_text) = args.task.as_ref() {
+        if task_text.trim().is_empty() {
+            return Err(AgentLoopError::Config("Task cannot be empty.".to_string()));
+        }
+        return Ok(task_text.clone());
+    }
+
+    Err(AgentLoopError::Config(
+        "Task is required. Provide --task <text> or --file <path>.".to_string(),
+    ))
+}
+
 fn task_heading(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if !(trimmed.starts_with("## ") || trimmed.starts_with("### ")) {
@@ -529,6 +530,15 @@ fn parse_tasks_file(raw_tasks: &str, tasks_file: &Path) -> Result<Vec<ParsedTask
     parse_tasks_markdown(raw_tasks)
 }
 
+fn build_batch_implementation_task(raw_tasks: &str) -> String {
+    format!(
+        "Implement ALL tasks below as one cohesive change set.\n\
+         Treat cross-task dependencies holistically and ensure every task is fully satisfied.\n\n\
+         TASKS:\n{tasks}",
+        tasks = raw_tasks.trim()
+    )
+}
+
 fn read_current_status(project_dir: &Path, single_agent: bool) -> Option<LoopStatus> {
     let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false).ok()?;
     if !config.state_dir.join("status.json").is_file() {
@@ -567,16 +577,6 @@ fn format_status_reason(status: Option<&LoopStatus>) -> String {
     }
 }
 
-fn ensure_tasks_file_exists(config: &Config) -> Result<(), AgentLoopError> {
-    let tasks_path = config.state_dir.join("tasks.md");
-    if tasks_path.exists() {
-        return Ok(());
-    }
-
-    state::write_state_file("tasks.md", "", config)?;
-    Ok(())
-}
-
 fn persist_last_run_task(task: &str, config: &Config) -> Result<(), AgentLoopError> {
     state::write_status(
         StatusPatch {
@@ -592,46 +592,8 @@ fn phase_success_to_exit_code(success: bool) -> i32 {
     if success { 0 } else { 1 }
 }
 
-fn execute_run_phases<FPlanning, FDecomposition, FImplementation, FSummary>(
-    config: &Config,
-    baseline_set: &HashSet<String>,
-    planning_only: bool,
-    planning_phase_fn: FPlanning,
-    decomposition_phase_fn: FDecomposition,
-    implementation_loop_fn: FImplementation,
-    print_summary_fn: FSummary,
-) -> i32
-where
-    FPlanning: FnOnce(&Config, bool) -> bool,
-    FDecomposition: FnOnce(&Config) -> bool,
-    FImplementation: FnOnce(&Config, &HashSet<String>) -> bool,
-    FSummary: FnOnce(&Config),
-{
-    let planning_succeeded = planning_phase_fn(config, planning_only);
-    if !planning_succeeded {
-        return 1;
-    }
-
-    if planning_only {
-        return phase_success_to_exit_code(decomposition_phase_fn(config));
-    }
-
-    let reached_consensus = implementation_loop_fn(config, baseline_set);
-    print_summary_fn(config);
-    phase_success_to_exit_code(reached_consensus)
-}
-
-/// Internal helper used by `run_command` and `tasks_command` (fresh runs only).
-///
-/// This function handles exclusively fresh implementation runs. Resume and
-/// planning-only paths are handled by `resume_command` and `plan_command`
-/// respectively, through dispatch rewriting.
-///
-/// # Panics / Errors
-///
-/// Returns `AgentLoopError::Config` if `args.resume` or `args.planning_only`
-/// are set — those flags must never reach this path since dispatch rewrites
-/// them to `Dispatch::Resume` and `Dispatch::Plan`.
+/// Internal helper used by `implement --task`, `implement --file`, and
+/// `implement` task-list execution attempts.
 fn run_command_with_max_rounds(
     args: RunArgs,
     max_rounds_override: Option<u32>,
@@ -639,7 +601,7 @@ fn run_command_with_max_rounds(
     if args.resume {
         return Err(AgentLoopError::Config(
             "run_command_with_max_rounds must not be called with resume=true. \
-             Use 'resume' subcommand instead."
+             Use 'implement --resume' instead."
                 .to_string(),
         ));
     }
@@ -668,22 +630,20 @@ fn run_command_with_max_rounds(
     };
     let baseline_set = baseline_vec.iter().cloned().collect::<HashSet<_>>();
 
+    let existing_plan = state::read_state_file("plan.md", &config);
     state::init(
         task.as_str(),
         &config,
         &baseline_vec,
-        state::WorkflowKind::Run,
+        state::WorkflowKind::Implement,
     )?;
-    ensure_tasks_file_exists(&config)?;
-    let exit_code = execute_run_phases(
-        &config,
-        &baseline_set,
-        false, // planning_only — fresh runs always implement
-        phases::planning_phase,
-        phases::task_decomposition_phase,
-        phases::implementation_loop,
-        phases::print_summary,
-    );
+    if !existing_plan.trim().is_empty() {
+        state::write_state_file("plan.md", &existing_plan, &config)?;
+    }
+
+    let reached_consensus = phases::implementation_loop(&config, &baseline_set);
+    phases::print_summary(&config);
+    let exit_code = phase_success_to_exit_code(reached_consensus);
     persist_last_run_task(task.as_str(), &config)?;
 
     // Check if the loop was interrupted by a signal and propagate as the
@@ -702,56 +662,17 @@ fn run_command_with_max_rounds(
     Ok(exit_code)
 }
 
-/// Resume helper used by `tasks_command` for resuming interrupted task attempts.
-///
-/// Delegates to `resume_command_inner` with `force_implementation: true` to skip
-/// workflow resolution (tasks always resume in implementation mode) and the
-/// provided `max_rounds_override` for retry-budget control.
+/// Resume helper used by `implement` task retries.
 fn resume_for_tasks(
     single_agent: bool,
     max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
-    let dispatch = ResumeDispatch {
-        args: ResumeArgs { single_agent },
-        planning_only_legacy_override: None,
-        max_rounds_override,
-        force_implementation: true,
-    };
-    resume_command_inner(
-        dispatch,
-        current_project_dir,
-        phases::task_decomposition_phase_resume,
-        phases::implementation_loop_resume,
-        phases::print_summary,
-    )
-}
-
-fn run_command(args: RunArgs) -> Result<i32, AgentLoopError> {
-    run_command_with_max_rounds(args, None)
+    implementation_resume_with_max_rounds(single_agent, max_rounds_override)
 }
 
 fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
-    plan_command_inner(
-        args,
-        current_project_dir,
-        phases::planning_phase,
-        phases::task_decomposition_phase,
-    )
-}
-
-fn plan_command_inner<FProjectDir, FPlanning, FDecomposition>(
-    args: PlanArgs,
-    project_dir_fn: FProjectDir,
-    planning_phase_fn: FPlanning,
-    decomposition_phase_fn: FDecomposition,
-) -> Result<i32, AgentLoopError>
-where
-    FProjectDir: FnOnce() -> Result<PathBuf, AgentLoopError>,
-    FPlanning: FnOnce(&Config, bool) -> bool,
-    FDecomposition: FnOnce(&Config) -> bool,
-{
     let task = resolve_task_for_plan(&args)?;
-    let project_dir = project_dir_fn()?;
+    let project_dir = current_project_dir()?;
     let config = Config::from_cli(project_dir, args.single_agent, false)?;
 
     let baseline_vec = if git::is_git_repo(&config) {
@@ -759,7 +680,6 @@ where
     } else {
         Vec::new()
     };
-    let baseline_set = baseline_vec.iter().cloned().collect::<HashSet<_>>();
 
     state::init(
         task.as_str(),
@@ -767,21 +687,13 @@ where
         &baseline_vec,
         state::WorkflowKind::Plan,
     )?;
-    ensure_tasks_file_exists(&config)?;
+    state::write_workflow(state::WorkflowKind::Plan, &config)?;
 
-    // Route through execute_run_phases with planning_only=true, so
-    // execute_run_phases will run planning + decomposition only (the
-    // implementation and summary closures are never called). We pass
-    // unreachable guards to make this guarantee explicit.
-    let exit_code = execute_run_phases(
-        &config,
-        &baseline_set,
-        true, // planning_only
-        planning_phase_fn,
-        decomposition_phase_fn,
-        |_, _| unreachable!("implementation must not run in plan_command"),
-        |_| unreachable!("summary must not run in plan_command"),
-    );
+    let planned = phases::planning_phase(&config, true);
+    let exit_code = phase_success_to_exit_code(planned);
+    if planned {
+        phases::print_summary(&config);
+    }
 
     persist_last_run_task(task.as_str(), &config)?;
 
@@ -799,16 +711,6 @@ where
     }
 
     Ok(exit_code)
-}
-
-fn resume_command(dispatch: ResumeDispatch) -> Result<i32, AgentLoopError> {
-    resume_command_inner(
-        dispatch,
-        current_project_dir,
-        phases::task_decomposition_phase_resume,
-        phases::implementation_loop_resume,
-        phases::print_summary,
-    )
 }
 
 /// Pre-config helper: validate that the state directory and status.json exist.
@@ -849,225 +751,20 @@ fn read_resume_task_from_state_dir(state_dir: &Path) -> Result<String, AgentLoop
     Ok(task)
 }
 
-/// Pre-config helper: read the persisted workflow marker.
-fn read_workflow_marker_from_state_dir(state_dir: &Path) -> Option<state::WorkflowKind> {
-    let raw = fs::read_to_string(state_dir.join("workflow.txt")).unwrap_or_default();
-    raw.trim().parse().ok()
-}
-
-/// Infer the workflow kind from pre-migration artifacts using strong signals only.
-///
-/// Returns `Some(WorkflowKind::Plan)` when `tasks.md` contains task headings
-/// (`## Task …` or `### Task …`) and no implementation status artifacts exist.
-///
-/// Returns `Some(WorkflowKind::Run)` when the status indicates an implementation
-/// phase (implementing, reviewing, needs_changes) or implementation artifacts
-/// (`changes.md`, `review.md`) have non-trivial content.
-///
-/// Returns `None` when signals are absent or conflicting (no unsafe guess).
-fn infer_workflow_from_artifacts(state_dir: &Path) -> Option<state::WorkflowKind> {
-    let tasks_content = fs::read_to_string(state_dir.join("tasks.md")).unwrap_or_default();
-    let has_task_headings = tasks_content
-        .lines()
-        .any(|line| task_heading(line).is_some());
-
-    // Parse status from status.json for signal classification.
-    let status_str: Option<String> = {
-        let raw = fs::read_to_string(state_dir.join("status.json")).unwrap_or_default();
-        serde_json::from_str::<serde_json::Value>(&raw)
-            .ok()
-            .and_then(|parsed| {
-                parsed
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            })
-    };
-
-    // Check implementation-specific signals from status.json.
-    // Only statuses that exclusively belong to the implementation/review loop
-    // are strong run signals. DISPUTED, APPROVED, CONSENSUS, and
-    // NEEDS_REVISION can also appear in planning/decomposition flows, so
-    // they are not reliable implementation indicators.
-    let has_impl_status = matches!(
-        status_str.as_deref(),
-        Some("IMPLEMENTING" | "REVIEWING" | "NEEDS_CHANGES")
-    );
-
-    // Decomposition-terminal statuses: these indicate that decomposition
-    // completed successfully. They are ambiguous because they can appear in
-    // both plan workflows (where decomposition IS the final output) and run
-    // workflows (where decomposition is phase 1 before implementation).
-    let has_decomposition_terminal_status =
-        matches!(status_str.as_deref(), Some("CONSENSUS" | "APPROVED"));
-
-    // Check for non-trivial implementation artifacts.
-    let changes_content = fs::read_to_string(state_dir.join("changes.md")).unwrap_or_default();
-    let review_content = fs::read_to_string(state_dir.join("review.md")).unwrap_or_default();
-    let has_impl_artifacts =
-        !changes_content.trim().is_empty() || !review_content.trim().is_empty();
-
-    let plan_signal = has_task_headings;
-    let run_signal = has_impl_status || has_impl_artifacts;
-
-    // Conflicting signals → no guess.
-    if plan_signal && run_signal {
-        return None;
-    }
-
-    if run_signal {
-        return Some(state::WorkflowKind::Run);
-    }
-
-    if plan_signal {
-        // Task headings alone are a plan signal, but when combined with a
-        // decomposition-terminal status (CONSENSUS/APPROVED) and no
-        // implementation artifacts, we cannot distinguish between:
-        //   - A plan workflow that completed successfully
-        //   - A run workflow interrupted between decomposition and implementation
-        // Return None (ambiguous) to avoid misclassifying run sessions as plan,
-        // which would cause resume to re-enter decomposition instead of
-        // starting implementation.
-        if has_decomposition_terminal_status {
-            return None;
-        }
-        return Some(state::WorkflowKind::Plan);
-    }
-
-    None
-}
-
-/// Resolve the workflow kind for a resume operation.
-///
-/// Precedence (strict):
-///   1. `dispatch.planning_only_legacy_override` from `run --planning-only --resume`
-///   2. Persisted `workflow.txt` marker in state directory
-///   3. Pre-migration inference from artifacts (tasks.md, status, changes/review)
-///   4. Error: cannot determine workflow
-fn resolve_workflow_for_resume(
-    dispatch: &ResumeDispatch,
-    state_dir: &Path,
-) -> Result<state::WorkflowKind, AgentLoopError> {
-    // 1. Legacy override takes absolute precedence.
-    if let Some(planning_only) = dispatch.planning_only_legacy_override {
-        return Ok(if planning_only {
-            state::WorkflowKind::Plan
-        } else {
-            state::WorkflowKind::Run
-        });
-    }
-
-    // 2. Persisted workflow marker.
-    if let Some(workflow) = read_workflow_marker_from_state_dir(state_dir) {
-        return Ok(workflow);
-    }
-
-    // 3. Pre-migration inference from artifacts.
-    if let Some(workflow) = infer_workflow_from_artifacts(state_dir) {
-        eprintln!(
-            "Warning: workflow.txt is missing. Inferred workflow '{}' from state artifacts. \
-             Consider running with an explicit workflow to persist the marker.",
-            workflow
-        );
-        return Ok(workflow);
-    }
-
-    // 4. Cannot determine workflow.
-    Err(AgentLoopError::State(
-        "Cannot resume: unable to determine whether the session is a 'plan' or 'run' workflow. \
-         No workflow.txt marker found and no inferrable artifacts. Please either:\n  \
-         - Write 'plan' or 'run' to .agent-loop/state/workflow.txt, or\n  \
-         - Start a fresh session with 'agent-loop plan' or 'agent-loop run'."
-            .to_string(),
-    ))
-}
-
-fn resume_command_inner<FProjectDir, FDecompositionResume, FImplementationResume, FSummary>(
-    dispatch: ResumeDispatch,
-    project_dir_fn: FProjectDir,
-    decomposition_resume_fn: FDecompositionResume,
-    implementation_resume_fn: FImplementationResume,
-    print_summary_fn: FSummary,
-) -> Result<i32, AgentLoopError>
-where
-    FProjectDir: FnOnce() -> Result<PathBuf, AgentLoopError>,
-    FDecompositionResume: FnOnce(&Config) -> bool,
-    FImplementationResume: FnOnce(&Config, &HashSet<String>) -> bool,
-    FSummary: FnOnce(&Config),
-{
-    let project_dir = project_dir_fn()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
-
-    // Step 1: Pre-config validation (no Config needed yet).
-    ensure_resume_state_dir_exists(&state_dir)?;
-    let task = read_resume_task_from_state_dir(&state_dir)?;
-
-    // Step 2: Resolve workflow with documented precedence.
-    // When force_implementation is set (tasks retry loop), skip resolution
-    // and always resume in implementation mode.
-    let workflow = if dispatch.force_implementation {
-        state::WorkflowKind::Run
-    } else {
-        resolve_workflow_for_resume(&dispatch, &state_dir)?
-    };
-
-    // Step 3: Build config and determine planning_only from resolved workflow.
-    let planning_only = matches!(workflow, state::WorkflowKind::Plan);
-    let config = Config::from_cli_with_overrides(
-        project_dir,
-        dispatch.args.single_agent,
-        false, // verbose
-        dispatch.max_rounds_override,
-    )?;
-
-    // Step 4: Collect baseline.
-    let baseline_vec = if git::is_git_repo(&config) {
-        git::list_changed_files(&config)?
-    } else {
-        Vec::new()
-    };
-    let baseline_set = baseline_vec.iter().cloned().collect::<HashSet<_>>();
-
-    // Step 5: Ensure tasks file exists and execute resume phases.
-    ensure_tasks_file_exists(&config)?;
-
-    let exit_code = if planning_only {
-        phase_success_to_exit_code(decomposition_resume_fn(&config))
-    } else {
-        let reached_consensus = implementation_resume_fn(&config, &baseline_set);
-        print_summary_fn(&config);
-        phase_success_to_exit_code(reached_consensus)
-    };
-
-    // Step 6: Persist last run task.
-    persist_last_run_task(task.as_str(), &config)?;
-
-    // Step 7: Check for interrupt signal propagation.
-    if exit_code != 0 {
-        let final_status = state::read_status(&config);
-        if final_status.status == state::Status::Interrupted {
-            return Err(AgentLoopError::Interrupted(
-                final_status
-                    .reason
-                    .unwrap_or_else(|| "Interrupted by signal".to_string()),
-            ));
-        }
-    }
-
-    Ok(exit_code)
-}
-
 fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<TaskStatusEntry> {
     let persisted = state::read_task_status_with_warnings(config);
     let persisted_entries = persisted.status_file.tasks;
 
-    // Positional reconciliation: match by index, not by title.
-    // Always use the current parsed title so edits between runs are reflected.
+    // Reconcile by index first, but only reuse persisted values when the title
+    // still matches. This avoids carrying stale batch aggregate entries into
+    // per-task mode while still preserving task state across normal reruns.
     parsed_tasks
         .iter()
         .enumerate()
         .map(|(i, task)| {
-            if let Some(entry) = persisted_entries.get(i) {
+            if let Some(entry) = persisted_entries.get(i)
+                && entry.title == task.title
+            {
                 TaskStatusEntry {
                     title: task.title.clone(),
                     ..entry.clone()
@@ -1088,12 +785,16 @@ fn reconcile_task_metrics(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<T
     let persisted = state::read_task_metrics(config);
     let persisted_entries = persisted.tasks;
 
-    // Always use the current parsed title so edits between runs are reflected.
+    // Reconcile by index first, but only reuse persisted values when the title
+    // still matches. This avoids carrying stale batch aggregate entries into
+    // per-task mode while still preserving task metrics across normal reruns.
     parsed_tasks
         .iter()
         .enumerate()
         .map(|(i, task)| {
-            if let Some(entry) = persisted_entries.get(i) {
+            if let Some(entry) = persisted_entries.get(i)
+                && entry.title == task.title
+            {
                 TaskMetricsEntry {
                     title: task.title.clone(),
                     ..entry.clone()
@@ -1219,16 +920,285 @@ fn print_task_duration_summary(metrics: &[TaskMetricsEntry]) {
     }
 }
 
+fn batch_metrics_title(task_count: usize) -> String {
+    format!("Batch implementation ({task_count} tasks)")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_batch_task_state(
+    title: &str,
+    task_status: TaskRunStatus,
+    last_error: Option<String>,
+    started_at: String,
+    ended_at: String,
+    duration_ms: u64,
+    usage: agent::UsageSnapshot,
+    config: &Config,
+) -> Result<(), AgentLoopError> {
+    state::write_task_status(
+        &TaskStatusFile {
+            tasks: vec![TaskStatusEntry {
+                title: title.to_string(),
+                status: task_status,
+                retries: 0,
+                last_error,
+            }],
+        },
+        config,
+    )?;
+
+    let mut metrics_entry = TaskMetricsEntry {
+        title: title.to_string(),
+        task_started_at: Some(started_at),
+        task_ended_at: Some(ended_at),
+        duration_ms: Some(duration_ms),
+        agent_calls: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_usd_micros: None,
+    };
+    apply_task_usage(&mut metrics_entry, usage);
+
+    state::write_task_metrics(
+        &TaskMetricsFile {
+            tasks: vec![metrics_entry.clone()],
+        },
+        config,
+    )?;
+    print_task_duration_summary(&[metrics_entry]);
+    Ok(())
+}
+
+fn implementation_resume_with_max_rounds(
+    single_agent: bool,
+    max_rounds_override: Option<u32>,
+) -> Result<i32, AgentLoopError> {
+    let project_dir = current_project_dir()?;
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    ensure_resume_state_dir_exists(&state_dir)?;
+    let task = read_resume_task_from_state_dir(&state_dir)?;
+
+    let config =
+        Config::from_cli_with_overrides(project_dir, single_agent, false, max_rounds_override)?;
+    let workflow = state::read_workflow(&config);
+    if workflow != Some(state::WorkflowKind::Implement) {
+        return Err(AgentLoopError::State(
+            "Cannot resume implementation: workflow is not 'implement'.".to_string(),
+        ));
+    }
+
+    let baseline_vec = if git::is_git_repo(&config) {
+        git::list_changed_files(&config)?
+    } else {
+        Vec::new()
+    };
+    let baseline_set = baseline_vec.iter().cloned().collect::<HashSet<_>>();
+
+    let reached_consensus = phases::implementation_loop_resume(&config, &baseline_set);
+    phases::print_summary(&config);
+    let exit_code = phase_success_to_exit_code(reached_consensus);
+    persist_last_run_task(task.as_str(), &config)?;
+
+    if exit_code != 0 {
+        let final_status = state::read_status(&config);
+        if final_status.status == state::Status::Interrupted {
+            return Err(AgentLoopError::Interrupted(
+                final_status
+                    .reason
+                    .unwrap_or_else(|| "Interrupted by signal".to_string()),
+            ));
+        }
+    }
+
+    Ok(exit_code)
+}
+
+fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
+    args.validate()?;
+
+    if args.resume {
+        return implementation_resume_with_max_rounds(args.single_agent, None);
+    }
+
+    if args.task.is_some() || args.file.is_some() {
+        let task = resolve_task_for_implement(&args)?;
+        return run_command_with_max_rounds(
+            RunArgs {
+                task: Some(task),
+                file: None,
+                resume: false,
+                planning_only: false,
+                single_agent: args.single_agent,
+            },
+            None,
+        );
+    }
+
+    implement_all_tasks_command(args)
+}
+
 fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
     args.validate()?;
 
     let project_dir = current_project_dir()?;
-    let tasks_file = args.effective_file(&project_dir);
-    let raw_tasks = fs::read_to_string(&tasks_file).map_err(|err| {
-        AgentLoopError::Config(format!("Failed to read '{}': {err}", tasks_file.display()))
-    })?;
-    let parsed_tasks = parse_tasks_file(&raw_tasks, &tasks_file)?;
     let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+
+    if args.resume {
+        let state_dir = project_dir.join(".agent-loop").join("state");
+        ensure_resume_state_dir_exists(&state_dir)?;
+        let workflow = state::read_workflow(&config);
+        if workflow != Some(state::WorkflowKind::Decompose) {
+            return Err(AgentLoopError::State(
+                "Cannot resume tasks decomposition: workflow is not 'decompose'.".to_string(),
+            ));
+        }
+
+        let exit_code = phase_success_to_exit_code(phases::task_decomposition_phase_resume(&config));
+        if exit_code != 0 {
+            let final_status = state::read_status(&config);
+            if final_status.status == state::Status::Interrupted {
+                return Err(AgentLoopError::Interrupted(
+                    final_status
+                        .reason
+                        .unwrap_or_else(|| "Interrupted by signal".to_string()),
+                ));
+            }
+        }
+        return Ok(exit_code);
+    }
+
+    let plan_content = if let Some(path) = args.file.as_ref() {
+        fs::read_to_string(path).map_err(|err| {
+            AgentLoopError::Config(format!("Failed to read plan file '{}': {err}", path.display()))
+        })?
+    } else {
+        fs::read_to_string(config.state_dir.join("plan.md")).unwrap_or_default()
+    };
+
+    if plan_content.trim().is_empty() {
+        return Err(AgentLoopError::State(
+            "No plan found. Run 'agent-loop plan' first.".to_string(),
+        ));
+    }
+
+    let existing_task = state::read_state_file("task.md", &config);
+    let task = if existing_task.trim().is_empty() {
+        plan_content.clone()
+    } else {
+        existing_task
+    };
+
+    let baseline_vec = if git::is_git_repo(&config) {
+        git::list_changed_files(&config)?
+    } else {
+        Vec::new()
+    };
+    state::init(
+        task.as_str(),
+        &config,
+        &baseline_vec,
+        state::WorkflowKind::Decompose,
+    )?;
+    state::write_state_file("plan.md", &plan_content, &config)?;
+    state::write_workflow(state::WorkflowKind::Decompose, &config)?;
+
+    let succeeded = phases::task_decomposition_phase(&config);
+    let exit_code = phase_success_to_exit_code(succeeded);
+    if succeeded {
+        let tasks_content = state::read_state_file("tasks.md", &config);
+        let task_count = parse_tasks_markdown(&tasks_content)
+            .map(|tasks| tasks.len())
+            .unwrap_or(0);
+        println!(
+            "Created {} tasks in {}",
+            task_count,
+            config.state_dir.join("tasks.md").display()
+        );
+    }
+
+    if exit_code != 0 {
+        let final_status = state::read_status(&config);
+        if final_status.status == state::Status::Interrupted {
+            return Err(AgentLoopError::Interrupted(
+                final_status
+                    .reason
+                    .unwrap_or_else(|| "Interrupted by signal".to_string()),
+            ));
+        }
+    }
+
+    Ok(exit_code)
+}
+
+fn per_task_only_flags_present(args: &ImplementArgs) -> bool {
+    args.continue_on_fail
+        || args.fail_fast
+        || args.max_parallel.is_some()
+        || args.max_retries != 2
+        || args.round_step != 2
+}
+
+fn implement_all_tasks_batch(
+    args: &ImplementArgs,
+    parsed_tasks: &[ParsedTask],
+    config: &Config,
+    project_dir: &Path,
+    raw_tasks: &str,
+) -> Result<i32, AgentLoopError> {
+    println!("Running batch implementation for all tasks in a single loop.");
+    let title = batch_metrics_title(parsed_tasks.len());
+    let started_at = state::timestamp();
+    let timer = Instant::now();
+    let usage_before = agent::usage_snapshot();
+    let combined_task = build_batch_implementation_task(raw_tasks);
+    let run_result = run_command_with_max_rounds(
+        RunArgs {
+            task: Some(combined_task),
+            file: None,
+            resume: false,
+            planning_only: false,
+            single_agent: args.single_agent,
+        },
+        None,
+    );
+    let usage_after = agent::usage_snapshot();
+    let usage = usage_after.saturating_sub(usage_before);
+    let ended_at = state::timestamp();
+    let duration_ms = timer.elapsed().as_millis() as u64;
+
+    let (status, last_error) = match &run_result {
+        Ok(0) => (TaskRunStatus::Done, None),
+        Ok(_) => (
+            TaskRunStatus::Failed,
+            Some(format_status_reason(
+                read_current_status(project_dir, args.single_agent).as_ref(),
+            )),
+        ),
+        Err(err) => (TaskRunStatus::Failed, Some(err.to_string())),
+    };
+
+    persist_batch_task_state(
+        &title,
+        status,
+        last_error,
+        started_at,
+        ended_at,
+        duration_ms,
+        usage,
+        config,
+    )?;
+
+    run_result
+}
+
+fn implement_all_tasks_per_task(
+    args: &ImplementArgs,
+    parsed_tasks: &[ParsedTask],
+    config: &Config,
+    project_dir: &Path,
+) -> Result<i32, AgentLoopError> {
+    println!("Running per-task implementation mode.");
     let base_max_rounds = config.max_rounds;
 
     // Resolve effective max_parallel: CLI > config > default(1).
@@ -1240,14 +1210,8 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
     }
 
     // Reconcile persisted task status and metrics with current task list.
-    let mut task_statuses = reconcile_task_status(&parsed_tasks, &config);
-    let mut task_metrics = reconcile_task_metrics(&parsed_tasks, &config);
-
-    println!(
-        "Found {} tasks in {}",
-        parsed_tasks.len(),
-        tasks_file.display()
-    );
+    let mut task_statuses = reconcile_task_status(parsed_tasks, config);
+    let mut task_metrics = reconcile_task_metrics(parsed_tasks, config);
 
     let mut had_failures = false;
 
@@ -1269,7 +1233,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
         if args.continue_on_fail && entry_status == TaskRunStatus::Failed {
             println!("{} — previously failed, skipping", task.title);
             task_statuses[index].status = TaskRunStatus::Skipped;
-            persist_task_state(&task_statuses, &task_metrics, &config)?;
+            persist_task_state(&task_statuses, &task_metrics, config)?;
             had_failures = true;
             continue;
         }
@@ -1282,11 +1246,11 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
             if args.continue_on_fail {
                 println!("{} — retries exhausted, skipping", task.title);
                 task_statuses[index].status = TaskRunStatus::Skipped;
-                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                persist_task_state(&task_statuses, &task_metrics, config)?;
                 had_failures = true;
                 continue;
             } else {
-                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                persist_task_state(&task_statuses, &task_metrics, config)?;
                 return Err(AgentLoopError::Agent(format!(
                     "Task '{}' failed with retries exhausted ({persisted_retries}/{}).",
                     task.title, args.max_retries
@@ -1297,7 +1261,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
         if entry_status == TaskRunStatus::Running && persisted_retries > args.max_retries {
             // Running task beyond retry boundary — mark failed immediately.
             task_statuses[index].status = TaskRunStatus::Failed;
-            persist_task_state(&task_statuses, &task_metrics, &config)?;
+            persist_task_state(&task_statuses, &task_metrics, config)?;
             if args.continue_on_fail {
                 had_failures = true;
                 continue;
@@ -1323,7 +1287,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
             total_tokens: None,
             cost_usd_micros: None,
         };
-        persist_task_state(&task_statuses, &task_metrics, &config)?;
+        persist_task_state(&task_statuses, &task_metrics, config)?;
 
         let timer = Instant::now();
 
@@ -1379,7 +1343,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
                 break;
             }
 
-            let status = read_current_status(&project_dir, args.single_agent);
+            let status = read_current_status(project_dir, args.single_agent);
             if !is_retryable_run_tasks_status(status.as_ref()) {
                 // Non-retryable failure.
                 break;
@@ -1406,7 +1370,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
 
             // Persist updated retry count.
             task_statuses[index].retries = retry;
-            persist_task_state(&task_statuses, &task_metrics, &config)?;
+            persist_task_state(&task_statuses, &task_metrics, config)?;
         }
 
         let elapsed = timer.elapsed();
@@ -1422,13 +1386,13 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
         } else {
             task_statuses[index].status = TaskRunStatus::Failed;
             task_statuses[index].retries = retry;
-            let status = read_current_status(&project_dir, args.single_agent);
+            let status = read_current_status(project_dir, args.single_agent);
             task_statuses[index].last_error = Some(format_status_reason(status.as_ref()));
             had_failures = true;
 
             if !args.continue_on_fail {
                 // Fail-fast: persist and exit.
-                persist_task_state(&task_statuses, &task_metrics, &config)?;
+                persist_task_state(&task_statuses, &task_metrics, config)?;
                 print_task_duration_summary(&task_metrics);
                 return Err(AgentLoopError::Agent(format!(
                     "Task '{}' failed with status {}.",
@@ -1438,7 +1402,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
             }
         }
 
-        persist_task_state(&task_statuses, &task_metrics, &config)?;
+        persist_task_state(&task_statuses, &task_metrics, config)?;
     }
 
     print_task_duration_summary(&task_metrics);
@@ -1450,6 +1414,41 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
         println!("All tasks completed.");
         Ok(0)
     }
+}
+
+fn implement_all_tasks_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
+    let project_dir = current_project_dir()?;
+    let tasks_file = project_dir.join(".agent-loop").join("state").join("tasks.md");
+    if !tasks_file.is_file() {
+        return Err(AgentLoopError::State(
+            "No tasks found. Run 'agent-loop tasks' first.".to_string(),
+        ));
+    }
+    let raw_tasks = fs::read_to_string(&tasks_file).map_err(|err| {
+        AgentLoopError::Config(format!("Failed to read '{}': {err}", tasks_file.display()))
+    })?;
+    let parsed_tasks = parse_tasks_file(&raw_tasks, &tasks_file)?;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+
+    println!(
+        "Found {} tasks in {}",
+        parsed_tasks.len(),
+        tasks_file.display()
+    );
+
+    let use_per_task_mode = args.per_task || !config.batch_implement;
+    if per_task_only_flags_present(&args) && !use_per_task_mode {
+        return Err(AgentLoopError::Config(
+            "Per-task lifecycle flags require per-task mode. Use '--per-task' or set 'batch_implement = false'."
+                .to_string(),
+        ));
+    }
+
+    if use_per_task_mode {
+        return implement_all_tasks_per_task(&args, &parsed_tasks, &config, &project_dir);
+    }
+
+    implement_all_tasks_batch(&args, &parsed_tasks, &config, &project_dir, &raw_tasks)
 }
 
 fn persist_task_state(
@@ -1472,38 +1471,14 @@ fn persist_task_state(
     Ok(())
 }
 
-fn init_command() -> Result<i32, AgentLoopError> {
+fn reset_command() -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, false, false)?;
-
-    for file in [
-        "task.md",
-        "plan.md",
-        "tasks.md",
-        "changes.md",
-        "review.md",
-        "log.txt",
-        "status.json",
-        "task_status.json",
-        "task_metrics.json",
-    ] {
-        state::write_state_file(file, "", &config)?;
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    if state_dir.exists() {
+        fs::remove_dir_all(&state_dir)?;
     }
-
-    state::write_status(
-        StatusPatch {
-            status: Some(Status::Pending),
-            round: Some(0),
-            implementer: Some(config.implementer.to_string()),
-            reviewer: Some(config.reviewer.to_string()),
-            mode: Some(config.run_mode.to_string()),
-            last_run_task: Some(String::new()),
-            ..StatusPatch::default()
-        },
-        &config,
-    )?;
-
-    println!("initialized {}", config.state_dir.display());
+    fs::create_dir_all(&state_dir)?;
+    println!("State cleared. decisions.md preserved.");
     Ok(0)
 }
 
@@ -1563,7 +1538,7 @@ fn status_command() -> Result<i32, AgentLoopError> {
             println!("  - {w}");
         }
         println!();
-        println!("Hint: status.json may be corrupted. Run `agent-loop init` to reset state.");
+        println!("Hint: status.json may be corrupted. Run `agent-loop reset` to reset state.");
     }
 
     // Print resume/init hints for terminal or stale statuses.
@@ -1574,7 +1549,9 @@ fn status_command() -> Result<i32, AgentLoopError> {
         if warnings.is_empty() {
             println!();
         }
-        println!("Hint: run `agent-loop resume` to continue, or `agent-loop init` to start fresh.");
+        println!(
+            "Hint: run `agent-loop implement --resume` or `agent-loop tasks --resume` to continue, or `agent-loop reset` to start fresh."
+        );
     }
 
     Ok(0)
@@ -1588,2231 +1565,70 @@ fn version_command() -> Result<i32, AgentLoopError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{TestConfigOptions, make_test_config, unique_temp_path};
-    use std::{
-        fs,
-        path::{Path, PathBuf},
-    };
 
     fn os_argv(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
     }
 
-    /// Clear env vars that affect `Config::from_cli_with_overrides`. Must be called
-    /// after acquiring `env_lock()` in tests that build real configs from the env.
-    fn clear_config_env() {
-        for key in [
-            "SINGLE_AGENT",
-            "IMPLEMENTER",
-            "REVIEWER",
-            "AUTO_COMMIT",
-            "AUTO_TEST",
-            "AUTO_TEST_CMD",
-            "MAX_ROUNDS",
-            "PLANNING_MAX_ROUNDS",
-            "DECOMPOSITION_MAX_ROUNDS",
-            "TIMEOUT",
-            "DIFF_MAX_LINES",
-            "CONTEXT_LINE_CAP",
-            "PLANNING_CONTEXT_EXCERPT_LINES",
-            "VERBOSE",
-        ] {
-            // SAFETY: tests serialize env mutation with env_lock().
-            unsafe {
-                std::env::remove_var(key);
-            }
-        }
-    }
-
-    fn test_config() -> Config {
-        let project_dir = PathBuf::from("/tmp/agent-loop-main-tests");
-        make_test_config(&project_dir, TestConfigOptions::default())
-    }
-
-    fn run_args(task: Option<&str>, file: Option<PathBuf>) -> RunArgs {
-        RunArgs {
-            task: task.map(ToOwned::to_owned),
-            file,
-            resume: false,
-            planning_only: false,
-            single_agent: false,
-        }
-    }
-
-    fn tasks_args(file: Option<PathBuf>, tasks_file: Option<PathBuf>) -> TasksArgs {
-        TasksArgs {
-            file,
-            tasks_file,
-            max_retries: 2,
-            round_step: 2,
-            single_agent: false,
-            continue_on_fail: false,
-            fail_fast: false,
-            max_parallel: None,
-        }
-    }
-
-    fn loop_status(status: Status, reason: Option<&str>) -> LoopStatus {
-        LoopStatus {
-            status,
-            round: 1,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "Task 1".to_string(),
-            reason: reason.map(ToOwned::to_owned),
-            rating: None,
-            timestamp: "2026-02-15T15:09:44.850Z".to_string(),
-        }
-    }
-
-    fn unique_temp_file(prefix: &str) -> PathBuf {
-        unique_temp_path(prefix)
-    }
-
-    fn write_temp_file(path: &Path, content: &str) {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("temp parent directory should be created");
-        }
-        fs::write(path, content).expect("temp file should be written");
+    #[test]
+    fn normalize_argv_does_not_inject_legacy_run() {
+        let normalized = normalize_argv(os_argv(&["agent-loop", "plain", "text"]));
+        assert_eq!(normalized, os_argv(&["agent-loop", "plain", "text"]));
     }
 
     #[test]
-    fn normalize_argv_injects_run_for_bare_task() {
-        let normalized = normalize_argv(os_argv(&["agent-loop", "sample task"]));
-        assert_eq!(normalized, os_argv(&["agent-loop", "run", "sample task"]));
-    }
-
-    #[test]
-    fn normalize_argv_leaves_explicit_subcommands_unchanged() {
-        for command in KNOWN_SUBCOMMANDS {
-            let normalized = normalize_argv(os_argv(&["agent-loop", command]));
-            assert_eq!(normalized, os_argv(&["agent-loop", command]));
-        }
-    }
-
-    #[test]
-    fn normalize_argv_does_not_rewrite_flags() {
-        let normalized = normalize_argv(os_argv(&["agent-loop", "--single-agent", "task"]));
-        assert_eq!(
-            normalized,
-            os_argv(&["agent-loop", "--single-agent", "task"])
-        );
-    }
-
-    #[test]
-    fn normalize_argv_leaves_version_subcommand_unchanged() {
-        let normalized = normalize_argv(os_argv(&["agent-loop", "version"]));
-        assert_eq!(normalized, os_argv(&["agent-loop", "version"]));
-    }
-
-    #[test]
-    fn parse_cli_from_version_subcommand_dispatches_version() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "version"]))
-            .expect("version subcommand should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("version subcommand should produce parsed CLI");
-        };
-        assert_eq!(
-            dispatch_from_cli(cli).expect("version dispatch should succeed"),
-            Dispatch::Version
-        );
-    }
-
-    #[test]
-    fn parse_cli_from_version_flag_exits_successfully() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "--version"]))
-            .expect("version flag should parse");
-        assert!(matches!(parsed, ParseOutcome::Exit(0)));
-    }
-
-    #[test]
-    fn resolve_task_for_run_prefers_file_over_positional_text() {
-        let task_file = unique_temp_file("agent_loop_task_precedence");
-        write_temp_file(&task_file, "task from file");
-
-        let args = run_args(Some("task from positional"), Some(task_file.clone()));
-        let resolved = resolve_task_for_run(&args).expect("task should resolve from file");
-        assert_eq!(resolved, "task from file");
-
-        let _ = fs::remove_file(task_file);
-    }
-
-    #[test]
-    fn resolve_task_for_run_uses_positional_task_when_file_is_missing() {
-        let args = run_args(Some("task from positional"), None);
-        let resolved = resolve_task_for_run(&args).expect("positional task should be used");
-        assert_eq!(resolved, "task from positional");
-    }
-
-    #[test]
-    fn resolve_task_for_run_rejects_missing_or_empty_tasks() {
-        let missing_task_error =
-            resolve_task_for_run(&run_args(None, None)).expect_err("missing task should fail");
-        assert!(missing_task_error.to_string().contains("Task is required"));
-
-        let empty_positional_error =
-            resolve_task_for_run(&run_args(Some("   "), None)).expect_err("empty task should fail");
-        assert!(
-            empty_positional_error
-                .to_string()
-                .contains("cannot be empty")
-        );
-
-        let task_file = unique_temp_file("agent_loop_task_empty_file");
-        write_temp_file(&task_file, "  \n\t");
-
-        let empty_file_error = resolve_task_for_run(&run_args(None, Some(task_file.clone())))
-            .expect_err("empty file task should fail");
-        assert!(empty_file_error.to_string().contains("is empty"));
-
-        let _ = fs::remove_file(task_file);
-    }
-
-    #[test]
-    fn task_heading_detects_supported_markdown_levels() {
-        assert_eq!(
-            task_heading("### Task 1: Build parser"),
-            Some("Task 1: Build parser".to_string())
-        );
-        assert_eq!(
-            task_heading("## Task 2: Add retries"),
-            Some("Task 2: Add retries".to_string())
-        );
-        assert_eq!(task_heading("#### Task 3: Ignore"), None);
-        assert_eq!(task_heading("### Phase 1"), None);
-    }
-
-    #[test]
-    fn parse_tasks_markdown_extracts_full_sections() {
-        let markdown = r#"
-# Tasks
-
-### Task 1: First
-Line A
-
-Line B
-
-### Task 2: Second
-Line C
-"#;
-
-        let tasks = parse_tasks_markdown(markdown).expect("tasks should parse");
-        assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].title, "Task 1: First");
-        assert!(tasks[0].content.contains("Line A"));
-        assert!(tasks[0].content.contains("Line B"));
-        assert_eq!(tasks[1].title, "Task 2: Second");
-        assert!(tasks[1].content.contains("Line C"));
-    }
-
-    #[test]
-    fn parse_tasks_markdown_rejects_missing_task_headings() {
-        let err = parse_tasks_markdown("# No tasks here")
-            .expect_err("missing task headings should return error");
-        assert!(err.to_string().contains("No tasks found"));
-    }
-
-    #[test]
-    fn parse_tasks_file_rejects_empty_input_with_actionable_message() {
-        let tasks_file = Path::new("/tmp/.agent-loop/state/tasks.md");
-        let err = parse_tasks_file("   \n\t", tasks_file)
-            .expect_err("empty tasks file should return error");
-        let msg = err.to_string();
-        assert!(msg.contains("is empty"), "error should mention empty file");
-        assert!(
-            msg.contains(tasks_file.to_string_lossy().as_ref()),
-            "error should include tasks file path"
-        );
-        assert!(
-            msg.contains("agent-loop plan --file <PLAN.md>"),
-            "error should suggest a recovery command"
-        );
-    }
-
-    #[test]
-    fn parse_tasks_file_accepts_valid_task_markdown() {
-        let tasks_file = Path::new("/tmp/.agent-loop/state/tasks.md");
-        let parsed = parse_tasks_file("### Task 1: Build parser\ncontent\n", tasks_file)
-            .expect("valid tasks markdown should parse");
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].title, "Task 1: Build parser");
-    }
-
-    #[test]
-    fn validate_rejects_zero_round_step() {
-        let mut args = tasks_args(None, None);
-        args.round_step = 0;
-
-        let err = args.validate().expect_err("round_step=0 should fail");
-        assert!(err.to_string().contains("--round-step"));
-    }
-
-    #[test]
-    fn validate_rejects_file_and_tasks_file_together() {
-        let args = tasks_args(Some(PathBuf::from("new.md")), Some(PathBuf::from("old.md")));
-
-        let err = args.validate().expect_err("file+tasks_file should fail");
-        assert!(err.to_string().contains("cannot be used together"));
-    }
-
-    #[test]
-    fn validate_rejects_continue_on_fail_with_fail_fast() {
-        let mut args = tasks_args(None, None);
-        args.continue_on_fail = true;
-        args.fail_fast = true;
-
-        let err = args
-            .validate()
-            .expect_err("continue_on_fail+fail_fast should fail");
-        assert!(err.to_string().contains("cannot be used together"));
-    }
-
-    #[test]
-    fn validate_rejects_zero_max_parallel() {
-        let mut args = tasks_args(None, None);
-        args.max_parallel = Some(0);
-
-        let err = args.validate().expect_err("max_parallel=0 should fail");
-        assert!(err.to_string().contains("--max-parallel"));
-    }
-
-    #[test]
-    fn validate_accepts_valid_args() {
-        let args = tasks_args(Some(PathBuf::from("tasks.md")), None);
-        args.validate().expect("valid args should pass validation");
-
-        let args2 = tasks_args(None, Some(PathBuf::from("old.md")));
-        args2
-            .validate()
-            .expect("deprecated tasks_file alone should pass validation");
-
-        let args3 = tasks_args(None, None);
-        args3
-            .validate()
-            .expect("no file args should pass validation");
-    }
-
-    #[test]
-    fn effective_file_prefers_file() {
-        let project_dir = PathBuf::from("/tmp/agent-loop");
-        let args = tasks_args(
-            Some(PathBuf::from("/tmp/new.md")),
-            Some(PathBuf::from("/tmp/old.md")),
-        );
-        let path = args.effective_file(&project_dir);
-        assert_eq!(path, PathBuf::from("/tmp/new.md"));
-    }
-
-    #[test]
-    fn effective_file_uses_tasks_file_with_deprecation_path_selection() {
-        let project_dir = PathBuf::from("/tmp/agent-loop");
-        let args = tasks_args(None, Some(PathBuf::from("/tmp/old.md")));
-        let path = args.effective_file(&project_dir);
-        assert_eq!(path, PathBuf::from("/tmp/old.md"));
-    }
-
-    #[test]
-    fn effective_file_defaults_to_state_tasks_md() {
-        let project_dir = PathBuf::from("/tmp/agent-loop");
-        let args = tasks_args(None, None);
-        let path = args.effective_file(&project_dir);
-        assert_eq!(
-            path,
-            project_dir
-                .join(".agent-loop")
-                .join("state")
-                .join("tasks.md")
-        );
-    }
-
-    #[test]
-    fn is_timeout_reason_matches_timeout_phrases() {
-        assert!(is_timeout_reason(Some(
-            "claude timed out after 600s of inactivity"
-        )));
-        assert!(is_timeout_reason(Some("Idle timeout: no output for 600s")));
-        assert!(!is_timeout_reason(Some("process exited with code 1")));
-        assert!(!is_timeout_reason(None));
-    }
-
-    #[test]
-    fn retryable_run_tasks_status_covers_max_rounds_and_timeout_error() {
-        let max_rounds = loop_status(Status::MaxRounds, None);
-        let timeout_error = loop_status(Status::Error, Some("codex timed out after 300s"));
-        let non_timeout_error = loop_status(Status::Error, Some("spawn failed"));
-        let needs_changes = loop_status(Status::NeedsChanges, None);
-
-        assert!(is_retryable_run_tasks_status(Some(&max_rounds)));
-        assert!(is_retryable_run_tasks_status(Some(&timeout_error)));
-        assert!(!is_retryable_run_tasks_status(Some(&non_timeout_error)));
-        assert!(!is_retryable_run_tasks_status(Some(&needs_changes)));
-        assert!(!is_retryable_run_tasks_status(None));
-    }
-
-    #[test]
-    fn format_status_reason_includes_reason_when_present() {
-        let timeout_error = loop_status(Status::Error, Some("claude timed out after 600s"));
-        assert_eq!(
-            format_status_reason(Some(&timeout_error)),
-            "ERROR (claude timed out after 600s)"
-        );
-
-        let max_rounds = loop_status(Status::MaxRounds, None);
-        assert_eq!(format_status_reason(Some(&max_rounds)), "MAX_ROUNDS");
-        assert_eq!(format_status_reason(None), "UNKNOWN");
-    }
-
-    #[test]
-    fn apply_task_usage_sets_optional_fields() {
-        let mut entry = TaskMetricsEntry {
-            title: "Task 1".to_string(),
-            task_started_at: None,
-            task_ended_at: None,
-            duration_ms: None,
-            agent_calls: None,
-            input_tokens: None,
-            output_tokens: None,
-            total_tokens: None,
-            cost_usd_micros: None,
-        };
-        apply_task_usage(
-            &mut entry,
-            agent::UsageSnapshot {
-                agent_calls: 3,
-                input_tokens: 1_200,
-                output_tokens: 450,
-                total_tokens: 1_650,
-                cost_usd_micros: 12_345,
-            },
-        );
-
-        assert_eq!(entry.agent_calls, Some(3));
-        assert_eq!(entry.input_tokens, Some(1_200));
-        assert_eq!(entry.output_tokens, Some(450));
-        assert_eq!(entry.total_tokens, Some(1_650));
-        assert_eq!(entry.cost_usd_micros, Some(12_345));
-    }
-
-    #[test]
-    fn task_usage_snapshot_reads_missing_fields_as_zero() {
-        let entry = TaskMetricsEntry {
-            title: "Task 1".to_string(),
-            task_started_at: None,
-            task_ended_at: None,
-            duration_ms: None,
-            agent_calls: None,
-            input_tokens: Some(10),
-            output_tokens: None,
-            total_tokens: None,
-            cost_usd_micros: None,
-        };
-
-        let usage = task_usage_snapshot(&entry);
-        assert_eq!(usage.agent_calls, 0);
-        assert_eq!(usage.input_tokens, 10);
-        assert_eq!(usage.output_tokens, 0);
-        assert_eq!(usage.total_tokens, 0);
-        assert_eq!(usage.cost_usd_micros, 0);
-    }
-
-    #[test]
-    fn no_args_dispatch_uses_help_path_and_returns_zero() {
-        let cli = Cli::try_parse_from(["agent-loop"]).expect("no-args parse should succeed");
-        let dispatch = dispatch_from_cli(cli).expect("no-args dispatch should succeed");
-        assert_eq!(dispatch, Dispatch::ShowHelp);
-
-        let mut help_called = false;
-        let exit_code = execute_dispatch(
-            dispatch,
-            |_| panic!("run handler should not be called"),
-            |_| panic!("plan handler should not be called"),
-            |_| panic!("resume handler should not be called"),
-            |_| panic!("tasks handler should not be called"),
-            || panic!("init handler should not be called"),
-            || panic!("status handler should not be called"),
-            || panic!("version handler should not be called"),
-            || {
-                help_called = true;
-                Ok(())
-            },
-        )
-        .expect("help dispatch should succeed");
-
-        assert!(help_called);
-        assert_eq!(exit_code, 0);
-    }
-
-    #[test]
-    fn execute_run_phases_maps_planning_only_result_to_exit_code() {
-        let config = test_config();
-        let baseline = HashSet::new();
-
-        let mut planning_called = false;
-        let mut decomposition_called = false;
-        let mut implementation_called = false;
-        let mut summary_called = false;
-
-        let success_exit = execute_run_phases(
-            &config,
-            &baseline,
-            true, // planning_only
-            |_, po| {
-                planning_called = true;
-                assert!(po, "planning_only should be true");
-                true
-            },
-            |_| {
-                decomposition_called = true;
-                true
-            },
-            |_, _| {
-                implementation_called = true;
-                true
-            },
-            |_| summary_called = true,
-        );
-
-        assert_eq!(success_exit, 0);
-        assert!(planning_called);
-        assert!(decomposition_called);
-        assert!(!implementation_called);
-        assert!(!summary_called);
-
-        let failure_exit = execute_run_phases(
-            &config,
-            &baseline,
-            true,
-            |_, _| true,
-            |_| false,
-            |_, _| true,
-            |_| {},
-        );
-        assert_eq!(failure_exit, 1);
-    }
-
-    #[test]
-    fn execute_run_phases_maps_implementation_result_to_exit_code() {
-        let config = test_config();
-        let baseline = HashSet::new();
-
-        let mut summary_called = false;
-        let success_exit = execute_run_phases(
-            &config,
-            &baseline,
-            false, // planning_only
-            |_, _| true,
-            |_| true,
-            |_, _| true,
-            |_| summary_called = true,
-        );
-        assert_eq!(success_exit, 0);
-        assert!(summary_called);
-
-        let mut summary_called_for_failure = false;
-        let failure_exit = execute_run_phases(
-            &config,
-            &baseline,
-            false,
-            |_, _| true,
-            |_| true,
-            |_, _| false,
-            |_| summary_called_for_failure = true,
-        );
-        assert_eq!(failure_exit, 1);
-        assert!(summary_called_for_failure);
-    }
-
-    #[test]
-    fn execute_run_phases_short_circuits_when_planning_fails() {
-        let config = test_config();
-        let baseline = HashSet::new();
-
-        let planning_only_exit = execute_run_phases(
-            &config,
-            &baseline,
-            true, // planning_only
-            |_, _| false,
-            |_| panic!("decomposition should not run when planning fails"),
-            |_, _| panic!("implementation should not run when planning fails"),
-            |_| panic!("summary should not run when planning fails"),
-        );
-        assert_eq!(planning_only_exit, 1);
-
-        let implementation_exit = execute_run_phases(
-            &config,
-            &baseline,
-            false, // planning_only
-            |_, _| false,
-            |_| panic!("decomposition should not run in implementation mode"),
-            |_, _| panic!("implementation should not run when planning fails"),
-            |_| panic!("summary should not run when planning fails"),
-        );
-        assert_eq!(implementation_exit, 1);
-    }
-
-    // --- New subcommand parsing tests ---
-
-    #[test]
-    fn parse_plan_subcommand_with_task() {
-        let cli = Cli::try_parse_from(["agent-loop", "plan", "my task"])
-            .expect("plan with task should parse");
-        let Some(Commands::Plan(args)) = cli.command else {
-            panic!("expected Commands::Plan variant");
-        };
-        assert_eq!(args.task.as_deref(), Some("my task"));
-        assert!(args.file.is_none());
-        assert!(!args.single_agent);
-    }
-
-    #[test]
-    fn parse_plan_subcommand_with_file() {
-        let cli = Cli::try_parse_from(["agent-loop", "plan", "--file", "plan.md"])
-            .expect("plan with file should parse");
-        let Some(Commands::Plan(args)) = cli.command else {
-            panic!("expected Commands::Plan variant");
-        };
-        assert_eq!(args.file.as_deref(), Some(Path::new("plan.md")));
-        assert!(args.task.is_none());
-    }
-
-    #[test]
-    fn parse_resume_subcommand() {
-        let cli = Cli::try_parse_from(["agent-loop", "resume"]).expect("resume should parse");
-        let Some(Commands::Resume(args)) = cli.command else {
-            panic!("expected Commands::Resume variant");
-        };
-        assert!(!args.single_agent);
-    }
-
-    #[test]
-    fn parse_resume_with_single_agent() {
-        let cli = Cli::try_parse_from(["agent-loop", "resume", "--single-agent"])
-            .expect("resume with single-agent should parse");
-        let Some(Commands::Resume(args)) = cli.command else {
-            panic!("expected Commands::Resume variant");
-        };
-        assert!(args.single_agent);
-    }
-
-    #[test]
-    fn parse_tasks_subcommand() {
-        let cli = Cli::try_parse_from(["agent-loop", "tasks"]).expect("tasks should parse");
-        assert!(matches!(cli.command, Some(Commands::Tasks(_))));
-    }
-
-    #[test]
-    fn parse_tasks_with_file_flag() {
-        let cli = Cli::try_parse_from(["agent-loop", "tasks", "--file", "custom.md"])
-            .expect("tasks with file should parse");
-        let Some(Commands::Tasks(args)) = cli.command else {
-            panic!("expected Commands::Tasks variant");
-        };
-        assert_eq!(args.file.as_deref(), Some(Path::new("custom.md")));
-    }
-
-    #[test]
-    fn parse_run_tasks_deprecated_maps_to_correct_variant() {
-        let cli = Cli::try_parse_from(["agent-loop", "run-tasks"]).expect("run-tasks should parse");
-        assert!(matches!(cli.command, Some(Commands::RunTasksDeprecated(_))));
-    }
-
-    #[test]
-    fn normalize_argv_recognizes_new_subcommands() {
-        for subcmd in &["plan", "resume", "tasks"] {
-            let normalized = normalize_argv(os_argv(&["agent-loop", subcmd]));
-            assert_eq!(
-                normalized,
-                os_argv(&["agent-loop", subcmd]),
-                "{subcmd} should not be rewritten"
-            );
-        }
-    }
-
-    #[test]
-    fn hidden_flags_still_parse_on_run() {
-        let resume_cli = Cli::try_parse_from(["agent-loop", "run", "--resume"])
-            .expect("run --resume should parse");
-        let Some(Commands::Run(resume_args)) = resume_cli.command else {
-            panic!("expected Commands::Run variant");
-        };
-        assert!(resume_args.resume);
-
-        let planning_cli = Cli::try_parse_from(["agent-loop", "run", "--planning-only", "task"])
-            .expect("run --planning-only should parse");
-        let Some(Commands::Run(planning_args)) = planning_cli.command else {
-            panic!("expected Commands::Run variant");
-        };
-        assert!(planning_args.planning_only);
-        assert_eq!(planning_args.task.as_deref(), Some("task"));
-    }
-
-    #[test]
-    fn dispatch_plan_maps_to_plan() {
-        let cli =
-            Cli::try_parse_from(["agent-loop", "plan", "my task"]).expect("plan should parse");
-        let dispatch = dispatch_from_cli(cli).expect("plan dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Plan(PlanArgs {
-                task: Some("my task".to_string()),
-                file: None,
-                single_agent: false,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_resume_maps_to_resume() {
-        let cli = Cli::try_parse_from(["agent-loop", "resume"]).expect("resume should parse");
-        let dispatch = dispatch_from_cli(cli).expect("resume dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: false,
-                },
-                planning_only_legacy_override: None,
-                max_rounds_override: None,
-                force_implementation: false,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_tasks_maps_to_tasks() {
-        let cli = Cli::try_parse_from(["agent-loop", "tasks", "--file", "f.md"])
-            .expect("tasks should parse");
-        let dispatch = dispatch_from_cli(cli).expect("tasks dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Tasks(TasksArgs {
-                file: Some(PathBuf::from("f.md")),
-                tasks_file: None,
-                max_retries: 2,
-                round_step: 2,
-                single_agent: false,
-                continue_on_fail: false,
-                fail_fast: false,
-                max_parallel: None,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_run_tasks_deprecated_maps_to_tasks() {
-        let cli = Cli::try_parse_from(["agent-loop", "run-tasks", "--file", "f.md"])
-            .expect("run-tasks should parse");
-        let dispatch = dispatch_from_cli(cli).expect("run-tasks dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Tasks(TasksArgs {
-                file: Some(PathBuf::from("f.md")),
-                tasks_file: None,
-                max_retries: 2,
-                round_step: 2,
-                single_agent: false,
-                continue_on_fail: false,
-                fail_fast: false,
-                max_parallel: None,
-            })
-        );
-    }
-
-    #[test]
-    fn parse_tasks_with_deprecated_tasks_file_flag() {
+    fn dispatch_tasks_with_removed_tasks_file_returns_migration_error() {
         let cli = Cli::try_parse_from(["agent-loop", "tasks", "--tasks-file", "old.md"])
-            .expect("tasks --tasks-file should parse");
-        let Some(Commands::Tasks(args)) = cli.command else {
-            panic!("expected Commands::Tasks variant");
-        };
-        assert!(args.file.is_none());
-        assert_eq!(args.tasks_file.as_deref(), Some(Path::new("old.md")));
-    }
-
-    #[test]
-    fn parse_run_tasks_deprecated_with_tasks_file_flag() {
-        let cli = Cli::try_parse_from(["agent-loop", "run-tasks", "--tasks-file", "old.md"])
-            .expect("run-tasks --tasks-file should parse");
-        let Some(Commands::RunTasksDeprecated(args)) = cli.command else {
-            panic!("expected Commands::RunTasksDeprecated variant");
-        };
-        assert!(args.file.is_none());
-        assert_eq!(args.tasks_file.as_deref(), Some(Path::new("old.md")));
-    }
-
-    #[test]
-    fn dispatch_tasks_file_wins_over_deprecated_tasks_file() {
-        let cli = Cli::try_parse_from([
-            "agent-loop",
-            "tasks",
-            "--file",
-            "new.md",
-            "--tasks-file",
-            "old.md",
-        ])
-        .expect("tasks with both flags should parse");
-        let dispatch = dispatch_from_cli(cli).expect("tasks dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Tasks(TasksArgs {
-                file: Some(PathBuf::from("new.md")),
-                tasks_file: Some(PathBuf::from("old.md")),
-                max_retries: 2,
-                round_step: 2,
-                single_agent: false,
-                continue_on_fail: false,
-                fail_fast: false,
-                max_parallel: None,
-            })
-        );
-    }
-
-    // --- Dispatch rewriting tests for legacy flag combinations ---
-
-    #[test]
-    fn dispatch_run_resume_rewrites_to_resume() {
-        let cli = Cli::try_parse_from(["agent-loop", "run", "--resume"])
-            .expect("run --resume should parse");
-        let dispatch = dispatch_from_cli(cli).expect("run --resume dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: false,
-                },
-                planning_only_legacy_override: None,
-                max_rounds_override: None,
-                force_implementation: false,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_run_planning_only_rewrites_to_plan() {
-        let cli = Cli::try_parse_from(["agent-loop", "run", "--planning-only", "task"])
-            .expect("run --planning-only should parse");
-        let dispatch = dispatch_from_cli(cli).expect("run --planning-only dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Plan(PlanArgs {
-                task: Some("task".to_string()),
-                file: None,
-                single_agent: false,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_run_planning_only_resume_rewrites_to_resume_with_override() {
-        let cli = Cli::try_parse_from(["agent-loop", "run", "--planning-only", "--resume"])
-            .expect("run --planning-only --resume should parse");
-        let dispatch =
-            dispatch_from_cli(cli).expect("run --planning-only --resume dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: false,
-                },
-                planning_only_legacy_override: Some(true),
-                max_rounds_override: None,
-                force_implementation: false,
-            })
-        );
-    }
-
-    #[test]
-    fn dispatch_run_resume_with_task_returns_error() {
-        let cli = Cli::try_parse_from(["agent-loop", "run", "--resume", "task"])
-            .expect("run --resume task should parse");
-        let err = dispatch_from_cli(cli).expect_err("run --resume with task should error");
-        assert!(err.to_string().contains("cannot be combined"));
-    }
-
-    #[test]
-    fn dispatch_run_resume_with_file_returns_error() {
-        let cli = Cli::try_parse_from(["agent-loop", "run", "--resume", "--file", "f.md"])
-            .expect("run --resume --file should parse");
-        let err = dispatch_from_cli(cli).expect_err("run --resume with file should error");
-        assert!(err.to_string().contains("cannot be combined"));
-    }
-
-    #[test]
-    fn dispatch_plain_run_maps_to_run() {
-        let cli =
-            Cli::try_parse_from(["agent-loop", "run", "task"]).expect("run task should parse");
-        let dispatch = dispatch_from_cli(cli).expect("plain run dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Run(RunArgs {
-                task: Some("task".to_string()),
-                file: None,
-                resume: false,
-                planning_only: false,
-                single_agent: false,
-            })
-        );
-    }
-
-    // --- resolve_task_for_plan tests ---
-
-    fn plan_args(task: Option<&str>, file: Option<PathBuf>) -> PlanArgs {
-        PlanArgs {
-            task: task.map(ToOwned::to_owned),
-            file,
-            single_agent: false,
-        }
-    }
-
-    #[test]
-    fn resolve_task_for_plan_prefers_file_over_positional_text() {
-        let task_file = unique_temp_file("agent_loop_plan_task_precedence");
-        write_temp_file(&task_file, "plan from file");
-
-        let args = plan_args(Some("plan from positional"), Some(task_file.clone()));
-        let resolved = resolve_task_for_plan(&args).expect("task should resolve from file");
-        assert_eq!(resolved, "plan from file");
-
-        let _ = fs::remove_file(task_file);
-    }
-
-    #[test]
-    fn resolve_task_for_plan_uses_positional_task_when_file_is_missing() {
-        let args = plan_args(Some("plan from positional"), None);
-        let resolved = resolve_task_for_plan(&args).expect("positional task should be used");
-        assert_eq!(resolved, "plan from positional");
-    }
-
-    #[test]
-    fn resolve_task_for_plan_rejects_missing_or_empty_tasks() {
-        let missing_task_error =
-            resolve_task_for_plan(&plan_args(None, None)).expect_err("missing task should fail");
-        assert!(missing_task_error.to_string().contains("Task is required"));
-
-        let empty_positional_error = resolve_task_for_plan(&plan_args(Some("   "), None))
-            .expect_err("empty task should fail");
-        assert!(
-            empty_positional_error
-                .to_string()
-                .contains("cannot be empty")
-        );
-
-        let task_file = unique_temp_file("agent_loop_plan_task_empty_file");
-        write_temp_file(&task_file, "  \n\t");
-
-        let empty_file_error = resolve_task_for_plan(&plan_args(None, Some(task_file.clone())))
-            .expect_err("empty file task should fail");
-        assert!(empty_file_error.to_string().contains("is empty"));
-
-        let _ = fs::remove_file(task_file);
-    }
-
-    #[test]
-    fn resolve_task_for_plan_rejects_unreadable_file() {
-        let bad_path = PathBuf::from("/nonexistent/path/to/plan.md");
-        let err = resolve_task_for_plan(&plan_args(None, Some(bad_path)))
-            .expect_err("unreadable file should fail");
-        assert!(err.to_string().contains("Failed to read task file"));
-    }
-
-    // --- plan_command integration-style phase test ---
-
-    #[test]
-    fn plan_command_inner_runs_planning_and_decomposition_only() {
-        use crate::test_support::env_lock;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let _guard = env_lock();
-        clear_config_env();
-        let project = crate::test_support::TestProject::builder("plan_cmd_phases").build();
-        let project_root = project.root.clone();
-
-        let planning_called = AtomicBool::new(false);
-        let decomposition_called = AtomicBool::new(false);
-
-        let args = plan_args(Some("plan this task"), None);
-
-        let exit_code = plan_command_inner(
-            args,
-            move || Ok(project_root),
-            |_config, _planning_only| {
-                planning_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config| {
-                decomposition_called.store(true, Ordering::SeqCst);
-                true
-            },
-        )
-        .expect("plan_command_inner should succeed");
-
-        assert_eq!(exit_code, 0);
-        assert!(
-            planning_called.load(Ordering::SeqCst),
-            "planning phase must be called"
-        );
-        assert!(
-            decomposition_called.load(Ordering::SeqCst),
-            "decomposition phase must be called"
-        );
-
-        // Verify workflow marker is Plan.
-        let workflow = crate::state::read_workflow(&project.config);
-        assert_eq!(workflow, Some(crate::state::WorkflowKind::Plan));
-
-        // Verify task was persisted.
-        let task_content = crate::state::read_state_file("task.md", &project.config);
-        assert_eq!(task_content, "plan this task");
-    }
-
-    #[test]
-    fn plan_command_inner_skips_decomposition_when_planning_fails() {
-        use crate::test_support::env_lock;
-
-        let _guard = env_lock();
-        clear_config_env();
-        let project = crate::test_support::TestProject::builder("plan_cmd_planning_fail").build();
-        let project_root = project.root.clone();
-
-        let args = plan_args(Some("fail planning"), None);
-
-        let exit_code = plan_command_inner(
-            args,
-            move || Ok(project_root),
-            |_config, _po| false, // planning fails
-            |_config| panic!("decomposition must not be called when planning fails"),
-        )
-        .expect("plan_command_inner should return Ok even on planning failure");
-
-        assert_eq!(exit_code, 1);
-    }
-
-    #[test]
-    fn plan_command_inner_returns_failure_exit_code_on_decomposition_failure() {
-        use crate::test_support::env_lock;
-
-        let _guard = env_lock();
-        clear_config_env();
-        let project = crate::test_support::TestProject::builder("plan_cmd_decomp_fail").build();
-        let project_root = project.root.clone();
-
-        let args = plan_args(Some("decomposition fails"), None);
-
-        let exit_code = plan_command_inner(
-            args,
-            move || Ok(project_root),
-            |_config, _po| true,  // planning succeeds
-            |_config| false, // decomposition fails
-        )
-        .expect("plan_command_inner should return Ok even on decomposition failure");
-
-        assert_eq!(exit_code, 1);
-    }
-
-    // --- Dispatch routing test for Dispatch::Plan ---
-
-    #[test]
-    fn execute_dispatch_routes_plan_to_plan_handler() {
-        let dispatch = Dispatch::Plan(PlanArgs {
-            task: Some("my plan task".to_string()),
-            file: None,
-            single_agent: false,
-        });
-
-        let exit_code = execute_dispatch(
-            dispatch,
-            |_| panic!("run handler should not be called"),
-            |args| {
-                assert_eq!(args.task.as_deref(), Some("my plan task"));
-                Ok(0)
-            },
-            |_| panic!("resume handler should not be called"),
-            |_| panic!("tasks handler should not be called"),
-            || panic!("init handler should not be called"),
-            || panic!("status handler should not be called"),
-            || panic!("version handler should not be called"),
-            || panic!("help handler should not be called"),
-        )
-        .expect("plan dispatch should succeed");
-
-        assert_eq!(exit_code, 0);
-    }
-
-    // --- run() wiring: end-to-end parse → dispatch → handler chain ---
-
-    /// Verify the full parse → dispatch → execute_dispatch chain routes
-    /// `plan <task>` to the plan handler (same wiring as `run()`).
-    #[test]
-    fn run_wiring_routes_plan_subcommand_to_plan_handler() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "plan", "test task"]))
-            .expect("plan subcommand should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("plan subcommand should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("plan dispatch should succeed");
-
-        // Verify the dispatch variant is Plan
-        assert!(
-            matches!(&dispatch, Dispatch::Plan(args) if args.task.as_deref() == Some("test task")),
-            "dispatch should be Plan with correct task"
-        );
-
-        // Execute through the same execute_dispatch that run() uses,
-        // verifying plan_handler is called (not run/resume/tasks).
-        let mut plan_handler_called = false;
-        let exit_code = execute_dispatch(
-            dispatch,
-            |_| panic!("run handler should not be called for plan subcommand"),
-            |args| {
-                plan_handler_called = true;
-                assert_eq!(args.task.as_deref(), Some("test task"));
-                Ok(0)
-            },
-            |_| panic!("resume handler should not be called for plan subcommand"),
-            |_| panic!("tasks handler should not be called for plan subcommand"),
-            || panic!("init handler should not be called for plan subcommand"),
-            || panic!("status handler should not be called for plan subcommand"),
-            || panic!("version handler should not be called for plan subcommand"),
-            || panic!("help handler should not be called for plan subcommand"),
-        )
-        .expect("plan dispatch should succeed");
-
-        assert!(plan_handler_called, "plan handler must be called");
-        assert_eq!(exit_code, 0);
-    }
-
-    /// Verify `run --planning-only <task>` is rewritten to Plan dispatch,
-    /// exercising the same chain as run().
-    #[test]
-    fn run_wiring_routes_legacy_planning_only_to_plan_handler() {
-        let parsed = parse_cli_from(os_argv(&[
-            "agent-loop",
-            "run",
-            "--planning-only",
-            "legacy task",
-        ]))
-        .expect("run --planning-only should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
-
-        assert!(
-            matches!(&dispatch, Dispatch::Plan(args) if args.task.as_deref() == Some("legacy task")),
-            "legacy --planning-only should rewrite to Dispatch::Plan"
-        );
-    }
-
-    // --- run_command_with_max_rounds guardrails ---
-
-    #[test]
-    fn run_command_with_max_rounds_rejects_resume_true() {
-        let args = RunArgs {
-            task: None,
-            file: None,
-            resume: true,
-            planning_only: false,
-            single_agent: false,
-        };
-        let err =
-            run_command_with_max_rounds(args, None).expect_err("resume=true should be rejected");
-        assert!(
-            err.to_string()
-                .contains("must not be called with resume=true"),
-            "error should mention resume rejection, got: {err}"
-        );
-    }
-
-    #[test]
-    fn run_command_with_max_rounds_rejects_planning_only_true() {
-        let args = RunArgs {
-            task: None,
-            file: None,
-            resume: false,
-            planning_only: true,
-            single_agent: false,
-        };
-        let err = run_command_with_max_rounds(args, None)
-            .expect_err("planning_only=true should be rejected");
-        assert!(
-            err.to_string()
-                .contains("must not be called with planning_only=true"),
-            "error should mention planning_only rejection, got: {err}"
-        );
-    }
-
-    // --- resume_command: pre-config state helpers ---
-
-    #[test]
-    fn ensure_resume_state_dir_exists_rejects_missing_dir() {
-        let root = unique_temp_file("resume_state_missing");
-        let state_dir = root.join(".agent-loop").join("state");
-        let err =
-            ensure_resume_state_dir_exists(&state_dir).expect_err("missing state dir should fail");
-        assert!(err.to_string().contains("does not exist"));
-    }
-
-    #[test]
-    fn ensure_resume_state_dir_exists_rejects_missing_status_json() {
-        let root = unique_temp_file("resume_state_no_status");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        let err = ensure_resume_state_dir_exists(&state_dir)
-            .expect_err("missing status.json should fail");
-        assert!(err.to_string().contains("status.json"));
-        assert!(err.to_string().contains("missing"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn ensure_resume_state_dir_exists_accepts_valid_state() {
-        let root = unique_temp_file("resume_state_valid");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("status.json"), "{}").unwrap();
-        ensure_resume_state_dir_exists(&state_dir).expect("valid state dir should pass");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_resume_task_from_state_dir_reads_task() {
-        let root = unique_temp_file("resume_task_read");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("task.md"), "my task").unwrap();
-        let task = read_resume_task_from_state_dir(&state_dir).expect("task should be readable");
-        assert_eq!(task, "my task");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_resume_task_from_state_dir_rejects_empty() {
-        let root = unique_temp_file("resume_task_empty");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("task.md"), "  \n\t").unwrap();
-        let err = read_resume_task_from_state_dir(&state_dir).expect_err("empty task should fail");
-        assert!(err.to_string().contains("empty"));
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_workflow_marker_from_state_dir_reads_plan() {
-        let root = unique_temp_file("resume_workflow_plan");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("workflow.txt"), "plan\n").unwrap();
-        assert_eq!(
-            read_workflow_marker_from_state_dir(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_workflow_marker_from_state_dir_reads_run() {
-        let root = unique_temp_file("resume_workflow_run");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("workflow.txt"), "run\n").unwrap();
-        assert_eq!(
-            read_workflow_marker_from_state_dir(&state_dir),
-            Some(state::WorkflowKind::Run)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn read_workflow_marker_from_state_dir_returns_none_when_missing() {
-        let root = unique_temp_file("resume_workflow_missing");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        assert_eq!(read_workflow_marker_from_state_dir(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // --- resume_command: artifact inference ---
-
-    #[test]
-    fn infer_workflow_from_artifacts_detects_plan_from_task_headings() {
-        let root = unique_temp_file("resume_infer_plan");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "## Task 1: Build parser\nsome content\n### Task 2: Add tests\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PENDING","round":0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_from_artifacts_detects_run_from_status() {
-        let root = unique_temp_file("resume_infer_run_status");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"IMPLEMENTING","round":2}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Run)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_from_artifacts_detects_run_from_changes() {
-        let root = unique_temp_file("resume_infer_run_changes");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(state_dir.join("changes.md"), "Some implementation changes").unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PENDING","round":0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Run)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_from_artifacts_returns_none_on_conflict() {
-        let root = unique_temp_file("resume_infer_conflict");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // Both plan signal (task headings) and run signal (impl status)
-        fs::write(state_dir.join("tasks.md"), "### Task 1: Build parser\n").unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"IMPLEMENTING","round":2}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_from_artifacts_returns_none_when_empty() {
-        let root = unique_temp_file("resume_infer_empty");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PENDING","round":0}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_needs_revision_is_not_run_signal() {
-        // NEEDS_REVISION can appear in planning/decomposition flows, so it
-        // should NOT be treated as an implementation signal.
-        let root = unique_temp_file("resume_infer_needs_revision");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"NEEDS_REVISION","round":2}"#,
-        )
-        .unwrap();
-        // No task headings, no impl artifacts — should be None (not Run).
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_needs_revision_with_plan_headings_infers_plan() {
-        // NEEDS_REVISION with task headings should infer Plan, not conflict.
-        let root = unique_temp_file("resume_infer_needs_rev_plan");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "### Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"NEEDS_REVISION","round":2}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_approved_with_plan_headings_is_ambiguous() {
-        // APPROVED with task headings but no implementation artifacts is
-        // ambiguous: could be a completed plan workflow OR a run workflow
-        // interrupted between decomposition and implementation. Return None.
-        let root = unique_temp_file("resume_infer_approved_ambiguous");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "### Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"APPROVED","round":1}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_consensus_with_plan_headings_is_ambiguous() {
-        // CONSENSUS with task headings but no implementation artifacts is
-        // ambiguous: could be a completed plan workflow OR a run workflow
-        // interrupted between decomposition and implementation. Return None.
-        let root = unique_temp_file("resume_infer_consensus_ambiguous");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "### Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"CONSENSUS","round":3}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_disputed_without_task_headings_does_not_infer_run() {
-        // DISPUTED can appear in planning/decomposition flows (e.g. stale
-        // timestamp fallback during decomposition consensus). Without task
-        // headings or implementation artifacts, it should NOT infer Run.
-        let root = unique_temp_file("resume_infer_disputed_no_headings");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"DISPUTED","round":2}"#,
-        )
-        .unwrap();
-        // No task headings, no impl artifacts — should be None (not Run).
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_disputed_with_plan_headings_infers_plan() {
-        // DISPUTED with task headings and no implementation artifacts should
-        // infer Plan (not conflict).
-        let root = unique_temp_file("resume_infer_disputed_plan");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "### Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"DISPUTED","round":2}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // --- resume_command: ambiguous decomposition-terminal inference ---
-
-    #[test]
-    fn infer_workflow_consensus_without_headings_returns_none() {
-        // CONSENSUS alone (no task headings, no impl artifacts) is not enough
-        // to infer any workflow.
-        let root = unique_temp_file("resume_infer_consensus_alone");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"CONSENSUS","round":3}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_approved_without_headings_returns_none() {
-        // APPROVED alone (no task headings, no impl artifacts) is not enough
-        // to infer any workflow.
-        let root = unique_temp_file("resume_infer_approved_alone");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"APPROVED","round":1}"#,
-        )
-        .unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_consensus_with_headings_and_impl_artifacts_returns_none() {
-        // CONSENSUS + task headings + implementation artifacts = conflicting
-        // signals (plan_signal && run_signal), should return None.
-        let root = unique_temp_file("resume_infer_consensus_conflict");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "### Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"CONSENSUS","round":3}"#,
-        )
-        .unwrap();
-        fs::write(state_dir.join("changes.md"), "Implementation changes").unwrap();
-        assert_eq!(infer_workflow_from_artifacts(&state_dir), None);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_planning_with_headings_infers_plan() {
-        // PLANNING status with task headings is safe to infer as Plan — the
-        // session is still actively decomposing, not in a decomposition-terminal
-        // state. This distinguishes it from the CONSENSUS/APPROVED ambiguity.
-        let root = unique_temp_file("resume_infer_planning_headings");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "## Task 1: Build parser\nsome content\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PLANNING","round":1}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn infer_workflow_pending_with_headings_infers_plan() {
-        // PENDING status with task headings is safe to infer as Plan — the
-        // session hasn't started yet, so no risk of misclassifying a run
-        // workflow that completed decomposition.
-        let root = unique_temp_file("resume_infer_pending_headings");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        fs::write(
-            state_dir.join("tasks.md"),
-            "## Task 1: Build parser\nsome content\n### Task 2: Add tests\n",
-        )
-        .unwrap();
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PENDING","round":0}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            infer_workflow_from_artifacts(&state_dir),
-            Some(state::WorkflowKind::Plan)
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // --- resume_command: task read error handling ---
-
-    #[test]
-    fn read_resume_task_from_state_dir_missing_file_gives_read_error() {
-        // Missing task.md should report a read failure, not "empty".
-        let root = unique_temp_file("resume_task_missing_file");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // Do NOT create task.md
-        let err =
-            read_resume_task_from_state_dir(&state_dir).expect_err("missing task.md should fail");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("failed to read"),
-            "error should mention read failure, got: {msg}"
-        );
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // --- resume_command: workflow resolution precedence ---
-
-    fn make_resume_dispatch(single_agent: bool, legacy_override: Option<bool>) -> ResumeDispatch {
-        ResumeDispatch {
-            args: ResumeArgs { single_agent },
-            planning_only_legacy_override: legacy_override,
-            max_rounds_override: None,
-            force_implementation: false,
-        }
-    }
-
-    #[test]
-    fn resolve_workflow_legacy_override_beats_persisted_marker() {
-        let root = unique_temp_file("resume_resolve_override");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // Persisted marker says "run"
-        fs::write(state_dir.join("workflow.txt"), "run\n").unwrap();
-        // Legacy override says planning_only = true => Plan
-        let dispatch = make_resume_dispatch(false, Some(true));
-        let workflow =
-            resolve_workflow_for_resume(&dispatch, &state_dir).expect("should resolve");
-        assert_eq!(workflow, state::WorkflowKind::Plan);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_workflow_persisted_marker_resolves() {
-        let root = unique_temp_file("resume_resolve_marker");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // Persisted marker says "plan"
-        fs::write(state_dir.join("workflow.txt"), "plan\n").unwrap();
-        let dispatch = make_resume_dispatch(false, None);
-        let workflow =
-            resolve_workflow_for_resume(&dispatch, &state_dir).expect("should resolve");
-        assert_eq!(workflow, state::WorkflowKind::Plan);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_workflow_returns_error_when_unresolvable() {
-        use crate::test_support::env_lock;
-
-        let _guard = env_lock();
-        clear_config_env();
-
-        let root = unique_temp_file("resume_resolve_error");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // No workflow.txt, no artifacts, no env
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"PENDING","round":0}"#,
-        )
-        .unwrap();
-        let dispatch = make_resume_dispatch(false, None);
-        let err = resolve_workflow_for_resume(&dispatch, &state_dir)
-            .expect_err("should fail when unresolvable");
-        let msg = err.to_string();
-        assert!(msg.contains("unable to determine"), "got: {msg}");
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn resolve_workflow_artifact_inference_resolves() {
-        let root = unique_temp_file("resume_resolve_artifact");
-        let state_dir = root.join(".agent-loop").join("state");
-        fs::create_dir_all(&state_dir).unwrap();
-        // No workflow.txt, but implementation artifacts (run signal)
-        fs::write(
-            state_dir.join("status.json"),
-            r#"{"status":"IMPLEMENTING","round":2}"#,
-        )
-        .unwrap();
-        let dispatch = make_resume_dispatch(false, None);
-        let workflow = resolve_workflow_for_resume(&dispatch, &state_dir)
-            .expect("should resolve from artifacts");
-        assert_eq!(workflow, state::WorkflowKind::Run);
-        let _ = fs::remove_dir_all(root);
-    }
-
-    // --- resume_command_inner: phase routing ---
-
-    #[test]
-    fn resume_command_inner_plan_runs_decomposition_only() {
-        use crate::test_support::env_lock;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let _guard = env_lock();
-        clear_config_env();
-
-        let project = crate::test_support::TestProject::builder("resume_plan_phases").build();
-        let project_root = project.root.clone();
-
-        // Set up state for resume: status.json + task.md + workflow.txt
-        fs::create_dir_all(&project.config.state_dir).unwrap();
-        crate::state::write_state_file("task.md", "plan task", &project.config).unwrap();
-        fs::write(project.config.state_dir.join("status.json"), r#"{"status":"PLANNING","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"plan task","timestamp":"2026-02-15T15:09:44.850Z"}"#).unwrap();
-        fs::write(project.config.state_dir.join("workflow.txt"), "plan\n").unwrap();
-
-        let decomposition_called = AtomicBool::new(false);
-        let implementation_called = AtomicBool::new(false);
-        let summary_called = AtomicBool::new(false);
-
-        let dispatch = make_resume_dispatch(false, None);
-
-        let exit_code = resume_command_inner(
-            dispatch,
-            move || Ok(project_root),
-            |_config| {
-                decomposition_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config, _baseline| {
-                implementation_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config| {
-                summary_called.store(true, Ordering::SeqCst);
-            },
-        )
-        .expect("resume_command_inner should succeed");
-
-        assert_eq!(exit_code, 0);
-        assert!(
-            decomposition_called.load(Ordering::SeqCst),
-            "decomposition phase must be called for Plan workflow"
-        );
-        assert!(
-            !implementation_called.load(Ordering::SeqCst),
-            "implementation must not be called for Plan workflow"
-        );
-        assert!(
-            !summary_called.load(Ordering::SeqCst),
-            "summary must not be called for Plan workflow"
-        );
-    }
-
-    #[test]
-    fn resume_command_inner_run_runs_implementation_and_summary() {
-        use crate::test_support::env_lock;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let _guard = env_lock();
-        clear_config_env();
-
-        let project = crate::test_support::TestProject::builder("resume_run_phases").build();
-        let project_root = project.root.clone();
-
-        // Set up state for resume: status.json + task.md + workflow.txt
-        fs::create_dir_all(&project.config.state_dir).unwrap();
-        crate::state::write_state_file("task.md", "run task", &project.config).unwrap();
-        fs::write(project.config.state_dir.join("status.json"), r#"{"status":"IMPLEMENTING","round":2,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"run task","timestamp":"2026-02-15T15:09:44.850Z"}"#).unwrap();
-        fs::write(project.config.state_dir.join("workflow.txt"), "run\n").unwrap();
-
-        let decomposition_called = AtomicBool::new(false);
-        let implementation_called = AtomicBool::new(false);
-        let summary_called = AtomicBool::new(false);
-
-        let dispatch = make_resume_dispatch(false, None);
-
-        let exit_code = resume_command_inner(
-            dispatch,
-            move || Ok(project_root),
-            |_config| {
-                decomposition_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config, _baseline| {
-                implementation_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config| {
-                summary_called.store(true, Ordering::SeqCst);
-            },
-        )
-        .expect("resume_command_inner should succeed");
-
-        assert_eq!(exit_code, 0);
-        assert!(
-            !decomposition_called.load(Ordering::SeqCst),
-            "decomposition must not be called for Run workflow"
-        );
-        assert!(
-            implementation_called.load(Ordering::SeqCst),
-            "implementation phase must be called for Run workflow"
-        );
-        assert!(
-            summary_called.load(Ordering::SeqCst),
-            "summary must be called for Run workflow"
-        );
-    }
-
-    // ── Task 8: help text and environment_help tests ──────────────────
-
-    #[test]
-    fn environment_help_mentions_new_subcommands() {
-        let help = environment_help();
-        assert!(
-            help.contains("agent-loop plan"),
-            "environment_help should mention 'agent-loop plan'"
-        );
-        assert!(
-            help.contains("agent-loop resume"),
-            "environment_help should mention 'agent-loop resume'"
-        );
-        assert!(
-            help.contains("agent-loop tasks"),
-            "environment_help should mention 'agent-loop tasks'"
-        );
-    }
-
-    #[test]
-    fn environment_help_mentions_deprecated_flags() {
-        let help = environment_help();
-        assert!(
-            help.contains("--planning-only"),
-            "environment_help should mention deprecated --planning-only flag"
-        );
-        assert!(
-            help.contains("--resume"),
-            "environment_help should mention deprecated --resume flag"
-        );
-        assert!(
-            help.contains("Deprecated"),
-            "environment_help should label deprecated flags"
-        );
-    }
-
-    #[test]
-    fn environment_help_does_not_list_run_tasks_as_primary() {
-        let help = environment_help();
-        // The primary commands section should not list run-tasks
-        let primary_section = help
-            .split("Deprecated flags")
-            .next()
-            .expect("should have a section before Deprecated flags");
-        assert!(
-            !primary_section.contains("run-tasks"),
-            "run-tasks should not appear in the primary commands section"
-        );
-    }
-
-    #[test]
-    fn help_output_shows_subcommand_descriptions() {
-        let mut buf = Vec::new();
-        Cli::command().write_long_help(&mut buf).unwrap();
-        let help_text = String::from_utf8(buf).unwrap();
-
-        assert!(
-            help_text.contains("plan") && help_text.contains("Plan and decompose"),
-            "help should show 'plan' subcommand with description"
-        );
-        assert!(
-            help_text.contains("resume") && help_text.contains("Resume an interrupted"),
-            "help should show 'resume' subcommand with description"
-        );
-        assert!(
-            help_text.contains("tasks") && help_text.contains("Execute all tasks"),
-            "help should show 'tasks' subcommand with description"
-        );
-    }
-
-    #[test]
-    fn help_output_hides_run_tasks() {
-        let mut buf = Vec::new();
-        Cli::command().write_long_help(&mut buf).unwrap();
-        let help_text = String::from_utf8(buf).unwrap();
-
-        assert!(
-            !help_text.contains("run-tasks"),
-            "help output should not show hidden 'run-tasks' subcommand"
-        );
-    }
-
-    // ── Task 9: Comprehensive backward-compatibility regression tests ──
-
-    /// Full chain: `run --planning-only --resume` → parse → dispatch → resume handler
-    /// with `planning_only_legacy_override = Some(true)`.
-    #[test]
-    fn regression_legacy_planning_only_resume_full_chain() {
-        let parsed = parse_cli_from(os_argv(&[
-            "agent-loop",
-            "run",
-            "--planning-only",
-            "--resume",
-        ]))
-        .expect("run --planning-only --resume should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
-
-        // Verify dispatch variant
-        assert_eq!(
-            dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: false,
-                },
-                planning_only_legacy_override: Some(true),
-                max_rounds_override: None,
-                force_implementation: false,
-            })
-        );
-
-        // Verify routing through execute_dispatch
-        let mut resume_called = false;
-        let exit_code = execute_dispatch(
-            dispatch,
-            |_| panic!("run handler must not be called"),
-            |_| panic!("plan handler must not be called"),
-            |rd| {
-                resume_called = true;
-                assert_eq!(rd.planning_only_legacy_override, Some(true));
-                Ok(0)
-            },
-            |_| panic!("tasks handler must not be called"),
-            || panic!("init handler must not be called"),
-            || panic!("status handler must not be called"),
-            || panic!("version handler must not be called"),
-            || panic!("help handler must not be called"),
-        )
-        .expect("dispatch should succeed");
-
-        assert!(resume_called, "resume handler must be called");
-        assert_eq!(exit_code, 0);
-    }
-
-    /// Full chain: `run-tasks --tasks-file old.md` → dispatch → tasks handler.
-    /// Verifies the deprecated `run-tasks` subcommand continues to work.
-    #[test]
-    fn regression_run_tasks_deprecated_with_tasks_file_full_chain() {
-        let parsed = parse_cli_from(os_argv(&[
-            "agent-loop",
-            "run-tasks",
-            "--tasks-file",
-            "old.md",
-        ]))
-        .expect("run-tasks --tasks-file should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
-
-        // Verify dispatch variant is Tasks (not RunTasksDeprecated)
-        assert!(
-            matches!(&dispatch, Dispatch::Tasks(args) if args.tasks_file.as_deref() == Some(Path::new("old.md"))),
-            "run-tasks should rewrite to Dispatch::Tasks with tasks_file"
-        );
-
-        // Verify routing
-        let mut tasks_called = false;
-        let exit_code = execute_dispatch(
-            dispatch,
-            |_| panic!("run handler must not be called"),
-            |_| panic!("plan handler must not be called"),
-            |_| panic!("resume handler must not be called"),
-            |args| {
-                tasks_called = true;
-                assert_eq!(args.tasks_file.as_deref(), Some(Path::new("old.md")));
-                Ok(0)
-            },
-            || panic!("init handler must not be called"),
-            || panic!("status handler must not be called"),
-            || panic!("version handler must not be called"),
-            || panic!("help handler must not be called"),
-        )
-        .expect("dispatch should succeed");
-
-        assert!(tasks_called, "tasks handler must be called");
-        assert_eq!(exit_code, 0);
-    }
-
-    /// Full chain: `tasks --file new.md --tasks-file old.md` parses, dispatches,
-    /// but validate() rejects the combination.
-    #[test]
-    fn regression_tasks_file_and_tasks_file_together_validation_error() {
-        let parsed = parse_cli_from(os_argv(&[
-            "agent-loop",
-            "tasks",
-            "--file",
-            "new.md",
-            "--tasks-file",
-            "old.md",
-        ]))
-        .expect("tasks with both flags should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
-
-        // Dispatch succeeds (both flags are valid at parse time)
-        let Dispatch::Tasks(ref args) = dispatch else {
-            panic!("dispatch should be Tasks");
-        };
-
-        // But validate() rejects the combination
-        let err = args
-            .validate()
-            .expect_err("file+tasks_file should fail validation");
-        assert!(err.to_string().contains("cannot be used together"));
-    }
-
-    /// Full chain: `run --resume "task"` still returns a validation error.
-    #[test]
-    fn regression_run_resume_with_task_still_errors() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "run", "--resume", "some task"]))
-            .expect("run --resume task should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let err = dispatch_from_cli(cli).expect_err("run --resume with task should error");
-        assert!(
-            err.to_string().contains("cannot be combined"),
-            "error should mention cannot be combined, got: {err}"
-        );
-    }
-
-    /// Full chain: `run --resume --file task.md` still returns a validation error.
-    #[test]
-    fn regression_run_resume_with_file_still_errors() {
-        let parsed = parse_cli_from(os_argv(&[
-            "agent-loop",
-            "run",
-            "--resume",
-            "--file",
-            "task.md",
-        ]))
-        .expect("run --resume --file should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let err = dispatch_from_cli(cli).expect_err("run --resume with file should error");
-        assert!(
-            err.to_string().contains("cannot be combined"),
-            "error should mention cannot be combined, got: {err}"
-        );
-    }
-
-    /// `agent-loop "task"` shorthand is normalized to `run "task"` and dispatches correctly.
-    #[test]
-    fn regression_bare_task_shorthand_full_chain() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "my cool task"]))
-            .expect("bare task should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("bare task dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Run(RunArgs {
-                task: Some("my cool task".to_string()),
-                file: None,
-                resume: false,
-                planning_only: false,
-                single_agent: false,
-            })
-        );
-    }
-
-    /// All new subcommands (`plan`, `resume`, `tasks`, `run-tasks`) are in
-    /// KNOWN_SUBCOMMANDS and normalize_argv does NOT inject `run` before them.
-    #[test]
-    fn regression_new_subcommands_not_rewritten_by_normalize() {
-        for cmd in ["plan", "resume", "tasks", "run-tasks"] {
-            assert!(
-                KNOWN_SUBCOMMANDS.contains(&cmd),
-                "{cmd} must be in KNOWN_SUBCOMMANDS"
-            );
-            let normalized = normalize_argv(os_argv(&["agent-loop", cmd]));
-            assert_eq!(
-                normalized,
-                os_argv(&["agent-loop", cmd]),
-                "normalize_argv must not inject 'run' before '{cmd}'"
-            );
-        }
-    }
-
-    /// Full chain: `run-tasks` (no args) dispatches to Tasks handler.
-    #[test]
-    fn regression_run_tasks_no_args_dispatches_to_tasks() {
-        let parsed =
-            parse_cli_from(os_argv(&["agent-loop", "run-tasks"])).expect("run-tasks should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("run-tasks dispatch should succeed");
-        assert!(
-            matches!(&dispatch, Dispatch::Tasks(_)),
-            "run-tasks should map to Dispatch::Tasks"
-        );
-
-        let mut tasks_called = false;
-        execute_dispatch(
-            dispatch,
-            |_| panic!("run handler must not be called"),
-            |_| panic!("plan handler must not be called"),
-            |_| panic!("resume handler must not be called"),
-            |_| {
-                tasks_called = true;
-                Ok(0)
-            },
-            || panic!("init handler must not be called"),
-            || panic!("status handler must not be called"),
-            || panic!("version handler must not be called"),
-            || panic!("help handler must not be called"),
-        )
-        .expect("dispatch should succeed");
-        assert!(tasks_called);
-    }
-
-    /// Full chain: `resume` routes to resume handler (new-style, no legacy override).
-    #[test]
-    fn regression_resume_subcommand_full_chain() {
-        let parsed =
-            parse_cli_from(os_argv(&["agent-loop", "resume"])).expect("resume should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("resume dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs {
-                    single_agent: false,
-                },
-                planning_only_legacy_override: None,
-                max_rounds_override: None,
-                force_implementation: false,
-            })
-        );
-
-        let mut resume_called = false;
-        execute_dispatch(
-            dispatch,
-            |_| panic!("run handler must not be called"),
-            |_| panic!("plan handler must not be called"),
-            |rd| {
-                resume_called = true;
-                assert!(rd.planning_only_legacy_override.is_none());
-                Ok(0)
-            },
-            |_| panic!("tasks handler must not be called"),
-            || panic!("init handler must not be called"),
-            || panic!("status handler must not be called"),
-            || panic!("version handler must not be called"),
-            || panic!("help handler must not be called"),
-        )
-        .expect("dispatch should succeed");
-        assert!(resume_called);
-    }
-
-    /// Full chain: `resume` uses persisted workflow (run) from workflow.txt.
-    #[test]
-    fn regression_resume_persisted_workflow_routes_correctly() {
-        use crate::test_support::env_lock;
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let _guard = env_lock();
-        clear_config_env();
-
-        let project = crate::test_support::TestProject::builder("resume_precedence_full").build();
-        let project_root = project.root.clone();
-
-        // Seed state: status.json + task.md + workflow.txt=run
-        fs::create_dir_all(&project.config.state_dir).unwrap();
-        crate::state::write_state_file("task.md", "implementation task", &project.config).unwrap();
-        fs::write(
-            project.config.state_dir.join("status.json"),
-            r#"{"status":"IMPLEMENTING","round":2,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"implementation task","timestamp":"2026-02-15T15:09:44.850Z"}"#,
-        ).unwrap();
-        fs::write(project.config.state_dir.join("workflow.txt"), "run\n").unwrap();
-
-        let decomposition_called = AtomicBool::new(false);
-        let implementation_called = AtomicBool::new(false);
-        let summary_called = AtomicBool::new(false);
-
-        // Parse + dispatch `resume` from CLI.
-        let parsed =
-            parse_cli_from(os_argv(&["agent-loop", "resume"])).expect("resume should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
-        let dispatch = dispatch_from_cli(cli).expect("resume dispatch should succeed");
-        let Dispatch::Resume(resume_dispatch) = dispatch else {
-            panic!("dispatch should be Resume");
-        };
-
-        // Execute resume_command_inner with stub phase fns.
-        let exit_code = resume_command_inner(
-            resume_dispatch,
-            move || Ok(project_root),
-            |_config| {
-                decomposition_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config, _baseline| {
-                implementation_called.store(true, Ordering::SeqCst);
-                true
-            },
-            |_config| {
-                summary_called.store(true, Ordering::SeqCst);
-            },
-        )
-        .expect("resume_command_inner should succeed");
-
-        assert_eq!(exit_code, 0);
-        // Persisted workflow is "run" so implementation path must be chosen.
-        assert!(
-            !decomposition_called.load(Ordering::SeqCst),
-            "decomposition must NOT be called for Run workflow"
-        );
-        assert!(
-            implementation_called.load(Ordering::SeqCst),
-            "implementation must be called for Run workflow"
-        );
-        assert!(
-            summary_called.load(Ordering::SeqCst),
-            "summary must be called for Run workflow"
-        );
-    }
-
-    /// Full chain: `resume --single-agent` preserves single_agent flag.
-    #[test]
-    fn regression_resume_single_agent_preserved() {
-        let parsed = parse_cli_from(os_argv(&["agent-loop", "resume", "--single-agent"]))
-            .expect("resume --single-agent should parse");
-        let ParseOutcome::Parsed(cli) = parsed else {
-            panic!("should produce parsed CLI");
-        };
+            .expect("tasks --tasks-file should parse for migration");
         let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
-            Dispatch::Resume(ResumeDispatch {
-                args: ResumeArgs { single_agent: true },
-                planning_only_legacy_override: None,
-                max_rounds_override: None,
-                force_implementation: false,
-            })
+            Dispatch::MigrationError("'--tasks-file' has been removed. Use '--file' instead.".to_string())
         );
+    }
+
+    #[test]
+    fn dispatch_legacy_run_variants_return_exact_migration_messages() {
+        let run = Cli::try_parse_from(["agent-loop", "run", "task text"]).expect("run should parse");
+        let dispatch = dispatch_from_cli(run).expect("dispatch should succeed");
+        assert_eq!(
+            dispatch,
+            Dispatch::MigrationError("'run' has been removed. Use 'implement'.".to_string())
+        );
+
+        let run_planning =
+            Cli::try_parse_from(["agent-loop", "run", "--planning-only"]).expect("run planning should parse");
+        let dispatch = dispatch_from_cli(run_planning).expect("dispatch should succeed");
+        assert_eq!(
+            dispatch,
+            Dispatch::MigrationError("'run --planning-only' has been removed. Use 'plan'.".to_string())
+        );
+
+        let run_resume =
+            Cli::try_parse_from(["agent-loop", "run", "--resume"]).expect("run resume should parse");
+        let dispatch = dispatch_from_cli(run_resume).expect("dispatch should succeed");
+        assert_eq!(
+            dispatch,
+            Dispatch::MigrationError("'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'.".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatch_new_commands_map_to_new_variants() {
+        let plan = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "plan", "task"]).unwrap())
+            .expect("plan dispatch should succeed");
+        assert!(matches!(plan, Dispatch::Plan(_)));
+
+        let tasks = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "tasks"]).unwrap())
+            .expect("tasks dispatch should succeed");
+        assert!(matches!(tasks, Dispatch::Tasks(_)));
+
+        let implement = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "implement"]).unwrap())
+            .expect("implement dispatch should succeed");
+        assert!(matches!(implement, Dispatch::Implement(_)));
+
+        let reset = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "reset"]).unwrap())
+            .expect("reset dispatch should succeed");
+        assert_eq!(reset, Dispatch::Reset);
     }
 }
