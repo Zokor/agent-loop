@@ -453,6 +453,30 @@ fn clear_session_id(config: &Config, session_key: &str) {
     let _ = fs::remove_file(path);
 }
 
+/// Detect session resume errors in agent output even when the process exits 0.
+///
+/// Some agents (Claude, Codex) may emit error messages about an invalid or
+/// expired session but still exit with code 0.  These patterns indicate the
+/// session ID is stale and should be cleared + retried fresh.
+fn has_session_resume_error(output: &str) -> bool {
+    // Check for common error patterns in Claude and Codex output that indicate
+    // a session resume failure.
+    const ERROR_PATTERNS: &[&str] = &[
+        "session not found",
+        "session has expired",
+        "session_id is invalid",
+        "invalid session",
+        "could not resume session",
+        "failed to resume",
+        "no such session",
+        "session does not exist",
+        "resume failed",
+    ];
+
+    let lower = output.to_lowercase();
+    ERROR_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 /// Extract the final message text from Codex `--json` NDJSON output.
 ///
 /// Codex emits newline-delimited JSON events. The final assistant message
@@ -646,12 +670,17 @@ fn run_agent_inner(
     let _ = log(&format!("▶ Running {agent}..."), config);
 
     // Session persistence: read existing session_id if applicable.
-    // Uses the registry's `supports_session_resume` flag instead of hardcoding
-    // agent names, so Codex and future agents get resume support automatically.
-    let session_persistence_enabled = match agent.name() {
-        "claude" => config.claude_session_persistence,
-        "codex" => config.codex_session_persistence,
-        _ => config.claude_session_persistence,
+    // Uses the registry's `supports_session_resume` capability flag; the
+    // per-agent config knob controls whether to actually persist.  Unknown
+    // agents with `supports_session_resume=true` default to enabled.
+    let session_persistence_enabled = if !agent.spec().supports_session_resume {
+        false
+    } else {
+        match agent.name() {
+            "claude" => config.claude_session_persistence,
+            "codex" => config.codex_session_persistence,
+            _ => true, // resumable agent with no dedicated config — default on
+        }
     };
     let session_id = if agent.spec().supports_session_resume
         && session_persistence_enabled
@@ -893,31 +922,37 @@ fn run_agent_inner(
         return Err(AgentLoopError::Agent(reason));
     };
 
+    // Detect session resume failures — either via non-zero exit code OR
+    // error patterns in the output (some agents exit 0 but signal resume
+    // failure in their output text).  In both cases, clear the stale
+    // session ID and retry once fresh (Task 15 requirement).
+    let is_resume_failure = !exit_status.success()
+        || (session_id.is_some() && has_session_resume_error(&normalized_output));
+
+    if is_resume_failure
+        && session_id.is_some()
+        && let Some(key) = session_key
+    {
+        let _ = log(
+            &format!(
+                "Session resume failed for {}/{}, retrying fresh",
+                match role {
+                    Some(AgentRole::Implementer) => "implementer",
+                    Some(AgentRole::Reviewer) => "reviewer",
+                    Some(AgentRole::Planner) => "planner",
+                    None => "unknown",
+                },
+                agent.name()
+            ),
+            config,
+        );
+        clear_session_id(config, key);
+
+        // Retry once without session resume.
+        return run_agent_inner(agent, prompt, config, system_prompt, session_key, role);
+    }
+
     if !exit_status.success() {
-        // If we were resuming a session and it failed, clear the stale session
-        // and retry once fresh (Task 15 requirement).
-        if session_id.is_some()
-            && let Some(key) = session_key
-        {
-            let _ = log(
-                &format!(
-                    "Session resume failed for {}/{}, retrying fresh",
-                    match role {
-                        Some(AgentRole::Implementer) => "implementer",
-                        Some(AgentRole::Reviewer) => "reviewer",
-                        Some(AgentRole::Planner) => "planner",
-                        None => "unknown",
-                    },
-                    agent.name()
-                ),
-                config,
-            );
-            clear_session_id(config, key);
-
-            // Retry once without session resume.
-            return run_agent_inner(agent, prompt, config, system_prompt, session_key, role);
-        }
-
         let code = exit_status
             .code()
             .map(|value| value.to_string())
@@ -1559,5 +1594,187 @@ mod tests {
     fn extract_codex_json_text_returns_none_for_empty() {
         let output = "{\"type\":\"status\",\"value\":\"done\"}\n";
         assert_eq!(extract_codex_json_text(output), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Session resume error detection (output-signaled failures)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn has_session_resume_error_detects_session_not_found() {
+        assert!(has_session_resume_error(
+            "Error: session not found for the given ID"
+        ));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_session_expired() {
+        assert!(has_session_resume_error("The session has expired."));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_invalid_session() {
+        assert!(has_session_resume_error(
+            "session_id is invalid: sess_old123"
+        ));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_could_not_resume() {
+        assert!(has_session_resume_error(
+            "could not resume session: connection reset"
+        ));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_failed_to_resume() {
+        assert!(has_session_resume_error("Failed to resume session"));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_no_such_session() {
+        assert!(has_session_resume_error("no such session"));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_resume_failed() {
+        assert!(has_session_resume_error(
+            "Resume failed: session data corrupted"
+        ));
+    }
+
+    #[test]
+    fn has_session_resume_error_returns_false_for_normal_output() {
+        assert!(!has_session_resume_error("Hello, I completed the task."));
+    }
+
+    #[test]
+    fn has_session_resume_error_returns_false_for_empty_output() {
+        assert!(!has_session_resume_error(""));
+    }
+
+    #[test]
+    fn has_session_resume_error_is_case_insensitive() {
+        assert!(has_session_resume_error("SESSION NOT FOUND"));
+        assert!(has_session_resume_error("Invalid Session ID"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Stale session retry integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn run_agent_with_session_retries_on_nonzero_exit_with_stale_session() {
+        let _env_guard = env_lock();
+        let project = new_project(5);
+        std::fs::create_dir_all(&project.config.state_dir).expect("state dir");
+
+        // Write a stale session ID
+        let session_key = "implement-implementer-claude";
+        write_session_id(&project.config, session_key, "sess_stale_001");
+
+        // Agent script: if --resume is passed, exit 1 (simulating stale session).
+        // Otherwise, succeed with normal output.
+        project.create_executable(
+            "claude",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--resume\" ]; then\n    echo 'session error' >&2\n    exit 1\n  fi\ndone\necho 'fresh session output'\n",
+        );
+        let _path_guard = project.with_path_override();
+
+        let result = run_agent_with_session(
+            &Agent::known("claude"),
+            "test prompt",
+            &project.config,
+            None,
+            Some(session_key),
+            Some(AgentRole::Implementer),
+        );
+
+        // Should succeed because the retry without session resume works
+        assert!(result.is_ok(), "expected retry to succeed: {result:?}");
+        let output = result.unwrap();
+        assert!(
+            output.trim() == "fresh session output",
+            "unexpected output: {output:?}"
+        );
+
+        // Session ID should have been cleared
+        assert!(
+            read_session_id(&project.config, session_key).is_none(),
+            "stale session ID should be cleared after retry"
+        );
+
+        // Log should contain the retry message
+        let logs = project.read_log();
+        assert!(
+            logs.contains("Session resume failed for implementer/claude, retrying fresh"),
+            "expected retry log message"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_agent_with_session_retries_on_output_error_with_exit_zero() {
+        let _env_guard = env_lock();
+        let project = new_project(5);
+        std::fs::create_dir_all(&project.config.state_dir).expect("state dir");
+
+        // Write a stale session ID
+        let session_key = "implement-implementer-claude";
+        write_session_id(&project.config, session_key, "sess_stale_002");
+
+        // Agent script: if --resume is passed, exit 0 but emit "session not found"
+        // in the output (simulating an output-signaled resume failure).
+        // Otherwise, succeed with normal output.
+        project.create_executable(
+            "claude",
+            "#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = \"--resume\" ]; then\n    echo 'Error: session not found for sess_stale_002'\n    exit 0\n  fi\ndone\necho 'fresh session output'\n",
+        );
+        let _path_guard = project.with_path_override();
+
+        let result = run_agent_with_session(
+            &Agent::known("claude"),
+            "test prompt",
+            &project.config,
+            None,
+            Some(session_key),
+            Some(AgentRole::Implementer),
+        );
+
+        // Should succeed because the retry without session resume works
+        assert!(
+            result.is_ok(),
+            "expected output-error retry to succeed: {result:?}"
+        );
+        let output = result.unwrap();
+        assert!(
+            output.trim() == "fresh session output",
+            "unexpected output: {output:?}"
+        );
+
+        // Session ID should have been cleared
+        assert!(
+            read_session_id(&project.config, session_key).is_none(),
+            "stale session ID should be cleared after output-error retry"
+        );
+
+        // Log should contain the retry message
+        let logs = project.read_log();
+        assert!(
+            logs.contains("Session resume failed for implementer/claude, retrying fresh"),
+            "expected retry log message for output-signaled failure"
+        );
+    }
+
+    #[test]
+    fn session_persistence_disabled_for_non_resumable_agents() {
+        // Experimental agents with supports_session_resume=false should never
+        // have session persistence enabled, regardless of config settings.
+        let agent = Agent::known("gemini");
+        assert!(
+            !agent.spec().supports_session_resume,
+            "gemini should not support session resume"
+        );
     }
 }
