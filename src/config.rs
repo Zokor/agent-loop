@@ -30,14 +30,22 @@ pub enum StuckAction {
     Retry,
 }
 
+impl FromStr for StuckAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "abort" => Ok(Self::Abort),
+            "warn" => Ok(Self::Warn),
+            "retry" => Ok(Self::Retry),
+            _ => Err(format!("invalid stuck action '{s}': expected abort, warn, or retry")),
+        }
+    }
+}
+
 impl StuckAction {
     pub fn from_str_opt(s: &str) -> Option<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "abort" => Some(Self::Abort),
-            "warn" => Some(Self::Warn),
-            "retry" => Some(Self::Retry),
-            _ => None,
-        }
+        s.parse().ok()
     }
 }
 
@@ -117,7 +125,7 @@ struct FileConfig {
     stuck_action: Option<String>,
 
     // ── Wave runtime ────────────────────────────────────────────────
-    /// Seconds before a wave lock file is considered stale (default 300).
+    /// Seconds before a wave lock file is considered stale (default 30).
     wave_lock_stale_seconds: Option<u64>,
     /// Milliseconds to wait for in-flight tasks before forceful shutdown (default 30000).
     wave_shutdown_grace_ms: Option<u64>,
@@ -267,7 +275,7 @@ pub struct Config {
     pub stuck_action: StuckAction,
 
     // ── Wave runtime ────────────────────────────────────────────────
-    /// Seconds before a wave lock is considered stale (default 300).
+    /// Seconds before a wave lock is considered stale (default 30).
     pub wave_lock_stale_seconds: u64,
     /// Grace period (ms) for in-flight tasks on interrupt (default 30_000).
     pub wave_shutdown_grace_ms: u64,
@@ -427,8 +435,10 @@ impl Config {
         let planning_context_excerpt_lines =
             parse_env("PLANNING_CONTEXT_EXCERPT_LINES").or(file.planning_context_excerpt_lines);
 
-        // --- max_parallel: TOML > default ---
-        let max_parallel = file.max_parallel.unwrap_or(DEFAULT_MAX_PARALLEL);
+        // --- max_parallel: env > TOML > default ---
+        let max_parallel = parse_env("MAX_PARALLEL")
+            .or(file.max_parallel)
+            .unwrap_or(DEFAULT_MAX_PARALLEL);
         let batch_implement = env_bool("BATCH_IMPLEMENT")
             .or(file.batch_implement)
             .unwrap_or(true);
@@ -774,11 +784,26 @@ mod tests {
             "DIFF_MAX_LINES",
             "CONTEXT_LINE_CAP",
             "PLANNING_CONTEXT_EXCERPT_LINES",
+            "MAX_PARALLEL",
             "BATCH_IMPLEMENT",
             "VERBOSE",
+            "PROGRESSIVE_CONTEXT",
+            // Stuck detection
+            "STUCK_DETECTION_ENABLED",
+            "STUCK_NO_DIFF_ROUNDS",
+            "STUCK_THRESHOLD_MINUTES",
+            "STUCK_ACTION",
+            // Wave runtime
+            "WAVE_LOCK_STALE_SECONDS",
+            "WAVE_SHUTDOWN_GRACE_MS",
+            // Model selection
+            "IMPLEMENTER_MODEL",
+            "REVIEWER_MODEL",
+            "PLANNER_MODEL",
             // Claude CLI tuning
             "CLAUDE_FULL_ACCESS",
             "CLAUDE_ALLOWED_TOOLS",
+            "REVIEWER_ALLOWED_TOOLS",
             "CLAUDE_SESSION_PERSISTENCE",
             "CLAUDE_EFFORT_LEVEL",
             "CLAUDE_MAX_OUTPUT_TOKENS",
@@ -787,6 +812,7 @@ mod tests {
             "REVIEWER_EFFORT_LEVEL",
             // Codex CLI tuning
             "CODEX_FULL_ACCESS",
+            "CODEX_SESSION_PERSISTENCE",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
             unsafe {
@@ -805,6 +831,22 @@ mod tests {
     fn write_toml(project_dir: &Path, content: &str) {
         std::fs::write(project_dir.join(CONFIG_FILE_NAME), content)
             .expect("TOML file should be written");
+    }
+
+    // -----------------------------------------------------------------------
+    // StuckAction FromStr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn stuck_action_from_str_parses_valid_values() {
+        assert_eq!("abort".parse::<StuckAction>().unwrap(), StuckAction::Abort);
+        assert_eq!("Warn".parse::<StuckAction>().unwrap(), StuckAction::Warn);
+        assert_eq!("RETRY".parse::<StuckAction>().unwrap(), StuckAction::Retry);
+    }
+
+    #[test]
+    fn stuck_action_from_str_rejects_invalid_values() {
+        assert!("invalid".parse::<StuckAction>().is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1737,6 +1779,19 @@ planning_context_excerpt_lines = 75
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, DEFAULT_MAX_PARALLEL);
         assert_eq!(config.max_parallel, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_env_overrides_max_parallel() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("MAX_PARALLEL", "8");
+
+        let dir = create_temp_project_root("cfg_env_max_parallel");
+        write_toml(&dir, "max_parallel = 4\n");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.max_parallel, 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

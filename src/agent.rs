@@ -1052,6 +1052,87 @@ mod tests {
     }
 
     #[test]
+    fn resolve_command_reviewer_role_uses_read_only_tools() {
+        let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Reviewer),
+        );
+        assert!(args.contains(&"--allowedTools".to_string()));
+        assert!(args.contains(&crate::config::DEFAULT_REVIEWER_ALLOWED_TOOLS.to_string()));
+        // Reviewer should NOT get full implementer tools
+        assert!(!args.contains(&crate::config::DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()));
+    }
+
+    #[test]
+    fn resolve_command_implementer_role_uses_full_tools() {
+        let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Implementer),
+        );
+        assert!(args.contains(&"--allowedTools".to_string()));
+        assert!(args.contains(&crate::config::DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()));
+    }
+
+    #[test]
+    fn resolve_command_reviewer_allowed_tools_env_override() {
+        let mut project = new_project(5);
+        project.config.reviewer_allowed_tools = "Read,Grep".to_string();
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Reviewer),
+        );
+        assert!(args.contains(&"Read,Grep".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_codex_unchanged_for_reviewer_role() {
+        let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("codex"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Reviewer),
+        );
+        // Codex should get --full-auto regardless of role
+        assert!(args.contains(&"--full-auto".to_string()));
+        // No --allowedTools for Codex
+        assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_experimental_agent_no_special_flags() {
+        let project = new_project(5);
+        let (command, args) = resolve_command(
+            &Agent::known("gemini"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(command, "gemini");
+        // Experimental agents don't get --allowedTools or --full-auto
+        assert!(!args.contains(&"--allowedTools".to_string()));
+        assert!(!args.contains(&"--full-auto".to_string()));
+    }
+
+    #[test]
     fn resolve_command_builds_claude_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.claude_full_access = true;
@@ -1059,6 +1140,24 @@ mod tests {
         assert_eq!(command, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_claude_with_model_produces_model_flag() {
+        let project = new_project(5);
+        let agent = Agent::known("claude").with_model(Some("claude-sonnet-4-6".to_string()));
+        let (_, args) = resolve_command(&agent, "hello", &project.config, None, None, None);
+        assert!(args.contains(&"--model".to_string()));
+        assert!(args.contains(&"claude-sonnet-4-6".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_codex_with_model_produces_m_flag() {
+        let project = new_project(5);
+        let agent = Agent::known("codex").with_model(Some("o3".to_string()));
+        let (_, args) = resolve_command(&agent, "hello", &project.config, None, None, None);
+        assert!(args.contains(&"-m".to_string()));
+        assert!(args.contains(&"o3".to_string()));
     }
 
     #[test]
