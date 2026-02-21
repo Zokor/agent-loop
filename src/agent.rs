@@ -453,28 +453,81 @@ fn clear_session_id(config: &Config, session_key: &str) {
     let _ = fs::remove_file(path);
 }
 
-/// Detect session resume errors in agent output even when the process exits 0.
-///
-/// Some agents (Claude, Codex) may emit error messages about an invalid or
-/// expired session but still exit with code 0.  These patterns indicate the
-/// session ID is stale and should be cleared + retried fresh.
-fn has_session_resume_error(output: &str) -> bool {
-    // Check for common error patterns in Claude and Codex output that indicate
-    // a session resume failure.
-    const ERROR_PATTERNS: &[&str] = &[
-        "session not found",
-        "session has expired",
-        "session_id is invalid",
-        "invalid session",
-        "could not resume session",
-        "failed to resume",
-        "no such session",
-        "session does not exist",
-        "resume failed",
-    ];
+/// Error patterns that indicate a stale or invalid session ID.
+const SESSION_ERROR_PATTERNS: &[&str] = &[
+    "session not found",
+    "session has expired",
+    "session_id is invalid",
+    "invalid session",
+    "could not resume session",
+    "failed to resume",
+    "no such session",
+    "session does not exist",
+    "resume failed",
+];
 
-    let lower = output.to_lowercase();
-    ERROR_PATTERNS.iter().any(|p| lower.contains(p))
+/// Check whether a single line of text matches any session error pattern.
+fn line_matches_session_error(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    SESSION_ERROR_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
+/// Detect session resume errors in the raw agent output even when the process
+/// exits 0.
+///
+/// Unlike the previous implementation which scanned normalized assistant text,
+/// this restricts pattern matching to structured error channels to avoid
+/// false-positives when the assistant's *content* happens to discuss sessions:
+///
+/// - **Non-JSON lines** (stderr, plain error output): checked for patterns.
+/// - **JSON events with `type: "error"` or `type: "system"`**: checked.
+/// - **`type: "assistant"` / `type: "result"` content**: NOT checked, since
+///   these contain the agent's actual response text.
+fn has_session_resume_error(raw_output: &str) -> bool {
+    for line in raw_output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Non-JSON lines (typically stderr output): check for patterns.
+        if !trimmed.starts_with('{') {
+            if line_matches_session_error(trimmed) {
+                return true;
+            }
+            continue;
+        }
+
+        // JSON lines: only check error/system event types, skip assistant content.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            // Malformed JSON line — treat like plain text.
+            if line_matches_session_error(trimmed) {
+                return true;
+            }
+            continue;
+        };
+
+        let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
+            // Error and system events are genuine error channels.
+            "error" | "system" => {
+                // Check the entire JSON line for error patterns.
+                if line_matches_session_error(trimmed) {
+                    return true;
+                }
+            }
+            // Assistant/result events contain the agent's response text —
+            // skip these to avoid false-positives.
+            "assistant" | "result" | "message" => {}
+            // Unknown event types: check conservatively.
+            _ => {
+                if line_matches_session_error(trimmed) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Extract the final message text from Codex `--json` NDJSON output.
@@ -659,6 +712,24 @@ pub fn run_agent_with_session(
     run_agent_inner(agent, prompt, config, system_prompt, session_key, role)
 }
 
+/// Select the effective Claude effort level based on the agent's role.
+///
+/// Role-specific levels (`implementer_effort_level`, `reviewer_effort_level`)
+/// take precedence, falling back to the generic `claude_effort_level`.
+fn effective_effort_level(role: Option<AgentRole>, config: &Config) -> Option<&str> {
+    match role {
+        Some(AgentRole::Implementer) => config
+            .implementer_effort_level
+            .as_deref()
+            .or(config.claude_effort_level.as_deref()),
+        Some(AgentRole::Reviewer) => config
+            .reviewer_effort_level
+            .as_deref()
+            .or(config.claude_effort_level.as_deref()),
+        _ => config.claude_effort_level.as_deref(),
+    }
+}
+
 fn run_agent_inner(
     agent: &Agent,
     prompt: &str,
@@ -714,18 +785,7 @@ fn run_agent_inner(
     if agent.name() == "claude" {
         cmd.env("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
 
-        let effective_effort = match session_key {
-            Some("implementer") => config
-                .implementer_effort_level
-                .as_deref()
-                .or(config.claude_effort_level.as_deref()),
-            Some("reviewer") => config
-                .reviewer_effort_level
-                .as_deref()
-                .or(config.claude_effort_level.as_deref()),
-            _ => config.claude_effort_level.as_deref(),
-        };
-        if let Some(effort) = effective_effort {
+        if let Some(effort) = effective_effort_level(role, config) {
             cmd.env("CLAUDE_CODE_EFFORT_LEVEL", effort);
         }
         if let Some(max) = config.claude_max_output_tokens {
@@ -892,6 +952,13 @@ fn run_agent_inner(
         }
     }
 
+    // Check for session resume errors in the raw output BEFORE normalization
+    // strips structural information.  This scans error/system JSON events and
+    // non-JSON (stderr) lines only — assistant content is excluded to avoid
+    // false-positives when the agent merely discusses sessions.
+    let raw_has_resume_error =
+        session_id.is_some() && has_session_resume_error(&combined_output);
+
     let normalized_output = normalize_agent_output(agent, combined_output);
     if let Err(err) = append_response_block(agent, &normalized_output, config) {
         let _ = log(&format!("⚠ {agent} error: {err}"), config);
@@ -923,11 +990,9 @@ fn run_agent_inner(
     };
 
     // Detect session resume failures — either via non-zero exit code OR
-    // error patterns in the output (some agents exit 0 but signal resume
-    // failure in their output text).  In both cases, clear the stale
-    // session ID and retry once fresh (Task 15 requirement).
-    let is_resume_failure = !exit_status.success()
-        || (session_id.is_some() && has_session_resume_error(&normalized_output));
+    // error patterns in the raw output's error channels (some agents exit 0
+    // but signal resume failure via error events or stderr).
+    let is_resume_failure = !exit_status.success() || raw_has_resume_error;
 
     if is_resume_failure
         && session_id.is_some()
@@ -1600,6 +1665,7 @@ mod tests {
     // Session resume error detection (output-signaled failures)
     // -----------------------------------------------------------------------
 
+    // Plain-text (stderr) error lines — detected
     #[test]
     fn has_session_resume_error_detects_session_not_found() {
         assert!(has_session_resume_error(
@@ -1657,6 +1723,57 @@ mod tests {
     fn has_session_resume_error_is_case_insensitive() {
         assert!(has_session_resume_error("SESSION NOT FOUND"));
         assert!(has_session_resume_error("Invalid Session ID"));
+    }
+
+    // JSON error events — detected
+    #[test]
+    fn has_session_resume_error_detects_json_error_event() {
+        let raw = "{\"type\":\"error\",\"message\":\"session not found\"}\n";
+        assert!(has_session_resume_error(raw));
+    }
+
+    #[test]
+    fn has_session_resume_error_detects_json_system_event() {
+        let raw = "{\"type\":\"system\",\"error\":\"invalid session\"}\n";
+        assert!(has_session_resume_error(raw));
+    }
+
+    // Assistant/result content — NOT detected (false-positive guard)
+    #[test]
+    fn has_session_resume_error_ignores_assistant_content_discussing_sessions() {
+        // An assistant event whose content happens to discuss "session not found"
+        // should NOT trigger a retry.
+        let raw = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"The error 'session not found' occurs when...\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"To fix 'invalid session' errors, check your config.\"}\n"
+        );
+        assert!(
+            !has_session_resume_error(raw),
+            "assistant/result content should not trigger session error detection"
+        );
+    }
+
+    #[test]
+    fn has_session_resume_error_ignores_codex_message_content_discussing_sessions() {
+        // A Codex message event whose content discusses session errors.
+        let raw = "{\"type\":\"message\",\"content\":\"The session not found error means the ID expired.\"}\n";
+        assert!(
+            !has_session_resume_error(raw),
+            "message content should not trigger session error detection"
+        );
+    }
+
+    #[test]
+    fn has_session_resume_error_mixed_events_detects_error_channel_only() {
+        // Mix of assistant content (discussing sessions) and an actual error event.
+        let raw = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"session not found in the docs\"}]}}\n",
+            "{\"type\":\"error\",\"message\":\"failed to resume: session expired\"}\n"
+        );
+        assert!(
+            has_session_resume_error(raw),
+            "should detect error in the error event, not the assistant content"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1775,6 +1892,85 @@ mod tests {
         assert!(
             !agent.spec().supports_session_resume,
             "gemini should not support session resume"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Role-specific effort level selection (regression for session key format)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn effective_effort_level_uses_implementer_effort_for_implementer_role() {
+        let mut project = new_project(5);
+        project.config.implementer_effort_level = Some("high".to_string());
+        project.config.reviewer_effort_level = Some("low".to_string());
+        project.config.claude_effort_level = Some("medium".to_string());
+
+        // Implementer role should use implementer_effort_level
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Implementer), &project.config),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn effective_effort_level_uses_reviewer_effort_for_reviewer_role() {
+        let mut project = new_project(5);
+        project.config.implementer_effort_level = Some("high".to_string());
+        project.config.reviewer_effort_level = Some("low".to_string());
+        project.config.claude_effort_level = Some("medium".to_string());
+
+        // Reviewer role should use reviewer_effort_level
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Reviewer), &project.config),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn effective_effort_level_falls_back_to_generic_when_role_specific_unset() {
+        let mut project = new_project(5);
+        project.config.implementer_effort_level = None;
+        project.config.reviewer_effort_level = None;
+        project.config.claude_effort_level = Some("medium".to_string());
+
+        // With no role-specific setting, falls back to generic
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Implementer), &project.config),
+            Some("medium")
+        );
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Reviewer), &project.config),
+            Some("medium")
+        );
+    }
+
+    #[test]
+    fn effective_effort_level_returns_none_when_nothing_configured() {
+        let project = new_project(5);
+        // All effort levels default to None
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Implementer), &project.config),
+            None
+        );
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Reviewer), &project.config),
+            None
+        );
+        assert_eq!(effective_effort_level(None, &project.config), None);
+    }
+
+    #[test]
+    fn effective_effort_level_planner_role_uses_generic_fallback() {
+        let mut project = new_project(5);
+        project.config.implementer_effort_level = Some("high".to_string());
+        project.config.reviewer_effort_level = Some("low".to_string());
+        project.config.claude_effort_level = Some("medium".to_string());
+
+        // Planner role has no dedicated field; falls back to generic
+        assert_eq!(
+            effective_effort_level(Some(AgentRole::Planner), &project.config),
+            Some("medium")
         );
     }
 }
