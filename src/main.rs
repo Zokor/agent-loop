@@ -2071,23 +2071,6 @@ fn status_command() -> Result<i32, AgentLoopError> {
         }
     }
 
-    // Wave lock info.
-    let wave_lock_path = config.state_dir.join("wave.lock");
-    if wave_lock_path.exists()
-        && let Ok(lock_content) = fs::read_to_string(&wave_lock_path)
-        && let Ok(lock) =
-            serde_json::from_str::<wave_runtime::LockFileContent>(&lock_content)
-    {
-        println!();
-        println!(
-            "Wave lock: PID {}, started {}, mode={}, max_parallel={}",
-            lock.pid, lock.started_at, lock.mode, lock.max_parallel
-        );
-        if !wave_runtime::is_pid_alive(lock.pid) {
-            println!("  ⚠ Lock owner PID {} is dead — may be stale", lock.pid);
-        }
-    }
-
     // Recent wave progress events.
     let journal_path = config.state_dir.join("wave-progress.jsonl");
     let recent = wave_runtime::read_recent_events(&journal_path, 5);

@@ -1084,7 +1084,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_reviewer_allowed_tools_env_override() {
+    fn resolve_command_reviewer_custom_allowed_tools() {
         let mut project = new_project(5);
         project.config.reviewer_allowed_tools = "Read,Grep".to_string();
         let (_, args) = resolve_command(
