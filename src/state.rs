@@ -30,6 +30,7 @@ pub enum Status {
     NeedsChanges,
     NeedsRevision,
     MaxRounds,
+    Stuck,
     Error,
     Interrupted,
 }
@@ -47,6 +48,7 @@ impl fmt::Display for Status {
             Self::NeedsChanges => "NEEDS_CHANGES",
             Self::NeedsRevision => "NEEDS_REVISION",
             Self::MaxRounds => "MAX_ROUNDS",
+            Self::Stuck => "STUCK",
             Self::Error => "ERROR",
             Self::Interrupted => "INTERRUPTED",
         };
@@ -844,6 +846,87 @@ pub fn read_findings(config: &Config) -> FindingsFile {
 pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
     write_state_file("findings.json", &serialized, config)
+}
+
+// ---------------------------------------------------------------------------
+// Planning findings (planning_findings.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanningFindingStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningFindingEntry {
+    pub id: String,
+    pub description: String,
+    pub status: PlanningFindingStatus,
+    pub round_introduced: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_resolved: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanningFindingsFile {
+    pub findings: Vec<PlanningFindingEntry>,
+}
+
+pub fn read_planning_findings(config: &Config) -> PlanningFindingsFile {
+    let raw = read_state_file("planning_findings.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return PlanningFindingsFile::default();
+    }
+    serde_json::from_str(trimmed).unwrap_or_default()
+}
+
+pub fn write_planning_findings(
+    findings: &PlanningFindingsFile,
+    config: &Config,
+) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
+    write_state_file("planning_findings.json", &serialized, config)
+}
+
+pub fn open_planning_findings_for_prompt(findings: &PlanningFindingsFile) -> String {
+    let open: Vec<&PlanningFindingEntry> = findings
+        .findings
+        .iter()
+        .filter(|f| f.status == PlanningFindingStatus::Open)
+        .collect();
+    if open.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Open planning findings:\n");
+    for f in &open {
+        out.push_str(&format!("- {}: {}\n", f.id, f.description));
+    }
+    out
+}
+
+pub fn next_planning_finding_id(findings: &PlanningFindingsFile) -> String {
+    let max_num = findings
+        .findings
+        .iter()
+        .filter_map(|f| f.id.strip_prefix("P-").and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(0);
+    format!("P-{:03}", max_num + 1)
+}
+
+pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {
+    let progress_path = config.state_dir.join("planning-progress.md");
+    let entry = format!("\n## Round {round}\n{summary}\n");
+    if let Ok(mut file) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&progress_path)
+    {
+        let _ = file.write_all(entry.as_bytes());
+    }
 }
 
 // ---------------------------------------------------------------------------

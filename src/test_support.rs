@@ -14,7 +14,8 @@ use std::{
 use crate::config::{
     Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
     DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS,
-    DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS, QualityCommand, RunMode,
+    DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_TIMEOUT_SECONDS,
+    QualityCommand, RunMode,
 };
 
 #[derive(Debug, Clone)]
@@ -37,8 +38,17 @@ pub struct TestConfigOptions {
     pub max_parallel: u32,
     pub batch_implement: bool,
     pub verbose: bool,
+    pub progressive_context: bool,
+    pub stuck_detection_enabled: bool,
+    pub stuck_no_diff_rounds: u32,
+    pub stuck_threshold_minutes: u64,
+    pub stuck_action: crate::config::StuckAction,
+    pub wave_lock_stale_seconds: u64,
+    pub wave_shutdown_grace_ms: u64,
+    pub planner_model: Option<String>,
     pub claude_full_access: bool,
     pub claude_allowed_tools: String,
+    pub reviewer_allowed_tools: String,
     pub claude_session_persistence: bool,
     pub claude_effort_level: Option<String>,
     pub claude_max_output_tokens: Option<u32>,
@@ -55,7 +65,7 @@ impl Default for TestConfigOptions {
             planning_max_rounds: DEFAULT_PLANNING_MAX_ROUNDS,
             decomposition_max_rounds: DEFAULT_DECOMPOSITION_MAX_ROUNDS,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
-            implementer: Agent::Claude,
+            implementer: Agent::known("claude"),
             single_agent: false,
             auto_commit: true,
             auto_test: false,
@@ -69,8 +79,17 @@ impl Default for TestConfigOptions {
             max_parallel: DEFAULT_MAX_PARALLEL,
             batch_implement: true,
             verbose: false,
+            progressive_context: false,
+            stuck_detection_enabled: false,
+            stuck_no_diff_rounds: crate::config::DEFAULT_STUCK_NO_DIFF_ROUNDS,
+            stuck_threshold_minutes: crate::config::DEFAULT_STUCK_THRESHOLD_MINUTES,
+            stuck_action: crate::config::StuckAction::Warn,
+            wave_lock_stale_seconds: 300,
+            wave_shutdown_grace_ms: 30_000,
+            planner_model: None,
             claude_full_access: false,
             claude_allowed_tools: DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string(),
+            reviewer_allowed_tools: DEFAULT_REVIEWER_ALLOWED_TOOLS.to_string(),
             claude_session_persistence: true,
             claude_effort_level: None,
             claude_max_output_tokens: None,
@@ -84,12 +103,9 @@ impl Default for TestConfigOptions {
 
 pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
     let reviewer = if options.single_agent {
-        options.implementer
+        options.implementer.clone()
     } else {
-        match options.implementer {
-            Agent::Claude => Agent::Codex,
-            Agent::Codex => Agent::Claude,
-        }
+        crate::config::default_reviewer_for(&options.implementer)
     };
 
     Config {
@@ -119,8 +135,17 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         max_parallel: options.max_parallel,
         batch_implement: options.batch_implement,
         verbose: options.verbose,
+        progressive_context: options.progressive_context,
+        stuck_detection_enabled: options.stuck_detection_enabled,
+        stuck_no_diff_rounds: options.stuck_no_diff_rounds,
+        stuck_threshold_minutes: options.stuck_threshold_minutes,
+        stuck_action: options.stuck_action,
+        wave_lock_stale_seconds: options.wave_lock_stale_seconds,
+        wave_shutdown_grace_ms: options.wave_shutdown_grace_ms,
+        planner_model: options.planner_model.clone(),
         claude_full_access: options.claude_full_access,
         claude_allowed_tools: options.claude_allowed_tools.clone(),
+        reviewer_allowed_tools: options.reviewer_allowed_tools.clone(),
         claude_session_persistence: options.claude_session_persistence,
         claude_effort_level: options.claude_effort_level.clone(),
         claude_max_output_tokens: options.claude_max_output_tokens,

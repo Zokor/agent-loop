@@ -5,14 +5,15 @@ use std::time::{Duration, Instant};
 
 use crate::{
     agent::run_agent_with_session,
-    config::{Agent, Config},
+    config::{Agent, Config, StuckAction},
     error::AgentLoopError,
+    stuck::{StuckDetector, StuckSignal},
     git::{git_checkpoint, git_diff_for_review, git_rev_parse_head},
     prompts::{
         AgentRole, compound_prompt, decomposition_initial_prompt, decomposition_reviewer_prompt,
         decomposition_revision_prompt, gather_project_context,
         implementation_adversarial_review_prompt, implementation_consensus_prompt,
-        implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
+        implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths, state_manifest,
         planning_implementer_revision_prompt, planning_initial_prompt, planning_reviewer_prompt,
         role_for_agent, system_prompt_for_role,
     },
@@ -333,7 +334,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     run_agent_fn: &mut FRunAgent,
     log_fn: &mut FLog,
 ) where
-    FRunAgent: FnMut(crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(&crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
     FLog: FnMut(&str, &Config),
 {
     if !config.compound {
@@ -341,7 +342,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     }
 
     log_fn("🧠 Running compound learning phase...", config);
-    if let Err(err) = run_agent_fn(config.implementer, &compound_prompt(task, plan), config) {
+    if let Err(err) = run_agent_fn(&config.implementer, &compound_prompt(task, plan), config) {
         log_fn(
             &format!("WARN: compound phase failed (continuing): {err}"),
             config,
@@ -357,7 +358,7 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
         task,
         plan,
         config,
-        &mut |agent, prompt, current_config| {
+        &mut |agent: &crate::config::Agent, prompt, current_config| {
             let role = role_for_agent(agent, current_config);
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
@@ -365,11 +366,13 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
             } else {
                 Some(sp.as_str())
             };
-            let session_key = match role {
+            let role_str = match role {
                 AgentRole::Implementer => "implementer",
                 AgentRole::Reviewer => "reviewer",
+                AgentRole::Planner => "planner",
             };
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+            let session_key = format!("{}-{}", role_str, agent.name());
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
                 .map(|_| ())
         },
         &mut |message, current_config| {
@@ -423,6 +426,7 @@ fn transition_label(patch: &StatusPatch) -> &'static str {
             Status::NeedsChanges => "NEEDS_CHANGES",
             Status::NeedsRevision => "NEEDS_REVISION",
             Status::MaxRounds => "MAX_ROUNDS",
+            Status::Stuck => "STUCK",
             Status::Error => "ERROR",
             Status::Interrupted => "INTERRUPTED",
         },
@@ -466,7 +470,7 @@ fn status_error_reason(status: &LoopStatus) -> String {
 
 fn run_agent_or_record_error(
     config: &Config,
-    agent: Agent,
+    agent: &Agent,
     prompt: &str,
     round: Option<u32>,
     role: AgentRole,
@@ -477,11 +481,13 @@ fn run_agent_or_record_error(
     } else {
         Some(sp.as_str())
     };
-    let session_key = match role {
+    let role_str = match role {
         AgentRole::Implementer => "implementer",
         AgentRole::Reviewer => "reviewer",
+        AgentRole::Planner => "planner",
     };
-    match run_agent_with_session(agent, prompt, config, sp_ref, Some(session_key)) {
+    let session_key = format!("{}-{}", role_str, agent.name());
+    match run_agent_with_session(agent, prompt, config, sp_ref, Some(&session_key)) {
         Ok(_) => true,
         Err(AgentLoopError::Interrupted(reason)) => {
             let _ = write_status(
@@ -1103,20 +1109,27 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
     let task = read_state_file("task.md", config);
     let paths = phase_paths(config);
-    let project_context = gather_project_context(
-        &config.project_dir,
-        config.effective_context_line_cap() as usize,
-        config.effective_planning_context_excerpt_lines() as usize,
-    );
-    let decisions = read_decisions(config);
+    let (project_context, decisions) = if config.progressive_context {
+        let _ = log("📋 Progressive context mode — agents will explore on-demand", config);
+        (state_manifest(config), String::new())
+    } else {
+        (
+            gather_project_context(
+                &config.project_dir,
+                config.effective_context_line_cap() as usize,
+                config.effective_planning_context_excerpt_lines() as usize,
+            ),
+            read_decisions(config),
+        )
+    };
 
     let _ = log("📝 Implementer proposing plan...", config);
     if !run_agent_or_record_error(
         config,
-        config.implementer,
+        &config.implementer,
         &planning_initial_prompt(&task, &project_context, &decisions, &paths),
         Some(0),
-        AgentRole::Implementer,
+        AgentRole::Planner,
     ) {
         return false;
     }
@@ -1137,11 +1150,16 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
         let plan = read_state_file("plan.md", config);
 
+        // Read open planning findings for the reviewer prompt.
+        let planning_findings = crate::state::read_planning_findings(config);
+        let open_findings_text =
+            crate::state::open_planning_findings_for_prompt(&planning_findings);
+
         let _ = log("🔍 Reviewer evaluating plan...", config);
         let reviewer_prompt_timestamp = timestamp();
         if !run_agent_or_record_error(
             config,
-            config.reviewer,
+            &config.reviewer,
             &planning_reviewer_prompt(
                 config,
                 &task,
@@ -1150,6 +1168,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 &reviewer_prompt_timestamp,
                 &paths,
                 dispute_reason.as_deref(),
+                &open_findings_text,
             ),
             Some(planning_round),
             AgentRole::Reviewer,
@@ -1178,6 +1197,14 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             review_status = read_status(config);
         }
 
+        // Append planning progress after each reviewer round.
+        let progress_summary = format!(
+            "Reviewer: {} — {}",
+            review_status.status,
+            review_status.reason.as_deref().unwrap_or("(no reason)")
+        );
+        crate::state::append_planning_progress(planning_round, &progress_summary, config);
+
         match planning_reviewer_action(review_status.status) {
             PlanningReviewerAction::NeedsRevision => {
                 let _ = log(
@@ -1193,7 +1220,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 let implementer_prompt_timestamp = timestamp();
                 if !run_agent_or_record_error(
                     config,
-                    config.implementer,
+                    &config.implementer,
                     &planning_implementer_revision_prompt(
                         config,
                         &task,
@@ -1207,7 +1234,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                         &paths,
                     ),
                     Some(planning_round),
-                    AgentRole::Implementer,
+                    AgentRole::Planner,
                 ) {
                     return false;
                 }
@@ -1412,14 +1439,18 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         if round == 1 {
             let _ = log("📋 Implementer breaking down plan into tasks...", config);
-            let project_context = gather_project_context(
-                &config.project_dir,
-                config.effective_context_line_cap() as usize,
-                config.effective_planning_context_excerpt_lines() as usize,
-            );
+            let project_context = if config.progressive_context {
+                state_manifest(config)
+            } else {
+                gather_project_context(
+                    &config.project_dir,
+                    config.effective_context_line_cap() as usize,
+                    config.effective_planning_context_excerpt_lines() as usize,
+                )
+            };
             if !run_agent_or_record_error(
                 config,
-                config.implementer,
+                &config.implementer,
                 &decomposition_initial_prompt(&task, &plan, &project_context, &paths),
                 Some(round),
                 AgentRole::Implementer,
@@ -1439,7 +1470,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             let implementer_prompt_timestamp = timestamp();
             if !run_agent_or_record_error(
                 config,
-                config.implementer,
+                &config.implementer,
                 &decomposition_revision_prompt(
                     config,
                     &task,
@@ -1492,7 +1523,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         if !run_agent_or_record_error(
             config,
-            config.reviewer,
+            &config.reviewer,
             &decomposition_reviewer_prompt(
                 config,
                 &plan,
@@ -1622,7 +1653,7 @@ fn implementation_loop_internal<
     resume: bool,
 ) -> bool
 where
-    FRunAgent: FnMut(crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(&crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
     FCheckpoint: FnMut(&str, &Config, &HashSet<String>),
     FLog: FnMut(&str, &Config),
     FWriteStatus: FnMut(StatusPatch, &Config),
@@ -1704,6 +1735,12 @@ where
         return false;
     }
 
+    let mut stuck_detector = StuckDetector::new(
+        config.stuck_detection_enabled,
+        config.stuck_no_diff_rounds,
+        config.stuck_threshold_minutes,
+    );
+
     for round in start_round..=config.max_rounds {
         log_fn(
             &format!("━━━ Round {round}/{} ━━━", config.max_rounds),
@@ -1735,7 +1772,7 @@ where
 
         log_fn("🔨 Implementer working...", config);
         if let Err(err) = run_agent_fn(
-            config.implementer,
+            &config.implementer,
             &implementation_implementer_prompt(
                 round,
                 &task,
@@ -1772,6 +1809,50 @@ where
 
         let diff = git_diff_for_review_fn(pre_impl_head.as_deref(), config);
 
+        // --- Stuck detection ---
+        let stuck_signal = stuck_detector.observe_round(&diff);
+        if stuck_signal != StuckSignal::Ok {
+            let signal_msg = match &stuck_signal {
+                StuckSignal::NoDiffProgress { consecutive_rounds } => {
+                    format!("No diff progress for {consecutive_rounds} consecutive rounds")
+                }
+                StuckSignal::Oscillating => "Oscillating diff pattern detected (A → B → A)".to_string(),
+                StuckSignal::TimeThresholdExceeded { elapsed_minutes } => {
+                    format!("Wall-clock threshold exceeded ({elapsed_minutes} minutes)")
+                }
+                StuckSignal::Ok => unreachable!(),
+            };
+
+            match config.stuck_action {
+                StuckAction::Abort => {
+                    log_fn(&format!("🛑 Stuck detected — aborting: {signal_msg}"), config);
+                    write_status_fn(
+                        StatusPatch {
+                            status: Some(Status::Stuck),
+                            round: Some(round),
+                            reason: Some(signal_msg.clone()),
+                            ..StatusPatch::default()
+                        },
+                        config,
+                    );
+                    record_struggle_signal(&task, &signal_msg, round, config);
+                    return false;
+                }
+                StuckAction::Warn => {
+                    log_fn(&format!("⚠ Stuck detected — continuing: {signal_msg}"), config);
+                    record_struggle_signal(&task, &signal_msg, round, config);
+                }
+                StuckAction::Retry => {
+                    log_fn(
+                        &format!("🔄 Stuck detected — skipping reviewer, retrying: {signal_msg}"),
+                        config,
+                    );
+                    record_struggle_signal(&task, &signal_msg, round, config);
+                    continue;
+                }
+            }
+        }
+
         let quality_checks_output = run_quality_checks(config);
 
         let reviewer_history = read_history_fn(config, HISTORY_MAX_LINES);
@@ -1787,7 +1868,7 @@ where
 
         let reviewer_prompt_timestamp = timestamp_fn();
         if let Err(err) = run_agent_fn(
-            config.reviewer,
+            &config.reviewer,
             &implementation_reviewer_prompt(
                 config,
                 &task,
@@ -1954,7 +2035,7 @@ where
                     let adversarial_timestamp = timestamp_fn();
 
                     if let Err(err) = run_agent_fn(
-                        config.reviewer,
+                        &config.reviewer,
                         &implementation_adversarial_review_prompt(
                             config,
                             &task,
@@ -2073,7 +2154,7 @@ where
                             ));
                             let consensus_prompt_timestamp = timestamp_fn();
                             if let Err(err) = run_agent_fn(
-                                config.implementer,
+                                &config.implementer,
                                 &implementation_consensus_prompt(
                                     config,
                                     &task,
@@ -2239,7 +2320,7 @@ where
                     ));
                     let consensus_prompt_timestamp = timestamp_fn();
                     if let Err(err) = run_agent_fn(
-                        config.implementer,
+                        &config.implementer,
                         &implementation_consensus_prompt(
                             config,
                             &task,
@@ -2407,7 +2488,7 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent, prompt, current_config| {
+        |agent: &crate::config::Agent, prompt, current_config| {
             let role = role_for_agent(agent, current_config);
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
@@ -2415,11 +2496,13 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
             } else {
                 Some(sp.as_str())
             };
-            let session_key = match role {
+            let role_str = match role {
                 AgentRole::Implementer => "implementer",
                 AgentRole::Reviewer => "reviewer",
+                AgentRole::Planner => "planner",
             };
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+            let session_key = format!("{}-{}", role_str, agent.name());
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
                 .map(|_| ())
         },
         |message, current_config, current_baseline| {
@@ -2455,7 +2538,7 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent, prompt, current_config| {
+        |agent: &crate::config::Agent, prompt, current_config| {
             let role = role_for_agent(agent, current_config);
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
@@ -2463,11 +2546,13 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
             } else {
                 Some(sp.as_str())
             };
-            let session_key = match role {
+            let role_str = match role {
                 AgentRole::Implementer => "implementer",
                 AgentRole::Reviewer => "reviewer",
+                AgentRole::Planner => "planner",
             };
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+            let session_key = format!("{}-{}", role_str, agent.name());
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
                 .map(|_| ())
         },
         |message, current_config, current_baseline| {
@@ -2603,7 +2688,7 @@ mod tests {
             "Task",
             "Plan",
             &enabled,
-            &mut |_agent, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent, _prompt, _config| {
                 enabled_calls += 1;
                 Ok(())
             },
@@ -2616,7 +2701,7 @@ mod tests {
             "Task",
             "Plan",
             &disabled,
-            &mut |_agent, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent, _prompt, _config| {
                 disabled_calls += 1;
                 Ok(())
             },

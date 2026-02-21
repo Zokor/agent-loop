@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::time::Duration;
 
-use crate::config::{Agent, Config};
+use crate::config::Config;
 use crate::error::AgentLoopError;
 
 /// Maximum time to wait for a `--version` probe before assuming the binary is
@@ -9,22 +9,24 @@ use crate::error::AgentLoopError;
 /// if a CLI hangs.
 const BINARY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn install_hint(binary: &str) -> &str {
-    match binary {
-        "claude" => "Install claude: npm install -g @anthropic-ai/claude-code",
-        "codex" => "Install codex: npm install -g @openai/codex",
-        "git" => "Install git: https://git-scm.com/downloads",
-        _ => "",
+fn install_hint(binary: &str) -> String {
+    if binary == "git" {
+        return "Install git: https://git-scm.com/downloads".to_string();
     }
+    // Look up agent-specific install hint from registry
+    if let Some(spec) = crate::agent_registry::get_agent_spec(binary) {
+        return spec.install_hint.to_string();
+    }
+    String::new()
 }
 
-fn check_binary_available(binary: &str) -> bool {
-    let mut child = match Command::new(binary)
-        .arg("--version")
+fn check_binary_available(binary: &str, probe_args: &[&str]) -> bool {
+    let mut cmd = Command::new(binary);
+    cmd.args(probe_args)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
+        .stderr(std::process::Stdio::null());
+
+    let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(_) => return false,
     };
@@ -47,33 +49,31 @@ fn check_binary_available(binary: &str) -> bool {
     }
 }
 
-fn required_agent_binaries(config: &Config) -> Vec<&'static str> {
-    let mut binaries = Vec::new();
+fn required_agents(config: &Config) -> Vec<&crate::config::Agent> {
+    let mut agents = vec![&config.implementer];
 
-    let agent_binary = |agent: Agent| -> &'static str {
-        match agent {
-            Agent::Claude => "claude",
-            Agent::Codex => "codex",
-        }
-    };
-
-    let implementer_bin = agent_binary(config.implementer);
-    binaries.push(implementer_bin);
-
-    let reviewer_bin = agent_binary(config.reviewer);
-    if reviewer_bin != implementer_bin {
-        binaries.push(reviewer_bin);
+    if config.reviewer.spec().binary != config.implementer.spec().binary {
+        agents.push(&config.reviewer);
     }
 
-    binaries
+    agents
 }
 
 fn check_agent_binaries(config: &Config) -> Result<(), AgentLoopError> {
-    let binaries = required_agent_binaries(config);
-    let missing: Vec<&str> = binaries
-        .into_iter()
-        .filter(|bin| !check_binary_available(bin))
-        .collect();
+    let agents = required_agents(config);
+    let mut missing = Vec::new();
+
+    for agent in &agents {
+        let spec = agent.spec();
+        if !check_binary_available(spec.binary, spec.probe_args) {
+            missing.push(spec);
+        } else if spec.tier == crate::agent_registry::Tier::Experimental {
+            eprintln!(
+                "⚠ Agent '{}' is experimental — behavior may change between releases.",
+                spec.name,
+            );
+        }
+    }
 
     if missing.is_empty() {
         return Ok(());
@@ -81,12 +81,12 @@ fn check_agent_binaries(config: &Config) -> Result<(), AgentLoopError> {
 
     let details = missing
         .iter()
-        .map(|bin| {
-            let hint = install_hint(bin);
+        .map(|spec| {
+            let hint = install_hint(spec.binary);
             if hint.is_empty() {
-                format!("  - '{bin}' not found in PATH")
+                format!("  - '{}' not found in PATH", spec.binary)
             } else {
-                format!("  - '{bin}' not found in PATH. {hint}")
+                format!("  - '{}' not found in PATH. {hint}", spec.binary)
             }
         })
         .collect::<Vec<_>>()
@@ -126,7 +126,7 @@ fn check_git_when_required(config: &Config) -> Result<(), AgentLoopError> {
         return Ok(());
     }
 
-    if check_binary_available("git") {
+    if check_binary_available("git", &["--version"]) {
         return Ok(());
     }
 
@@ -136,8 +136,41 @@ fn check_git_when_required(config: &Config) -> Result<(), AgentLoopError> {
     )))
 }
 
-pub fn run_preflight(config: &Config) -> Result<(), AgentLoopError> {
+fn validate_session_resume_support(config: &Config) {
+    if !config.claude_session_persistence {
+        return;
+    }
+    for agent in required_agents(config) {
+        if !agent.spec().supports_session_resume {
+            eprintln!(
+                "⚠ Agent '{}' does not support session resume. Session persistence disabled for this agent.",
+                agent.name(),
+            );
+        }
+    }
+}
+
+fn validate_model_support(config: &mut Config) {
+    if config.implementer.model().is_some() && !config.implementer.spec().supports_model_flag {
+        eprintln!(
+            "⚠ Agent '{}' does not support --model. Clearing implementer_model.",
+            config.implementer.name(),
+        );
+        config.implementer.clear_model();
+    }
+    if config.reviewer.model().is_some() && !config.reviewer.spec().supports_model_flag {
+        eprintln!(
+            "⚠ Agent '{}' does not support --model. Clearing reviewer_model.",
+            config.reviewer.name(),
+        );
+        config.reviewer.clear_model();
+    }
+}
+
+pub fn run_preflight(config: &mut Config) -> Result<(), AgentLoopError> {
     check_agent_binaries(config)?;
+    validate_model_support(config);
+    validate_session_resume_support(config);
     check_git_when_required(config)?;
     Ok(())
 }
@@ -153,31 +186,33 @@ mod tests {
         // `/bin/sh` is the POSIX-mandated shell and is reliably available on all
         // Unix-like systems (macOS, Linux).  Using it avoids portability issues
         // with `echo` which is a shell built-in on some platforms.
-        assert!(check_binary_available("/bin/sh"));
+        assert!(check_binary_available("/bin/sh", &["--version"]));
     }
 
     #[test]
     fn check_binary_available_returns_false_for_missing_binary() {
         assert!(!check_binary_available(
-            "agent_loop_nonexistent_binary_xyz_42"
+            "agent_loop_nonexistent_binary_xyz_42",
+            &["--version"],
         ));
     }
 
     #[test]
-    fn required_agent_binaries_single_agent_returns_one() {
+    fn required_agents_single_agent_returns_one() {
         let project = TestProject::builder("preflight_single")
             .single_agent(true)
             .build();
-        let binaries = required_agent_binaries(&project.config);
-        assert_eq!(binaries.len(), 1);
-        assert_eq!(binaries[0], "claude");
+        let agents = required_agents(&project.config);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].spec().binary, "claude");
     }
 
     #[test]
-    fn required_agent_binaries_dual_agent_returns_two() {
+    fn required_agents_dual_agent_returns_two() {
         let project = TestProject::builder("preflight_dual").build();
-        let binaries = required_agent_binaries(&project.config);
-        assert_eq!(binaries.len(), 2);
+        let agents = required_agents(&project.config);
+        assert_eq!(agents.len(), 2);
+        let binaries: Vec<&str> = agents.iter().map(|a| a.spec().binary).collect();
         assert!(binaries.contains(&"claude"));
         assert!(binaries.contains(&"codex"));
     }
@@ -294,13 +329,13 @@ mod tests {
     #[test]
     fn run_preflight_errors_on_missing_agent_binary() {
         let _guard = env_lock();
-        let project = TestProject::builder("preflight_run_missing")
+        let mut project = TestProject::builder("preflight_run_missing")
             .auto_commit(false)
             .build();
 
         let _path_override = project.with_path_override();
 
-        let err = run_preflight(&project.config)
+        let err = run_preflight(&mut project.config)
             .expect_err("should fail when agent binaries are missing");
         assert!(err.to_string().contains("not found in PATH"));
     }
@@ -309,7 +344,7 @@ mod tests {
     #[test]
     fn run_preflight_succeeds_with_all_binaries_present() {
         let _guard = env_lock();
-        let project = TestProject::builder("preflight_run_ok")
+        let mut project = TestProject::builder("preflight_run_ok")
             .auto_commit(false)
             .build();
 
@@ -317,14 +352,14 @@ mod tests {
         project.create_executable("codex", "#!/bin/sh\necho codex\n");
         let _path_override = project.with_path_override();
 
-        run_preflight(&project.config).expect("should succeed with all binaries present");
+        run_preflight(&mut project.config).expect("should succeed with all binaries present");
     }
 
     #[cfg(unix)]
     #[test]
     fn run_preflight_checks_git_after_agent_binaries() {
         let _guard = env_lock();
-        let project = TestProject::builder("preflight_run_git")
+        let mut project = TestProject::builder("preflight_run_git")
             .auto_commit(true)
             .build();
 
@@ -333,7 +368,7 @@ mod tests {
         // No git in PATH
         let _path_override = project.with_path_override();
 
-        let err = run_preflight(&project.config)
+        let err = run_preflight(&mut project.config)
             .expect_err("should fail when git is required but missing");
         assert!(err.to_string().contains("git is required"));
     }
@@ -346,7 +381,7 @@ mod tests {
         // required (via the `.git` ancestor walk) and error when the `git`
         // binary is absent from PATH.
         let _guard = env_lock();
-        let project = TestProject::builder("preflight_git_backed_no_bin")
+        let mut project = TestProject::builder("preflight_git_backed_no_bin")
             .auto_commit(false)
             .with_git()
             .build();
@@ -356,7 +391,7 @@ mod tests {
         // No git in PATH — only agent binaries
         let _path_override = project.with_path_override();
 
-        let err = run_preflight(&project.config)
+        let err = run_preflight(&mut project.config)
             .expect_err("should fail when git is required but binary is missing");
         let msg = err.to_string();
         assert!(

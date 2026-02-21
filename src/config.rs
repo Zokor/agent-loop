@@ -19,6 +19,37 @@ pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 pub const DEFAULT_DECISIONS_MAX_LINES: u32 = 50;
 pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob,WebFetch";
+pub const DEFAULT_REVIEWER_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebFetch";
+pub const DEFAULT_STUCK_NO_DIFF_ROUNDS: u32 = 3;
+pub const DEFAULT_STUCK_THRESHOLD_MINUTES: u64 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckAction {
+    Abort,
+    Warn,
+    Retry,
+}
+
+impl StuckAction {
+    pub fn from_str_opt(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "abort" => Some(Self::Abort),
+            "warn" => Some(Self::Warn),
+            "retry" => Some(Self::Retry),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for StuckAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Abort => write!(f, "abort"),
+            Self::Warn => write!(f, "warn"),
+            Self::Retry => write!(f, "retry"),
+        }
+    }
+}
 
 const CONFIG_FILE_NAME: &str = ".agent-loop.toml";
 
@@ -72,11 +103,40 @@ struct FileConfig {
     /// Implement all tasks from tasks.md in one batch loop (default true).
     batch_implement: Option<bool>,
 
+    /// Replace front-loaded project context with on-demand state manifest.
+    progressive_context: Option<bool>,
+
+    // ── Stuck detection ─────────────────────────────────────────────
+    /// Enable stuck detection in the implementation loop.
+    stuck_detection_enabled: Option<bool>,
+    /// Consecutive no-diff rounds before signalling.
+    stuck_no_diff_rounds: Option<u32>,
+    /// Wall-clock minutes before signalling.
+    stuck_threshold_minutes: Option<u64>,
+    /// Action on stuck: `"abort"`, `"warn"`, `"retry"`.
+    stuck_action: Option<String>,
+
+    // ── Wave runtime ────────────────────────────────────────────────
+    /// Seconds before a wave lock file is considered stale (default 300).
+    wave_lock_stale_seconds: Option<u64>,
+    /// Milliseconds to wait for in-flight tasks before forceful shutdown (default 30000).
+    wave_shutdown_grace_ms: Option<u64>,
+
+    // ── Model selection ─────────────────────────────────────────────
+    /// Model override for the implementer role.
+    implementer_model: Option<String>,
+    /// Model override for the reviewer role.
+    reviewer_model: Option<String>,
+    /// Model override for the planning phase.
+    planner_model: Option<String>,
+
     // ── Claude CLI tuning ──────────────────────────────────────────
     /// Bypass allowedTools and use `--dangerously-skip-permissions`.
     claude_full_access: Option<bool>,
     /// Comma-separated list of tools Claude is allowed to use.
     claude_allowed_tools: Option<String>,
+    /// Comma-separated list of tools the reviewer is allowed to use (read-only by default).
+    reviewer_allowed_tools: Option<String>,
     /// Persist Claude sessions across implementation rounds.
     claude_session_persistence: Option<bool>,
     /// Global Claude effort level: `"low"`, `"medium"`, `"high"`.
@@ -95,18 +155,57 @@ struct FileConfig {
     codex_full_access: Option<bool>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Agent {
-    Claude,
-    Codex,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Agent {
+    name: String,
+    model: Option<String>,
+}
+
+impl Agent {
+    /// Create a new agent, validating against the registry.
+    pub fn new(name: &str) -> Result<Self, AgentLoopError> {
+        if !crate::agent_registry::is_known_agent(name) {
+            return Err(AgentLoopError::Config(format!("unknown agent '{name}'")));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            model: None,
+        })
+    }
+
+    /// Convenience constructor that panics if the name is not registered.
+    pub fn known(name: &str) -> Self {
+        Self::new(name).unwrap_or_else(|_| panic!("'{name}' is not a registered agent"))
+    }
+
+    /// Return a clone with the given model set.
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    /// Clear the model selection (e.g. when the agent doesn't support it).
+    pub fn clear_model(&mut self) {
+        self.model = None;
+    }
+
+    pub fn spec(&self) -> &'static crate::agent_registry::AgentSpec {
+        crate::agent_registry::get_agent_spec(&self.name)
+            .expect("agent should be validated at construction time")
+    }
 }
 
 impl fmt::Display for Agent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Claude => write!(f, "claude"),
-            Self::Codex => write!(f, "codex"),
-        }
+        write!(f, "{}", self.name)
     }
 }
 
@@ -125,7 +224,7 @@ impl fmt::Display for RunMode {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub project_dir: PathBuf,
     pub state_dir: PathBuf,
@@ -150,11 +249,38 @@ pub struct Config {
     pub batch_implement: bool,
     pub verbose: bool,
 
+    // ── Progressive context ────────────────────────────────────────
+    /// When true, replace front-loaded context with a compact state manifest.
+    pub progressive_context: bool,
+
+    // ── Stuck detection ─────────────────────────────────────────────
+    /// Enable stuck detection in the implementation loop.
+    pub stuck_detection_enabled: bool,
+    /// Consecutive no-diff rounds before signalling.
+    pub stuck_no_diff_rounds: u32,
+    /// Wall-clock minutes before signalling.
+    pub stuck_threshold_minutes: u64,
+    /// Action to take when stuck is detected.
+    pub stuck_action: StuckAction,
+
+    // ── Wave runtime ────────────────────────────────────────────────
+    /// Seconds before a wave lock is considered stale (default 300).
+    pub wave_lock_stale_seconds: u64,
+    /// Grace period (ms) for in-flight tasks on interrupt (default 30_000).
+    pub wave_shutdown_grace_ms: u64,
+
+    // ── Model selection ─────────────────────────────────────────────
+    /// Model override for planning phase (separate from implementer/reviewer models
+    /// which live on the `Agent` struct).
+    pub planner_model: Option<String>,
+
     // ── Claude CLI tuning ──────────────────────────────────────────
     /// When true, use `--dangerously-skip-permissions` instead of `--allowedTools`.
     pub claude_full_access: bool,
     /// Comma-separated list of tools Claude is allowed to use.
     pub claude_allowed_tools: String,
+    /// Comma-separated list of tools the reviewer is allowed to use.
+    pub reviewer_allowed_tools: String,
     /// Persist Claude sessions across implementation rounds.
     pub claude_session_persistence: bool,
     /// Global Claude effort level: `"low"`, `"medium"`, `"high"`.
@@ -185,6 +311,15 @@ impl Config {
     pub fn effective_planning_context_excerpt_lines(&self) -> u32 {
         self.planning_context_excerpt_lines
             .unwrap_or(DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES)
+    }
+
+    /// Clone this config with a different state_dir and auto_commit disabled.
+    /// Used by wave orchestrator to give each task its own state directory.
+    pub fn with_state_dir(&self, state_dir: PathBuf) -> Self {
+        let mut cloned = self.clone();
+        cloned.state_dir = state_dir;
+        cloned.auto_commit = false;
+        cloned
     }
 
     pub fn from_cli(
@@ -219,15 +354,32 @@ impl Config {
         // --- implementer: env > TOML > default ---
         let implementer = env_agent("IMPLEMENTER")
             .or_else(|| parse_agent(file.implementer.as_deref()))
-            .unwrap_or(Agent::Claude);
+            .unwrap_or_else(|| Agent::known("claude"));
 
         // --- reviewer: env > TOML > derived default ---
         let reviewer = if single_agent {
-            implementer
+            implementer.clone()
         } else {
             env_agent("REVIEWER")
                 .or_else(|| parse_agent(file.reviewer.as_deref()))
-                .unwrap_or_else(|| opposite_agent(implementer))
+                .unwrap_or_else(|| default_reviewer_for(&implementer))
+        };
+
+        // --- model selection: env > TOML > None ---
+        let implementer_model =
+            env_trimmed_string("IMPLEMENTER_MODEL").or(file.implementer_model);
+        let reviewer_model = env_trimmed_string("REVIEWER_MODEL").or(file.reviewer_model);
+        let planner_model = env_trimmed_string("PLANNER_MODEL").or(file.planner_model);
+
+        // Apply models to agents.
+        let implementer = implementer.with_model(implementer_model);
+        let reviewer = if single_agent {
+            if reviewer_model.is_some() {
+                eprintln!("⚠ reviewer_model is ignored in single-agent mode.");
+            }
+            reviewer
+        } else {
+            reviewer.with_model(reviewer_model)
         };
 
         // --- numeric: override > env > TOML > default ---
@@ -275,6 +427,32 @@ impl Config {
         let batch_implement = env_bool("BATCH_IMPLEMENT")
             .or(file.batch_implement)
             .unwrap_or(true);
+        let progressive_context = env_bool("PROGRESSIVE_CONTEXT")
+            .or(file.progressive_context)
+            .unwrap_or(false);
+
+        // --- stuck detection: env > TOML > default ---
+        let stuck_detection_enabled = env_bool("STUCK_DETECTION_ENABLED")
+            .or(file.stuck_detection_enabled)
+            .unwrap_or(false);
+        let stuck_no_diff_rounds = parse_env("STUCK_NO_DIFF_ROUNDS")
+            .or(file.stuck_no_diff_rounds)
+            .unwrap_or(DEFAULT_STUCK_NO_DIFF_ROUNDS);
+        let stuck_threshold_minutes = parse_env("STUCK_THRESHOLD_MINUTES")
+            .or(file.stuck_threshold_minutes)
+            .unwrap_or(DEFAULT_STUCK_THRESHOLD_MINUTES);
+        let stuck_action = env_trimmed_string("STUCK_ACTION")
+            .or(file.stuck_action)
+            .and_then(|s| StuckAction::from_str_opt(&s))
+            .unwrap_or(StuckAction::Warn);
+
+        // --- Wave runtime: env > TOML > default ---
+        let wave_lock_stale_seconds = parse_env("WAVE_LOCK_STALE_SECONDS")
+            .or(file.wave_lock_stale_seconds)
+            .unwrap_or(300);
+        let wave_shutdown_grace_ms = parse_env("WAVE_SHUTDOWN_GRACE_MS")
+            .or(file.wave_shutdown_grace_ms)
+            .unwrap_or(30_000);
 
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
@@ -286,6 +464,9 @@ impl Config {
         let claude_allowed_tools = env_trimmed_string("CLAUDE_ALLOWED_TOOLS")
             .or(file.claude_allowed_tools)
             .unwrap_or_else(|| DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string());
+        let reviewer_allowed_tools = env_trimmed_string("REVIEWER_ALLOWED_TOOLS")
+            .or(file.reviewer_allowed_tools)
+            .unwrap_or_else(|| DEFAULT_REVIEWER_ALLOWED_TOOLS.to_string());
         let claude_session_persistence = env_bool("CLAUDE_SESSION_PERSISTENCE")
             .or(file.claude_session_persistence)
             .unwrap_or(true);
@@ -328,8 +509,17 @@ impl Config {
             max_parallel,
             batch_implement,
             verbose,
+            progressive_context,
+            stuck_detection_enabled,
+            stuck_no_diff_rounds,
+            stuck_threshold_minutes,
+            stuck_action,
+            wave_lock_stale_seconds,
+            wave_shutdown_grace_ms,
+            planner_model,
             claude_full_access,
             claude_allowed_tools,
+            reviewer_allowed_tools,
             claude_session_persistence,
             claude_effort_level,
             claude_max_output_tokens,
@@ -349,19 +539,19 @@ impl Config {
 /// Validate that agent string fields in the config contain known values.
 fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoopError> {
     if let Some(ref value) = config.implementer
-        && parse_agent(Some(value.as_str())).is_none()
+        && !crate::agent_registry::is_known_agent(value)
     {
         return Err(AgentLoopError::Config(format!(
-            "invalid implementer '{}' in {}: must be one of [\"claude\", \"codex\"]",
+            "invalid implementer '{}' in {}: not a registered agent",
             value,
             path.display(),
         )));
     }
     if let Some(ref value) = config.reviewer
-        && parse_agent(Some(value.as_str())).is_none()
+        && !crate::agent_registry::is_known_agent(value)
     {
         return Err(AgentLoopError::Config(format!(
-            "invalid reviewer '{}' in {}: must be one of [\"claude\", \"codex\"]",
+            "invalid reviewer '{}' in {}: not a registered agent",
             value,
             path.display(),
         )));
@@ -428,43 +618,32 @@ fn env_trimmed_string(key: &str) -> Option<String> {
 }
 
 fn parse_agent(value: Option<&str>) -> Option<Agent> {
-    match value {
-        Some("codex") => Some(Agent::Codex),
-        Some("claude") => Some(Agent::Claude),
-        _ => None,
-    }
+    Agent::new(value?).ok()
 }
 
 fn env_agent(key: &str) -> Option<Agent> {
     parse_agent(env::var(key).ok().as_deref())
 }
 
-fn opposite_agent(agent: Agent) -> Agent {
-    match agent {
-        Agent::Claude => Agent::Codex,
-        Agent::Codex => Agent::Claude,
-    }
+pub fn default_reviewer_for(agent: &Agent) -> Agent {
+    Agent::known(agent.spec().default_reviewer)
 }
 
 #[cfg(test)]
 pub fn resolve_implementer(env_value: Option<&str>) -> Agent {
     if env_value == Some("codex") {
-        Agent::Codex
+        Agent::known("codex")
     } else {
-        Agent::Claude
+        Agent::known("claude")
     }
 }
 
 #[cfg(test)]
-pub fn resolve_reviewer(implementer: Agent, single_agent: bool) -> Agent {
+pub fn resolve_reviewer(implementer: &Agent, single_agent: bool) -> Agent {
     if single_agent {
-        return implementer;
+        return implementer.clone();
     }
-
-    match implementer {
-        Agent::Claude => Agent::Codex,
-        Agent::Codex => Agent::Claude,
-    }
+    default_reviewer_for(implementer)
 }
 
 pub fn resolve_run_mode(single_agent: bool) -> RunMode {
@@ -658,26 +837,26 @@ mod tests {
 
     #[test]
     fn resolve_implementer_defaults_to_claude() {
-        assert_eq!(resolve_implementer(None), Agent::Claude);
-        assert_eq!(resolve_implementer(Some("claude")), Agent::Claude);
-        assert_eq!(resolve_implementer(Some("CODEX")), Agent::Claude);
+        assert_eq!(resolve_implementer(None), Agent::known("claude"));
+        assert_eq!(resolve_implementer(Some("claude")), Agent::known("claude"));
+        assert_eq!(resolve_implementer(Some("CODEX")), Agent::known("claude"));
     }
 
     #[test]
     fn resolve_implementer_uses_codex_only_on_exact_match() {
-        assert_eq!(resolve_implementer(Some("codex")), Agent::Codex);
+        assert_eq!(resolve_implementer(Some("codex")), Agent::known("codex"));
     }
 
     #[test]
     fn resolve_reviewer_matches_single_agent_mode() {
-        assert_eq!(resolve_reviewer(Agent::Claude, true), Agent::Claude);
-        assert_eq!(resolve_reviewer(Agent::Codex, true), Agent::Codex);
+        assert_eq!(resolve_reviewer(&Agent::known("claude"), true), Agent::known("claude"));
+        assert_eq!(resolve_reviewer(&Agent::known("codex"), true), Agent::known("codex"));
     }
 
     #[test]
     fn resolve_reviewer_uses_opposite_agent_in_dual_mode() {
-        assert_eq!(resolve_reviewer(Agent::Claude, false), Agent::Codex);
-        assert_eq!(resolve_reviewer(Agent::Codex, false), Agent::Claude);
+        assert_eq!(resolve_reviewer(&Agent::known("claude"), false), Agent::known("codex"));
+        assert_eq!(resolve_reviewer(&Agent::known("codex"), false), Agent::known("claude"));
     }
 
     #[test]
@@ -824,8 +1003,8 @@ command = "cargo test"
             DEFAULT_DECOMPOSITION_MAX_ROUNDS
         );
         assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
-        assert_eq!(config.implementer, Agent::Claude);
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.implementer, Agent::known("claude"));
+        assert_eq!(config.reviewer, Agent::known("codex"));
         assert!(!config.single_agent);
         assert_eq!(config.run_mode, RunMode::DualAgent);
         assert!(config.auto_commit);
@@ -862,8 +1041,8 @@ command = "cargo test"
         assert_eq!(config.planning_max_rounds, 7);
         assert_eq!(config.decomposition_max_rounds, 8);
         assert_eq!(config.timeout_seconds, 900);
-        assert_eq!(config.implementer, Agent::Codex);
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.implementer, Agent::known("codex"));
+        assert_eq!(config.reviewer, Agent::known("codex"));
         assert!(config.single_agent);
         assert_eq!(config.run_mode, RunMode::SingleAgent);
         assert!(!config.auto_commit);
@@ -963,7 +1142,7 @@ command = "cargo test"
             Config::from_cli(project_dir.clone(), true, false).expect("from_cli should succeed");
 
         assert!(config.single_agent);
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.reviewer, Agent::known("codex"));
         assert_eq!(config.run_mode, RunMode::SingleAgent);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -1003,8 +1182,8 @@ batch_implement = false
         assert_eq!(config.planning_max_rounds, 5);
         assert_eq!(config.decomposition_max_rounds, 4);
         assert_eq!(config.timeout_seconds, 300);
-        assert_eq!(config.implementer, Agent::Codex);
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.implementer, Agent::known("codex"));
+        assert_eq!(config.reviewer, Agent::known("codex"));
         assert!(config.single_agent);
         assert!(!config.auto_commit);
         assert!(config.auto_test);
@@ -1053,7 +1232,7 @@ batch_implement = true
 
         assert_eq!(config.max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
-        assert_eq!(config.implementer, Agent::Claude);
+        assert_eq!(config.implementer, Agent::known("claude"));
         assert!(!config.single_agent);
         assert!(config.auto_commit);
         assert!(config.auto_test);
@@ -1142,8 +1321,8 @@ batch_implement = true
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         // Both claude -> explicit reviewer override honored
-        assert_eq!(config.implementer, Agent::Claude);
-        assert_eq!(config.reviewer, Agent::Claude);
+        assert_eq!(config.implementer, Agent::known("claude"));
+        assert_eq!(config.reviewer, Agent::known("claude"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1157,7 +1336,7 @@ batch_implement = true
         set_env("REVIEWER", "codex");
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.reviewer, Agent::known("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1174,8 +1353,8 @@ batch_implement = true
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.single_agent);
-        assert_eq!(config.implementer, Agent::Codex);
-        assert_eq!(config.reviewer, Agent::Codex);
+        assert_eq!(config.implementer, Agent::known("codex"));
+        assert_eq!(config.reviewer, Agent::known("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1188,7 +1367,7 @@ batch_implement = true
 
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
         let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
-        assert_eq!(config.reviewer, Agent::Claude);
+        assert_eq!(config.reviewer, Agent::known("claude"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

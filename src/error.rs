@@ -17,6 +17,8 @@ pub enum AgentLoopError {
     Config(String),
     /// State management error (status.json parse, missing files, etc.).
     State(String),
+    /// Wave scheduling or execution error.
+    Wave(String),
     /// Process was interrupted by a signal (SIGINT/SIGTERM).
     Interrupted(String),
 }
@@ -29,6 +31,7 @@ impl fmt::Display for AgentLoopError {
             Self::Agent(msg) => write!(f, "Agent error: {msg}"),
             Self::Config(msg) => write!(f, "Config error: {msg}"),
             Self::State(msg) => write!(f, "State error: {msg}"),
+            Self::Wave(msg) => write!(f, "Wave error: {msg}"),
             Self::Interrupted(msg) => write!(f, "Interrupted: {msg}"),
         }
     }
@@ -42,6 +45,7 @@ impl std::error::Error for AgentLoopError {
             | Self::Agent(_)
             | Self::Config(_)
             | Self::State(_)
+            | Self::Wave(_)
             | Self::Interrupted(_) => None,
         }
     }

@@ -20,60 +20,71 @@ use crate::{
 };
 
 fn resolve_command(
-    agent: Agent,
+    agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
     session_id: Option<&str>,
 ) -> (&'static str, Vec<String>) {
-    match agent {
-        Agent::Claude => {
-            let mut args = Vec::new();
+    let spec = agent.spec();
 
-            // Session resumption: --resume <id> -p <prompt> continues an existing session.
-            if let Some(sid) = session_id {
-                args.push("--resume".to_string());
-                args.push(sid.to_string());
+    // Layer 1: Registry command builder — base CLI args (agent-specific syntax).
+    let mut args = (spec.command_builder)(prompt, agent.model());
+
+    // Layer 2: Config-driven overrides applied after base args.
+
+    // Session resumption: agent-specific resume flags.
+    if let Some(sid) = session_id {
+        match agent.name() {
+            "claude" => {
+                // --resume <id> must precede -p
+                args.insert(0, sid.to_string());
+                args.insert(0, "--resume".to_string());
             }
-
-            args.push("-p".to_string());
-            args.push(prompt.to_string());
-            args.push("--verbose".to_string());
-            args.push("--output-format".to_string());
-            args.push("stream-json".to_string());
-
-            if config.claude_full_access {
-                args.push("--dangerously-skip-permissions".to_string());
-            } else {
-                args.push("--allowedTools".to_string());
-                args.push(config.claude_allowed_tools.clone());
+            "codex" => {
+                // Replace `exec` with `exec resume <id>` — prompt is already the last arg.
+                if let Some(pos) = args.iter().position(|a| a == "exec") {
+                    args.insert(pos + 1, sid.to_string());
+                    args.insert(pos + 1, "resume".to_string());
+                }
             }
-
-            if let Some(sp) = system_prompt {
-                args.push("--append-system-prompt".to_string());
-                args.push(sp.to_string());
-            }
-
-            ("claude", args)
-        }
-        Agent::Codex => {
-            let mut args = vec!["exec".to_string(), "--skip-git-repo-check".to_string()];
-
-            if config.codex_full_access {
-                args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
-            } else {
-                args.push("--full-auto".to_string());
-            }
-
-            args.push("--json".to_string());
-            args.push("--color".to_string());
-            args.push("never".to_string());
-
-            args.push(prompt.to_string());
-
-            ("codex", args)
+            _ => {}
         }
     }
+
+    // Permission / sandbox policy.
+    if agent.name() == "claude" {
+        if config.claude_full_access {
+            args.push("--dangerously-skip-permissions".to_string());
+        } else {
+            args.push("--allowedTools".to_string());
+            // Reviewer gets read-only tools by default.
+            let is_reviewer = *agent == config.reviewer && config.implementer != config.reviewer;
+            let tools = if is_reviewer {
+                config.reviewer_allowed_tools.clone()
+            } else {
+                config.claude_allowed_tools.clone()
+            };
+            args.push(tools);
+        }
+    }
+    if agent.name() == "codex" {
+        if config.codex_full_access {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        } else {
+            args.push("--full-auto".to_string());
+        }
+    }
+
+    // System prompt (claude only).
+    if agent.name() == "claude" {
+        if let Some(sp) = system_prompt {
+            args.push("--append-system-prompt".to_string());
+            args.push(sp.to_string());
+        }
+    }
+
+    (spec.binary, args)
 }
 
 const SUPERVISOR_TICK: Duration = Duration::from_secs(1);
@@ -180,7 +191,7 @@ fn truncate_response_lines(output: &str, max_lines: usize) -> (String, usize) {
     (kept.join("\n"), dropped)
 }
 
-fn append_response_block(agent: Agent, output: &str, config: &Config) -> std::io::Result<()> {
+fn append_response_block(agent: &Agent, output: &str, config: &Config) -> std::io::Result<()> {
     if output.trim().is_empty() {
         return Ok(());
     }
@@ -393,6 +404,30 @@ fn extract_claude_session_id(output: &str) -> Option<String> {
     None
 }
 
+/// Extract a `session_id` from Codex `--json` NDJSON output.
+///
+/// Codex may emit a `session_id` field in its final status/result event.
+fn extract_codex_session_id(output: &str) -> Option<String> {
+    for line in output.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.starts_with('{') {
+            continue;
+        }
+
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        if let Some(sid) = value.get("session_id").and_then(|v| v.as_str())
+            && !sid.is_empty()
+        {
+            return Some(sid.to_string());
+        }
+    }
+
+    None
+}
+
 fn session_file_path(config: &Config, session_key: &str) -> std::path::PathBuf {
     config.state_dir.join(format!("{session_key}_session_id"))
 }
@@ -492,10 +527,11 @@ fn extract_codex_json_usage(output: &str) -> AgentUsage {
     usage
 }
 
-fn normalize_agent_output(agent: Agent, output: String) -> String {
-    match agent {
-        Agent::Claude => extract_claude_stream_json_text(&output).unwrap_or(output),
-        Agent::Codex => extract_codex_json_text(&output).unwrap_or(output),
+fn normalize_agent_output(agent: &Agent, output: String) -> String {
+    match agent.name() {
+        "claude" => extract_claude_stream_json_text(&output).unwrap_or(output),
+        "codex" => extract_codex_json_text(&output).unwrap_or(output),
+        _ => output,
     }
 }
 
@@ -565,7 +601,7 @@ fn join_reader_thread(handle: Option<JoinHandle<()>>) {
 
 #[cfg(test)]
 pub(crate) fn run_agent(
-    agent: Agent,
+    agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
@@ -582,7 +618,7 @@ pub(crate) fn run_agent(
 /// 3. After a successful run, extracts the new session_id and stores it
 /// 4. On failure with `--resume`, clears the session file so the next call starts fresh
 pub fn run_agent_with_session(
-    agent: Agent,
+    agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
@@ -592,7 +628,7 @@ pub fn run_agent_with_session(
 }
 
 fn run_agent_inner(
-    agent: Agent,
+    agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
@@ -601,7 +637,9 @@ fn run_agent_inner(
     let _ = log(&format!("▶ Running {agent}..."), config);
 
     // Session persistence: read existing session_id if applicable.
-    let session_id = if agent == Agent::Claude
+    // Uses the registry's `supports_session_resume` flag instead of hardcoding
+    // agent names, so Codex and future agents get resume support automatically.
+    let session_id = if agent.spec().supports_session_resume
         && config.claude_session_persistence
         && let Some(key) = session_key
     {
@@ -627,7 +665,7 @@ fn run_agent_inner(
         .env_remove("CLAUDECODE");
 
     // Claude-specific environment variable pass-through.
-    if agent == Agent::Claude {
+    if agent.name() == "claude" {
         cmd.env("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "1");
 
         let effective_effort = match session_key {
@@ -779,26 +817,34 @@ fn run_agent_inner(
         .map(|mut guard| std::mem::take(&mut *guard))
         .unwrap_or_default();
     let combined_output = String::from_utf8_lossy(&raw_bytes).into_owned();
-    let usage = match agent {
-        Agent::Claude => extract_stream_json_usage(&combined_output),
-        Agent::Codex => extract_codex_json_usage(&combined_output),
+    let usage = match agent.name() {
+        "claude" => extract_stream_json_usage(&combined_output),
+        "codex" => extract_codex_json_usage(&combined_output),
+        _ => AgentUsage::default(),
     };
     record_agent_invocation(usage);
 
-    // Session persistence: extract and store session_id from Claude output.
-    if agent == Agent::Claude
+    // Session persistence: extract and store session_id from agent output.
+    if agent.spec().supports_session_resume
         && config.claude_session_persistence
         && let Some(key) = session_key
-        && let Some(sid) = extract_claude_session_id(&combined_output)
     {
-        let _ = log(
-            &format!(
-                "  ↳ Captured Claude session_id: {}",
-                &sid[..sid.len().min(12)]
-            ),
-            config,
-        );
-        write_session_id(config, key, &sid);
+        let sid = match agent.name() {
+            "claude" => extract_claude_session_id(&combined_output),
+            "codex" => extract_codex_session_id(&combined_output),
+            _ => None,
+        };
+        if let Some(sid) = sid {
+            let _ = log(
+                &format!(
+                    "  ↳ Captured {} session_id: {}",
+                    agent.name(),
+                    &sid[..sid.len().min(12)]
+                ),
+                config,
+            );
+            write_session_id(config, key, &sid);
+        }
     }
 
     let normalized_output = normalize_agent_output(agent, combined_output);
@@ -837,7 +883,10 @@ fn run_agent_inner(
         if session_id.is_some()
             && let Some(key) = session_key
         {
-            let _ = log("  ↳ Clearing stale Claude session after failure", config);
+            let _ = log(
+                &format!("  ↳ Clearing stale {} session after failure", agent.name()),
+                config,
+            );
             clear_session_id(config, key);
         }
 
@@ -867,7 +916,7 @@ mod tests {
     #[test]
     fn resolve_command_builds_claude_with_allowed_tools_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(Agent::Claude, "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None);
         assert_eq!(command, "claude");
         assert!(args.contains(&"--allowedTools".to_string()));
         assert!(args.contains(&crate::config::DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()));
@@ -878,7 +927,7 @@ mod tests {
     fn resolve_command_builds_claude_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.claude_full_access = true;
-        let (command, args) = resolve_command(Agent::Claude, "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None);
         assert_eq!(command, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--allowedTools".to_string()));
@@ -888,7 +937,7 @@ mod tests {
     fn resolve_command_appends_system_prompt_when_provided() {
         let project = new_project(5);
         let (_, args) = resolve_command(
-            Agent::Claude,
+            &Agent::known("claude"),
             "hello",
             &project.config,
             Some("system instructions"),
@@ -902,7 +951,7 @@ mod tests {
     fn resolve_command_adds_resume_flag_with_session_id() {
         let project = new_project(5);
         let (_, args) = resolve_command(
-            Agent::Claude,
+            &Agent::known("claude"),
             "hello",
             &project.config,
             None,
@@ -915,9 +964,27 @@ mod tests {
     }
 
     #[test]
+    fn resolve_command_adds_codex_resume_subcommand_with_session_id() {
+        let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("codex"),
+            "hello",
+            &project.config,
+            None,
+            Some("sess_codex_42"),
+        );
+        // Should have `exec resume <id>` in sequence
+        let exec_pos = args.iter().position(|a| a == "exec").expect("exec arg");
+        assert_eq!(args[exec_pos + 1], "resume");
+        assert_eq!(args[exec_pos + 2], "sess_codex_42");
+        // Prompt still present
+        assert!(args.contains(&"hello".to_string()));
+    }
+
+    #[test]
     fn resolve_command_builds_codex_with_full_auto_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(Agent::Codex, "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None);
         assert_eq!(command, "codex");
         assert!(args.contains(&"--full-auto".to_string()));
         assert!(args.contains(&"--json".to_string()));
@@ -929,7 +996,7 @@ mod tests {
     fn resolve_command_builds_codex_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.codex_full_access = true;
-        let (command, args) = resolve_command(Agent::Codex, "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None);
         assert_eq!(command, "codex");
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args.contains(&"--full-auto".to_string()));
@@ -947,7 +1014,7 @@ mod tests {
         let _path_guard = project.with_path_override();
         let _claudecode_guard = ScopedEnvVar::set("CLAUDECODE", "nested-agent-marker");
 
-        let output = run_agent(Agent::Claude, "ignored", &project.config, None)
+        let output = run_agent(&Agent::known("claude"), "ignored", &project.config, None)
             .expect("agent should succeed");
         assert!(output.contains("CLAUDECODE=unset"));
     }
@@ -963,7 +1030,7 @@ mod tests {
         );
         let _path_guard = project.with_path_override();
 
-        let output = run_agent(Agent::Claude, "ignored", &project.config, None)
+        let output = run_agent(&Agent::known("claude"), "ignored", &project.config, None)
             .expect("agent should succeed");
 
         assert!(output.contains("out-1"));
@@ -980,7 +1047,7 @@ mod tests {
         let _path_guard = project.with_path_override();
 
         let started = Instant::now();
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         let elapsed = started.elapsed();
 
         assert!(
@@ -1004,7 +1071,7 @@ mod tests {
         let _path_guard = project.with_path_override();
 
         let started = Instant::now();
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         let elapsed = started.elapsed();
 
         assert!(
@@ -1024,7 +1091,7 @@ mod tests {
         project.create_executable("claude", "#!/bin/sh\nprintf 'hello'\n");
         let _path_guard = project.with_path_override();
 
-        let output = run_agent(Agent::Claude, "ignored", &project.config, None)
+        let output = run_agent(&Agent::known("claude"), "ignored", &project.config, None)
             .expect("agent should succeed");
         assert_eq!(output, "hello");
 
@@ -1043,7 +1110,7 @@ mod tests {
         project.create_executable("claude", "#!/bin/sh\nprintf '  \\n\\t  '\n");
         let _path_guard = project.with_path_override();
 
-        let output = run_agent(Agent::Claude, "ignored", &project.config, None)
+        let output = run_agent(&Agent::known("claude"), "ignored", &project.config, None)
             .expect("agent should succeed");
         assert_eq!(output, "  \n\t  ");
 
@@ -1059,7 +1126,7 @@ mod tests {
         project.create_executable("claude", "#!/bin/sh\nprintf 'partial-output'\nexit 7\n");
         let _path_guard = project.with_path_override();
 
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         assert!(result.is_err());
 
         let logs = project.read_log();
@@ -1077,7 +1144,7 @@ mod tests {
         );
         let _path_guard = project.with_path_override();
 
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         assert!(result.is_err());
 
         let logs = project.read_log();
@@ -1092,7 +1159,7 @@ mod tests {
         fs::create_dir_all(project.bin_dir()).expect("bin dir should exist");
         let _path_guard = project.with_path_override();
 
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         assert!(result.is_err());
 
         let logs = project.read_log();
@@ -1116,7 +1183,7 @@ mod tests {
         project.create_executable("claude", &script);
         let _path_guard = project.with_path_override();
 
-        let result = run_agent(Agent::Claude, "ignored", &project.config, None);
+        let result = run_agent(&Agent::known("claude"), "ignored", &project.config, None);
         assert!(result.is_err(), "agent should time out");
 
         // The PID file must exist and contain a valid PID.
@@ -1270,7 +1337,7 @@ mod tests {
     #[test]
     fn normalize_agent_output_leaves_plain_text_unchanged_for_claude() {
         let output = "plain text output".to_string();
-        let normalized = normalize_agent_output(Agent::Claude, output.clone());
+        let normalized = normalize_agent_output(&Agent::known("claude"), output.clone());
         assert_eq!(normalized, output);
     }
 
@@ -1311,7 +1378,7 @@ mod tests {
         let lines: Vec<String> = (1..=600).map(|i| format!("line {i}")).collect();
         let output = lines.join("\n");
 
-        append_response_block(Agent::Claude, &output, &project.config)
+        append_response_block(&Agent::known("claude"), &output, &project.config)
             .expect("append should succeed");
 
         let logs = project.read_log();
@@ -1339,7 +1406,7 @@ mod tests {
         let lines: Vec<String> = (1..=100).map(|i| format!("line {i}")).collect();
         let output = lines.join("\n");
 
-        append_response_block(Agent::Claude, &output, &project.config)
+        append_response_block(&Agent::known("claude"), &output, &project.config)
             .expect("append should succeed");
 
         let logs = project.read_log();
@@ -1388,6 +1455,64 @@ mod tests {
 
         clear_session_id(&project.config, "implementer");
         assert!(read_session_id(&project.config, "implementer").is_none());
+    }
+
+    #[test]
+    fn extract_codex_session_id_from_output() {
+        let output = concat!(
+            "{\"type\":\"message\",\"content\":\"hello\"}\n",
+            "{\"type\":\"status\",\"value\":\"done\",\"session_id\":\"csess_xyz789\"}\n",
+        );
+        assert_eq!(
+            extract_codex_session_id(output),
+            Some("csess_xyz789".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_codex_session_id_returns_none_when_absent() {
+        let output = "{\"type\":\"status\",\"value\":\"done\"}\n";
+        assert_eq!(extract_codex_session_id(output), None);
+    }
+
+    #[test]
+    fn session_id_round_trip_with_agent_aware_key() {
+        let project = new_project(5);
+        std::fs::create_dir_all(&project.config.state_dir).expect("state dir should be created");
+
+        // Keys now include agent name for disambiguation
+        let key = "implementer-claude";
+        assert!(read_session_id(&project.config, key).is_none());
+
+        write_session_id(&project.config, key, "sess_agent_aware_001");
+        assert_eq!(
+            read_session_id(&project.config, key),
+            Some("sess_agent_aware_001".to_string())
+        );
+
+        // Different agent gets a separate file
+        let key2 = "implementer-codex";
+        assert!(read_session_id(&project.config, key2).is_none());
+
+        write_session_id(&project.config, key2, "csess_codex_002");
+        assert_eq!(
+            read_session_id(&project.config, key2),
+            Some("csess_codex_002".to_string())
+        );
+
+        // Both keys are independent
+        assert_eq!(
+            read_session_id(&project.config, key),
+            Some("sess_agent_aware_001".to_string())
+        );
+
+        clear_session_id(&project.config, key);
+        assert!(read_session_id(&project.config, key).is_none());
+        // Other agent's session is unaffected
+        assert_eq!(
+            read_session_id(&project.config, key2),
+            Some("csess_codex_002".to_string())
+        );
     }
 
     #[test]

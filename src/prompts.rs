@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Agent, Config};
+use crate::config::Config;
 
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".agent-loop"];
 
@@ -148,6 +148,42 @@ fn append_file_excerpt(
     }
 }
 
+/// Build a compact state manifest pointing agents to available context files.
+/// Used in progressive-context mode instead of front-loading the full project context.
+pub(crate) fn state_manifest(config: &Config) -> String {
+    let root = &config.project_dir;
+    let state = &config.state_dir;
+
+    let mut lines = vec!["AVAILABLE CONTEXT (explore files on-demand as needed):".to_string()];
+    lines.push(format!(
+        "- Project root: {} -- explore structure and source files",
+        root.display()
+    ));
+
+    let doc_files: &[(&str, &str)] = &[
+        ("README.md", "project documentation"),
+        ("CLAUDE.md", "project instructions for AI"),
+        (".agent-loop/decisions.md", "prior decisions & learnings"),
+    ];
+
+    for (relative, description) in doc_files {
+        let full = root.join(relative);
+        if full.exists() {
+            lines.push(format!("- {relative}: {} -- {description}", full.display()));
+        }
+    }
+
+    let conversation = state.join("conversation.md");
+    if conversation.exists() {
+        lines.push(format!(
+            "- conversation.md: {} -- round history",
+            conversation.display()
+        ));
+    }
+
+    lines.join("\n")
+}
+
 const SINGLE_AGENT_REVIEWER_PREAMBLE: &str = "⚠️ SINGLE-AGENT REVIEWER MODE ⚠️
 You are now switching roles from IMPLEMENTER to REVIEWER. You must adopt a completely independent, critical perspective.
 
@@ -221,6 +257,7 @@ pub(crate) fn single_agent_reviewer_preamble(config: &Config) -> String {
 pub(crate) enum AgentRole {
     Implementer,
     Reviewer,
+    Planner,
 }
 
 /// Determine the role based on which agent is being invoked.
@@ -228,8 +265,8 @@ pub(crate) enum AgentRole {
 /// In single-agent mode (where implementer == reviewer), this always returns
 /// `Implementer`. The reviewer preamble is still injected via the user prompt
 /// in single-agent mode, so this is acceptable.
-pub(crate) fn role_for_agent(agent: Agent, config: &Config) -> AgentRole {
-    if agent == config.reviewer && config.implementer != config.reviewer {
+pub(crate) fn role_for_agent(agent: &crate::config::Agent, config: &Config) -> AgentRole {
+    if *agent == config.reviewer && config.implementer != config.reviewer {
         AgentRole::Reviewer
     } else {
         AgentRole::Implementer
@@ -275,6 +312,7 @@ pub(crate) fn planning_reviewer_prompt(
     prompt_timestamp: &str,
     paths: &PhasePaths,
     dispute_reason: Option<&str>,
+    open_findings: &str,
 ) -> String {
     let concerns_section = match dispute_reason {
         Some(reason) if !reason.trim().is_empty() => {
@@ -283,8 +321,14 @@ pub(crate) fn planning_reviewer_prompt(
         _ => String::new(),
     };
 
+    let findings_section = if open_findings.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{open_findings}")
+    };
+
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a brief justification.\n\nIf you approve the plan, write this exact JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {} and write this JSON to {}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {} and write this JSON to {}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.status_json),
         config.implementer,
@@ -894,6 +938,7 @@ mod tests {
             "2026-02-14T10:00:00.000Z",
             &paths,
             Some("I disagree with the rollback plan"),
+            "",
         );
 
         assert!(
@@ -914,6 +959,7 @@ mod tests {
             "2026-02-14T10:00:00.000Z",
             &paths,
             None,
+            "",
         );
 
         assert!(
@@ -934,6 +980,7 @@ mod tests {
             "2026-02-14T10:00:00.000Z",
             &paths,
             Some("   "),
+            "",
         );
 
         assert!(
@@ -1228,6 +1275,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
         );
 
         assert!(
@@ -1284,6 +1332,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             None,
+            "",
         );
 
         assert!(
