@@ -435,4 +435,53 @@ mod tests {
         assert!(install_hint("git").contains("git-scm.com"));
         assert!(install_hint("unknown").is_empty());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_agent_binaries_succeeds_for_experimental_agent() {
+        // Verifies the Tier::Experimental branch in check_agent_binaries is
+        // exercised: when an experimental agent binary is found, preflight
+        // succeeds (and the warning is printed to stderr).
+        let _guard = env_lock();
+        let project = TestProject::builder("preflight_experimental")
+            .single_agent(true)
+            .build();
+
+        // Replace the implementer with an experimental agent (gemini)
+        let mut config = project.config.clone();
+        config.implementer = crate::config::Agent::known("gemini");
+        config.reviewer = crate::config::Agent::known("gemini");
+
+        // Create a fake gemini binary
+        project.create_executable("gemini", "#!/bin/sh\necho gemini\n");
+        let _path_override = project.with_path_override();
+
+        // Should succeed (not error) — the experimental warning is printed
+        // to stderr but doesn't cause failure
+        check_agent_binaries(&config).expect("experimental agent with valid binary should pass");
+
+        // Verify gemini is indeed experimental
+        assert_eq!(
+            config.implementer.spec().tier,
+            crate::agent_registry::Tier::Experimental
+        );
+    }
+
+    #[test]
+    fn validate_model_support_clears_unsupported_model() {
+        let project = TestProject::builder("preflight_model_clear").build();
+        let mut config = project.config.clone();
+
+        // Set a model on an agent that doesn't support it (gemini)
+        config.implementer = crate::config::Agent::known("gemini").with_model(Some("gpt-4".to_string()));
+        assert!(config.implementer.model().is_some());
+
+        validate_model_support(&mut config);
+
+        // Model should have been cleared
+        assert!(
+            config.implementer.model().is_none(),
+            "model should be cleared for agents that don't support --model"
+        );
+    }
 }

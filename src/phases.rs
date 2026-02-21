@@ -3041,4 +3041,159 @@ mod tests {
         let findings = parse_planning_findings_from_output(text, 1);
         assert!(findings.is_empty());
     }
+
+    #[test]
+    fn reconcile_planning_verdict_revise_with_empty_findings_synthesizes() {
+        let config = test_config();
+        let existing = crate::state::PlanningFindingsFile::default();
+        let review_status = LoopStatus {
+            status: Status::NeedsRevision,
+            round: 2,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: Some("The error handling section needs work".to_string()),
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        let (action, findings_file) = reconcile_planning_verdict(
+            Some("REVISE"),
+            Vec::new(), // empty findings
+            &existing,
+            &review_status,
+            2,
+            &config,
+        );
+
+        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
+        assert_eq!(findings_file.findings.len(), 1);
+        assert_eq!(findings_file.findings[0].id, "P-001");
+        assert_eq!(
+            findings_file.findings[0].description,
+            "The error handling section needs work"
+        );
+        assert_eq!(
+            findings_file.findings[0].status,
+            crate::state::PlanningFindingStatus::Open
+        );
+    }
+
+    #[test]
+    fn reconcile_planning_verdict_approved_with_open_findings_forces_needs_revision() {
+        let config = test_config();
+        let existing = crate::state::PlanningFindingsFile {
+            findings: vec![crate::state::PlanningFindingEntry {
+                id: "P-001".to_string(),
+                description: "Missing error handling".to_string(),
+                status: crate::state::PlanningFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        let review_status = LoopStatus {
+            status: Status::Approved,
+            round: 3,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        let (action, findings_file) = reconcile_planning_verdict(
+            Some("APPROVED"),
+            Vec::new(),
+            &existing,
+            &review_status,
+            3,
+            &config,
+        );
+
+        // Should force NEEDS_REVISION despite APPROVED verdict
+        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
+        // Existing finding should be preserved
+        assert_eq!(findings_file.findings.len(), 1);
+        assert_eq!(findings_file.findings[0].id, "P-001");
+    }
+
+    #[test]
+    fn reconcile_planning_verdict_approved_without_open_findings_approves() {
+        let config = test_config();
+        let existing = crate::state::PlanningFindingsFile {
+            findings: vec![crate::state::PlanningFindingEntry {
+                id: "P-001".to_string(),
+                description: "Was resolved".to_string(),
+                status: crate::state::PlanningFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        let review_status = LoopStatus {
+            status: Status::Approved,
+            round: 3,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        let (action, _) = reconcile_planning_verdict(
+            Some("APPROVED"),
+            Vec::new(),
+            &existing,
+            &review_status,
+            3,
+            &config,
+        );
+
+        assert_eq!(action, PlanningReviewerAction::Approved);
+    }
+
+    #[test]
+    fn reconcile_planning_verdict_revise_with_findings_keeps_them() {
+        let config = test_config();
+        let existing = crate::state::PlanningFindingsFile::default();
+        let new_findings = vec![crate::state::PlanningFindingEntry {
+            id: "P-001".to_string(),
+            description: "Explicit finding from reviewer".to_string(),
+            status: crate::state::PlanningFindingStatus::Open,
+            round_introduced: 2,
+            round_resolved: None,
+        }];
+        let review_status = LoopStatus {
+            status: Status::NeedsRevision,
+            round: 2,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: Some("Needs work".to_string()),
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        let (action, findings_file) = reconcile_planning_verdict(
+            Some("REVISE"),
+            new_findings,
+            &existing,
+            &review_status,
+            2,
+            &config,
+        );
+
+        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
+        // Should keep the explicit finding, not synthesize
+        assert_eq!(findings_file.findings.len(), 1);
+        assert_eq!(
+            findings_file.findings[0].description,
+            "Explicit finding from reviewer"
+        );
+    }
 }
