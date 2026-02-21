@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::{Agent, Config};
 
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".agent-loop"];
 
@@ -161,7 +161,8 @@ CRITICAL INSTRUCTIONS:
 
 ";
 
-const DECISION_CAPTURE_INSTRUCTIONS: &str = "DECISION CAPTURE: If you make an important architectural decision, discover a constraint,
+const DECISION_CAPTURE_INSTRUCTIONS: &str =
+    "DECISION CAPTURE: If you make an important architectural decision, discover a constraint,
 choose a reusable pattern, hit a gotcha, or identify a key dependency — append a one-line
 entry to `.agent-loop/decisions.md` with format:
 - [CATEGORY] description
@@ -184,6 +185,7 @@ pub(crate) struct PhasePaths {
     pub(crate) tasks_md: PathBuf,
     pub(crate) changes_md: PathBuf,
     pub(crate) review_md: PathBuf,
+    pub(crate) findings_json: PathBuf,
     pub(crate) status_json: PathBuf,
 }
 
@@ -194,6 +196,7 @@ pub(crate) fn phase_paths(config: &Config) -> PhasePaths {
         tasks_md: config.state_dir.join("tasks.md"),
         changes_md: config.state_dir.join("changes.md"),
         review_md: config.state_dir.join("review.md"),
+        findings_json: config.state_dir.join("findings.json"),
         status_json: config.state_dir.join("status.json"),
     }
 }
@@ -208,6 +211,41 @@ pub(crate) fn single_agent_reviewer_preamble(config: &Config) -> String {
     }
 
     SINGLE_AGENT_REVIEWER_PREAMBLE.to_string()
+}
+
+/// Role-specific system prompt for `--append-system-prompt`.
+///
+/// Returns `None` when there is nothing role-specific to inject (the default
+/// instructions already live in the user prompt for backward compatibility).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AgentRole {
+    Implementer,
+    Reviewer,
+}
+
+/// Determine the role based on which agent is being invoked.
+///
+/// In single-agent mode (where implementer == reviewer), this always returns
+/// `Implementer`. The reviewer preamble is still injected via the user prompt
+/// in single-agent mode, so this is acceptable.
+pub(crate) fn role_for_agent(agent: Agent, config: &Config) -> AgentRole {
+    if agent == config.reviewer && config.implementer != config.reviewer {
+        AgentRole::Reviewer
+    } else {
+        AgentRole::Implementer
+    }
+}
+
+pub(crate) fn system_prompt_for_role(role: AgentRole, config: &Config) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+
+    parts.push(DECISION_CAPTURE_INSTRUCTIONS);
+
+    if role == AgentRole::Reviewer && config.single_agent {
+        parts.push(SINGLE_AGENT_REVIEWER_PREAMBLE);
+    }
+
+    parts.join("\n\n")
 }
 
 pub(crate) fn planning_initial_prompt(
@@ -343,11 +381,13 @@ pub(crate) fn decomposition_reviewer_prompt(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_implementer_prompt(
     round: u32,
     task: &str,
     plan: &str,
     previous_review: &str,
+    open_findings: &str,
     decisions: &str,
     paths: &PhasePaths,
     round_history: &str,
@@ -363,10 +403,15 @@ pub(crate) fn implementation_implementer_prompt(
     } else {
         format!("\n\nROUND HISTORY:\n{round_history}")
     };
+    let findings_section = if open_findings.trim().is_empty() {
+        "OPEN FINDINGS:\nNone.".to_string()
+    } else {
+        format!("OPEN FINDINGS (resolve every item before approval):\n{open_findings}")
+    };
     let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Adding tests where appropriate\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
+        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\n{findings_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Resolving every open finding ID\n- Adding tests where appropriate\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
         path_text(&paths.changes_md)
     )
 }
@@ -381,6 +426,7 @@ pub(crate) fn implementation_reviewer_prompt(
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
+    open_findings: &str,
     quality_checks: Option<&str>,
     decisions: &str,
     round_history: &str,
@@ -395,12 +441,20 @@ pub(crate) fn implementation_reviewer_prompt(
     } else {
         format!("\n\nROUND HISTORY:\n{round_history}")
     };
+    let open_findings_section = if open_findings.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nOPEN FINDINGS FROM PREVIOUS ROUND (keep IDs for still-open issues):\n{open_findings}"
+        )
+    };
     let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
+        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{open_findings_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Findings\nList unresolved issues using IDs like F-001, F-002. Include severity and file refs.\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nAlso write structured findings JSON to {}:\n\nIf APPROVED (no unresolved issues):\n{{\"round\": {round}, \"findings\": []}}\n\nIf CHANGES NEEDED:\n{{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what is wrong\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\nRules for findings.json:\n- Include every unresolved issue in the findings array.\n- Keep IDs stable for issues that remain unresolved across rounds.\n- Do not mark APPROVED when findings is non-empty.\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
+        path_text(&paths.findings_json),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
@@ -411,15 +465,23 @@ pub(crate) fn implementation_reviewer_prompt(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_consensus_prompt(
     config: &Config,
     task: &str,
     plan: &str,
     review: &str,
+    open_findings: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
+    let findings_section = if open_findings.trim().is_empty() {
+        "OPEN FINDINGS:\nNone.".to_string()
+    } else {
+        format!("OPEN FINDINGS:\n{open_findings}")
+    };
+
     format!(
         "The reviewer has APPROVED your implementation. Before confirming consensus,
 perform your own final review:
@@ -437,6 +499,8 @@ PLAN:
 
 REVIEW:
 {review}
+
+{findings_section}
 
 Write a brief summary of your self-review findings.
 
@@ -520,6 +584,10 @@ pub(crate) fn implementation_adversarial_review_prompt(
         4. Deviations from the plan that weren't flagged\n\
         5. Error handling gaps or silent failures\n\n\
         Write your detailed review to: {}\n\n\
+        Also write structured findings JSON to {}:\n\
+        - If APPROVED: {{\"round\": {round}, \"findings\": []}}\n\
+        - If CHANGES NEEDED: {{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what was missed\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\
+        Keep finding IDs stable when issues remain unresolved.\n\n\
         Include a quality rating from 1-5 in your status JSON:\n  \
         1 = poor (major bugs, missing tests, does not follow plan)\n  \
         2 = below average (significant issues or gaps)\n  \
@@ -533,6 +601,7 @@ pub(crate) fn implementation_adversarial_review_prompt(
         {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 3, \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
+        path_text(&paths.findings_json),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
@@ -770,15 +839,12 @@ mod tests {
             tasks_md: PathBuf::from("/state/tasks.md"),
             changes_md: PathBuf::from("/state/changes.md"),
             review_md: PathBuf::from("/state/review.md"),
+            findings_json: PathBuf::from("/state/findings.json"),
             status_json: PathBuf::from("/state/status.json"),
         };
 
-        let with_context = planning_initial_prompt(
-            "My task",
-            "PROJECT STRUCTURE:\nsrc/\n  main.rs",
-            "",
-            &paths,
-        );
+        let with_context =
+            planning_initial_prompt("My task", "PROJECT STRUCTURE:\nsrc/\n  main.rs", "", &paths);
         let without_context = planning_initial_prompt("My task", "", "", &paths);
 
         assert!(with_context.contains("PROJECT STRUCTURE:\nsrc/\n  main.rs"));
@@ -791,12 +857,7 @@ mod tests {
     #[test]
     fn planning_initial_prompt_injects_prior_decisions_when_present() {
         let paths = test_phase_paths();
-        let prompt = planning_initial_prompt(
-            "Task",
-            "",
-            "- [PATTERN] Reuse parser logic",
-            &paths,
-        );
+        let prompt = planning_initial_prompt("Task", "", "- [PATTERN] Reuse parser logic", &paths);
         assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
         assert!(prompt.contains("- [PATTERN] Reuse parser logic"));
     }
@@ -816,6 +877,7 @@ mod tests {
             tasks_md: PathBuf::from("/state/tasks.md"),
             changes_md: PathBuf::from("/state/changes.md"),
             review_md: PathBuf::from("/state/review.md"),
+            findings_json: PathBuf::from("/state/findings.json"),
             status_json: PathBuf::from("/state/status.json"),
         }
     }
@@ -888,6 +950,7 @@ mod tests {
             tasks_md: PathBuf::from("/state/tasks.md"),
             changes_md: PathBuf::from("/state/changes.md"),
             review_md: PathBuf::from("/state/review.md"),
+            findings_json: PathBuf::from("/state/findings.json"),
             status_json: PathBuf::from("/state/status.json"),
         };
 
@@ -914,6 +977,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "",
             "",
@@ -937,6 +1001,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             Some(checks),
             "",
             "",
@@ -963,6 +1028,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             Some("   "),
             "",
             "",
@@ -981,6 +1047,7 @@ mod tests {
             "Plan",
             "Fix validation",
             "",
+            "",
             &paths,
             history,
         );
@@ -997,7 +1064,7 @@ mod tests {
     #[test]
     fn implementation_implementer_prompt_omits_round_history_when_empty() {
         let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", &paths, "");
+        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "");
 
         assert!(!prompt.contains("ROUND HISTORY:"));
     }
@@ -1006,9 +1073,27 @@ mod tests {
     fn implementation_implementer_prompt_omits_round_history_when_whitespace_only() {
         let paths = test_phase_paths();
         let prompt =
-            implementation_implementer_prompt(1, "Task", "Plan", "", "", &paths, "   \n  ");
+            implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "   \n  ");
 
         assert!(!prompt.contains("ROUND HISTORY:"));
+    }
+
+    #[test]
+    fn implementation_implementer_prompt_includes_open_findings_when_present() {
+        let paths = test_phase_paths();
+        let prompt = implementation_implementer_prompt(
+            2,
+            "Task",
+            "Plan",
+            "Fix the previous issues",
+            "- F-001 [HIGH] Missing validation (src/lib.rs:10)",
+            "",
+            &paths,
+            "",
+        );
+
+        assert!(prompt.contains("OPEN FINDINGS (resolve every item before approval):"));
+        assert!(prompt.contains("F-001 [HIGH] Missing validation"));
     }
 
     #[test]
@@ -1020,6 +1105,7 @@ mod tests {
             1,
             "Task",
             "Plan",
+            "",
             "",
             "- [CONSTRAINT] Keep compatibility",
             &paths,
@@ -1038,6 +1124,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "- [GOTCHA] Handle stale status writes",
             "",
@@ -1056,6 +1143,7 @@ mod tests {
             "Task body",
             "Plan body",
             "Reviewer approved",
+            "",
             2,
             "2026-02-15T00:00:00.000Z",
             &paths,
@@ -1089,6 +1177,7 @@ mod tests {
             2,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "",
             history,
@@ -1118,6 +1207,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "",
             "",
@@ -1165,6 +1255,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "",
             "",
@@ -1177,6 +1268,7 @@ mod tests {
         assert!(prompt.contains("## Tests"), "missing Tests section");
         assert!(prompt.contains("## Style"), "missing Style section");
         assert!(prompt.contains("## Security"), "missing Security section");
+        assert!(prompt.contains("## Findings"), "missing Findings section");
         assert!(prompt.contains("## Verdict"), "missing Verdict section");
     }
 
@@ -1217,6 +1309,7 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
             "",
             "",
@@ -1233,6 +1326,10 @@ mod tests {
         assert!(
             prompt.contains("\"rating\":"),
             "missing rating field in JSON status"
+        );
+        assert!(
+            prompt.contains("\"findings\":"),
+            "missing findings JSON template"
         );
     }
 
@@ -1364,6 +1461,10 @@ mod tests {
         assert!(
             prompt.contains("\"rating\":"),
             "missing rating field in JSON status"
+        );
+        assert!(
+            prompt.contains("\"findings\":"),
+            "missing findings JSON template"
         );
         assert!(
             prompt.contains("\"round\": 2"),

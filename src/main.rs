@@ -371,7 +371,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent: claude|codex\n  REVIEWER                              Reviewer agent: claude|codex (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent: claude|codex\n  REVIEWER                              Reviewer agent: claude|codex (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -1054,7 +1054,8 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
             ));
         }
 
-        let exit_code = phase_success_to_exit_code(phases::task_decomposition_phase_resume(&config));
+        let exit_code =
+            phase_success_to_exit_code(phases::task_decomposition_phase_resume(&config));
         if exit_code != 0 {
             let final_status = state::read_status(&config);
             if final_status.status == state::Status::Interrupted {
@@ -1070,7 +1071,10 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
 
     let plan_content = if let Some(path) = args.file.as_ref() {
         fs::read_to_string(path).map_err(|err| {
-            AgentLoopError::Config(format!("Failed to read plan file '{}': {err}", path.display()))
+            AgentLoopError::Config(format!(
+                "Failed to read plan file '{}': {err}",
+                path.display()
+            ))
         })?
     } else {
         fs::read_to_string(config.state_dir.join("plan.md")).unwrap_or_default()
@@ -1418,7 +1422,10 @@ fn implement_all_tasks_per_task(
 
 fn implement_all_tasks_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let tasks_file = project_dir.join(".agent-loop").join("state").join("tasks.md");
+    let tasks_file = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join("tasks.md");
     if !tasks_file.is_file() {
         return Err(AgentLoopError::State(
             "No tasks found. Run 'agent-loop tasks' first.".to_string(),
@@ -1583,33 +1590,41 @@ mod tests {
         let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
-            Dispatch::MigrationError("'--tasks-file' has been removed. Use '--file' instead.".to_string())
+            Dispatch::MigrationError(
+                "'--tasks-file' has been removed. Use '--file' instead.".to_string()
+            )
         );
     }
 
     #[test]
     fn dispatch_legacy_run_variants_return_exact_migration_messages() {
-        let run = Cli::try_parse_from(["agent-loop", "run", "task text"]).expect("run should parse");
+        let run =
+            Cli::try_parse_from(["agent-loop", "run", "task text"]).expect("run should parse");
         let dispatch = dispatch_from_cli(run).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
             Dispatch::MigrationError("'run' has been removed. Use 'implement'.".to_string())
         );
 
-        let run_planning =
-            Cli::try_parse_from(["agent-loop", "run", "--planning-only"]).expect("run planning should parse");
+        let run_planning = Cli::try_parse_from(["agent-loop", "run", "--planning-only"])
+            .expect("run planning should parse");
         let dispatch = dispatch_from_cli(run_planning).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
-            Dispatch::MigrationError("'run --planning-only' has been removed. Use 'plan'.".to_string())
+            Dispatch::MigrationError(
+                "'run --planning-only' has been removed. Use 'plan'.".to_string()
+            )
         );
 
-        let run_resume =
-            Cli::try_parse_from(["agent-loop", "run", "--resume"]).expect("run resume should parse");
+        let run_resume = Cli::try_parse_from(["agent-loop", "run", "--resume"])
+            .expect("run resume should parse");
         let dispatch = dispatch_from_cli(run_resume).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
-            Dispatch::MigrationError("'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'.".to_string())
+            Dispatch::MigrationError(
+                "'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
+                    .to_string()
+            )
         );
     }
 
@@ -1623,8 +1638,9 @@ mod tests {
             .expect("tasks dispatch should succeed");
         assert!(matches!(tasks, Dispatch::Tasks(_)));
 
-        let implement = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "implement"]).unwrap())
-            .expect("implement dispatch should succeed");
+        let implement =
+            dispatch_from_cli(Cli::try_parse_from(["agent-loop", "implement"]).unwrap())
+                .expect("implement dispatch should succeed");
         assert!(matches!(implement, Dispatch::Implement(_)));
 
         let reset = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "reset"]).unwrap())

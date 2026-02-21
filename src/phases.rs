@@ -4,21 +4,22 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::{
-    agent::run_agent,
+    agent::run_agent_with_session,
     config::{Agent, Config},
     error::AgentLoopError,
     git::{git_checkpoint, git_diff_for_review, git_rev_parse_head},
     prompts::{
-        compound_prompt,
-        decomposition_initial_prompt, decomposition_reviewer_prompt, decomposition_revision_prompt,
-        gather_project_context, implementation_adversarial_review_prompt,
-        implementation_consensus_prompt, implementation_implementer_prompt,
-        implementation_reviewer_prompt, phase_paths, planning_implementer_revision_prompt,
-        planning_initial_prompt, planning_reviewer_prompt,
+        AgentRole, compound_prompt, decomposition_initial_prompt, decomposition_reviewer_prompt,
+        decomposition_revision_prompt, gather_project_context,
+        implementation_adversarial_review_prompt, implementation_consensus_prompt,
+        implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
+        planning_implementer_revision_prompt, planning_initial_prompt, planning_reviewer_prompt,
+        role_for_agent, system_prompt_for_role,
     },
     state::{
-        LoopStatus, Status, StatusPatch, append_decision, is_status_stale, log, read_decisions,
-        read_state_file, read_status, summarize_task, timestamp, write_status,
+        FindingEntry, FindingsFile, LoopStatus, Status, StatusPatch, append_decision,
+        is_status_stale, log, read_decisions, read_findings, read_findings_with_warnings,
+        read_state_file, read_status, summarize_task, timestamp, write_findings, write_status,
     },
 };
 
@@ -35,6 +36,7 @@ const CHECKPOINT_SUMMARY_MAX_LEN: usize = 80;
 const IMPLEMENTATION_CHECKPOINT_FALLBACK: &str = "implementation updates";
 const QUALITY_CHECK_TIMEOUT_SECS: u64 = 120;
 const QUALITY_CHECK_MAX_LINES: usize = 100;
+const FINDINGS_PATH_HINT: &str = ".agent-loop/state/findings.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanningReviewerAction {
@@ -64,6 +66,180 @@ enum ImplementationConsensusDecision {
     Disputed,
     Error,
     Continue,
+}
+
+#[derive(Debug, Clone)]
+struct FindingsReconcileResult {
+    status: Status,
+    findings: FindingsFile,
+    reason: Option<String>,
+    log_note: Option<String>,
+}
+
+fn normalize_findings_for_round(file: FindingsFile, round: u32) -> FindingsFile {
+    let mut normalized = Vec::new();
+    let mut used_ids = HashSet::new();
+
+    for (index, finding) in file.findings.into_iter().enumerate() {
+        let summary = finding.summary.trim();
+        if summary.is_empty() {
+            continue;
+        }
+
+        let mut id = finding.id.trim().to_string();
+        if id.is_empty() {
+            id = format!("F-{:03}", index + 1);
+        }
+        while used_ids.contains(&id) {
+            id = format!("F-{:03}", used_ids.len() + 1);
+        }
+        used_ids.insert(id.clone());
+
+        let severity = match finding.severity.trim().to_ascii_uppercase().as_str() {
+            "HIGH" => "HIGH".to_string(),
+            "LOW" => "LOW".to_string(),
+            _ => "MEDIUM".to_string(),
+        };
+
+        let file_refs = finding
+            .file_refs
+            .into_iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+
+        normalized.push(FindingEntry {
+            id,
+            severity,
+            summary: summary.to_string(),
+            file_refs,
+        });
+    }
+
+    FindingsFile {
+        round,
+        findings: normalized,
+    }
+}
+
+fn synthesize_finding(reason: Option<&str>) -> FindingEntry {
+    let summary = reason
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Reviewer requested changes but did not provide structured findings.");
+    FindingEntry {
+        id: "F-001".to_string(),
+        severity: "MEDIUM".to_string(),
+        summary: summary.to_string(),
+        file_refs: Vec::new(),
+    }
+}
+
+fn findings_id_list(findings: &FindingsFile) -> String {
+    findings
+        .findings
+        .iter()
+        .map(|finding| finding.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn findings_for_prompt(findings: &FindingsFile) -> String {
+    if findings.findings.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::with_capacity(findings.findings.len());
+    for finding in &findings.findings {
+        let refs = if finding.file_refs.is_empty() {
+            "no file refs".to_string()
+        } else {
+            finding.file_refs.join(", ")
+        };
+        lines.push(format!(
+            "- {} [{}] {} ({})",
+            finding.id, finding.severity, finding.summary, refs
+        ));
+    }
+    lines.join("\n")
+}
+
+fn reconcile_findings_after_review(
+    round: u32,
+    status: Status,
+    status_reason: Option<&str>,
+    previous_findings: &FindingsFile,
+    current_findings: FindingsFile,
+) -> FindingsReconcileResult {
+    let mut normalized = normalize_findings_for_round(current_findings, round);
+
+    match status {
+        Status::NeedsChanges => {
+            let log_note = if normalized.findings.is_empty()
+                && !previous_findings.findings.is_empty()
+            {
+                normalized = FindingsFile {
+                    round,
+                    findings: previous_findings.findings.clone(),
+                };
+                Some(
+                    "Reviewer requested changes but findings.json was empty; carrying forward previous findings.".to_string(),
+                )
+            } else if normalized.findings.is_empty() {
+                normalized = FindingsFile {
+                    round,
+                    findings: vec![synthesize_finding(status_reason)],
+                };
+                Some(
+                    "Reviewer requested changes but findings.json was empty; synthesized F-001 from status reason.".to_string(),
+                )
+            } else {
+                None
+            };
+
+            let reason = format!(
+                "Open findings: {}. See {FINDINGS_PATH_HINT}.",
+                findings_id_list(&normalized)
+            );
+
+            FindingsReconcileResult {
+                status: Status::NeedsChanges,
+                findings: normalized,
+                reason: Some(reason),
+                log_note,
+            }
+        }
+        Status::Approved => {
+            if normalized.findings.is_empty() {
+                FindingsReconcileResult {
+                    status: Status::Approved,
+                    findings: normalized,
+                    reason: None,
+                    log_note: None,
+                }
+            } else {
+                let reason = format!(
+                    "Cannot approve with unresolved findings: {}. See {FINDINGS_PATH_HINT}.",
+                    findings_id_list(&normalized)
+                );
+                FindingsReconcileResult {
+                    status: Status::NeedsChanges,
+                    findings: normalized,
+                    reason: Some(reason),
+                    log_note: Some(
+                        "Reviewer returned APPROVED with unresolved findings; forcing NEEDS_CHANGES."
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+        _ => FindingsReconcileResult {
+            status,
+            findings: normalized,
+            reason: None,
+            log_note: None,
+        },
+    }
 }
 
 fn planning_reviewer_action(status: Status) -> PlanningReviewerAction {
@@ -181,7 +357,21 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
         task,
         plan,
         config,
-        &mut |agent, prompt, current_config| run_agent(agent, prompt, current_config).map(|_| ()),
+        &mut |agent, prompt, current_config| {
+            let role = role_for_agent(agent, current_config);
+            let sp = system_prompt_for_role(role, current_config);
+            let sp_ref = if sp.is_empty() {
+                None
+            } else {
+                Some(sp.as_str())
+            };
+            let session_key = match role {
+                AgentRole::Implementer => "implementer",
+                AgentRole::Reviewer => "reviewer",
+            };
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+                .map(|_| ())
+        },
         &mut |message, current_config| {
             let _ = log(message, current_config);
         },
@@ -279,8 +469,19 @@ fn run_agent_or_record_error(
     agent: Agent,
     prompt: &str,
     round: Option<u32>,
+    role: AgentRole,
 ) -> bool {
-    match run_agent(agent, prompt, config) {
+    let sp = system_prompt_for_role(role, config);
+    let sp_ref = if sp.is_empty() {
+        None
+    } else {
+        Some(sp.as_str())
+    };
+    let session_key = match role {
+        AgentRole::Implementer => "implementer",
+        AgentRole::Reviewer => "reviewer",
+    };
+    match run_agent_with_session(agent, prompt, config, sp_ref, Some(session_key)) {
         Ok(_) => true,
         Err(AgentLoopError::Interrupted(reason)) => {
             let _ = write_status(
@@ -853,7 +1054,7 @@ fn format_summary_block(status: &LoopStatus) -> String {
     lines.push(border);
     lines.push("\n📁 State files in: .agent-loop/state/".to_string());
     lines.push(
-        "   - task.md, plan.md, tasks.md, changes.md, review.md, status.json, log.txt".to_string(),
+        "   - task.md, plan.md, tasks.md, changes.md, review.md, findings.json, status.json, log.txt".to_string(),
     );
     lines.push(String::new());
 
@@ -915,6 +1116,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         config.implementer,
         &planning_initial_prompt(&task, &project_context, &decisions, &paths),
         Some(0),
+        AgentRole::Implementer,
     ) {
         return false;
     }
@@ -950,6 +1152,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 dispute_reason.as_deref(),
             ),
             Some(planning_round),
+            AgentRole::Reviewer,
         ) {
             return false;
         }
@@ -1004,6 +1207,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                         &paths,
                     ),
                     Some(planning_round),
+                    AgentRole::Implementer,
                 ) {
                     return false;
                 }
@@ -1218,6 +1422,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 config.implementer,
                 &decomposition_initial_prompt(&task, &plan, &project_context, &paths),
                 Some(round),
+                AgentRole::Implementer,
             ) {
                 return false;
             }
@@ -1249,6 +1454,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     &paths,
                 ),
                 Some(round),
+                AgentRole::Implementer,
             ) {
                 return false;
             }
@@ -1296,6 +1502,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 &paths,
             ),
             Some(round),
+            AgentRole::Reviewer,
         ) {
             return false;
         }
@@ -1516,6 +1723,13 @@ where
         let task = read_state_file_fn("task.md", config);
         let plan = read_state_file_fn("plan.md", config);
         let previous_review = read_state_file_fn("review.md", config);
+        let previous_findings_result = read_findings_with_warnings(config);
+        for warning in &previous_findings_result.warnings {
+            log_fn(&format!("⚠ findings.json: {warning}"), config);
+        }
+        let findings_before_review =
+            normalize_findings_for_round(previous_findings_result.findings_file, round);
+        let open_findings_for_prompt = findings_for_prompt(&findings_before_review);
 
         let impl_history = read_history_fn(config, HISTORY_MAX_LINES);
 
@@ -1527,6 +1741,7 @@ where
                 &task,
                 &plan,
                 &previous_review,
+                &open_findings_for_prompt,
                 &phase_decisions,
                 &paths,
                 &impl_history,
@@ -1582,6 +1797,7 @@ where
                 round,
                 &reviewer_prompt_timestamp,
                 &paths,
+                &open_findings_for_prompt,
                 quality_checks_output.as_deref(),
                 &phase_decisions,
                 &reviewer_history,
@@ -1621,6 +1837,44 @@ where
             );
             status = read_status_fn(config);
         }
+
+        let reviewer_findings_result = read_findings_with_warnings(config);
+        for warning in &reviewer_findings_result.warnings {
+            log_fn(&format!("⚠ findings.json: {warning}"), config);
+        }
+        let reviewer_findings = reconcile_findings_after_review(
+            round,
+            status.status,
+            status.reason.as_deref(),
+            &findings_before_review,
+            reviewer_findings_result.findings_file,
+        );
+        if let Some(note) = reviewer_findings.log_note.as_deref() {
+            log_fn(&format!("⚠ {note}"), config);
+        }
+        if matches!(status.status, Status::NeedsChanges | Status::Approved) {
+            if let Err(err) = write_findings(&reviewer_findings.findings, config) {
+                log_fn(
+                    &format!("WARN: failed to write findings.json: {err}"),
+                    config,
+                );
+            }
+            if reviewer_findings.status != status.status
+                || reviewer_findings.reason.as_deref() != status.reason.as_deref()
+            {
+                write_status_fn(
+                    StatusPatch {
+                        status: Some(reviewer_findings.status),
+                        round: Some(round),
+                        reason: reviewer_findings.reason.clone(),
+                        ..StatusPatch::default()
+                    },
+                    config,
+                );
+                status = read_status_fn(config);
+            }
+        }
+
         log_fn(&format!("📊 Review result: {}", status.status), config);
 
         let review_summary = match status.status {
@@ -1674,6 +1928,14 @@ where
                         config,
                     );
                     let first_review = read_state_file_fn("review.md", config);
+                    let findings_before_adversarial_result = read_findings_with_warnings(config);
+                    for warning in &findings_before_adversarial_result.warnings {
+                        log_fn(&format!("⚠ findings.json: {warning}"), config);
+                    }
+                    let findings_before_adversarial = normalize_findings_for_round(
+                        findings_before_adversarial_result.findings_file,
+                        round,
+                    );
 
                     // Write intermediate Reviewing status before adversarial call.
                     // This prevents false consensus if the adversarial agent fails to
@@ -1743,6 +2005,47 @@ where
                         adversarial_status = read_status_fn(config);
                     }
 
+                    let adversarial_findings_result = read_findings_with_warnings(config);
+                    for warning in &adversarial_findings_result.warnings {
+                        log_fn(&format!("⚠ findings.json: {warning}"), config);
+                    }
+                    let adversarial_findings = reconcile_findings_after_review(
+                        round,
+                        adversarial_status.status,
+                        adversarial_status.reason.as_deref(),
+                        &findings_before_adversarial,
+                        adversarial_findings_result.findings_file,
+                    );
+                    if let Some(note) = adversarial_findings.log_note.as_deref() {
+                        log_fn(&format!("⚠ {note}"), config);
+                    }
+                    if matches!(
+                        adversarial_status.status,
+                        Status::NeedsChanges | Status::Approved
+                    ) {
+                        if let Err(err) = write_findings(&adversarial_findings.findings, config) {
+                            log_fn(
+                                &format!("WARN: failed to write findings.json: {err}"),
+                                config,
+                            );
+                        }
+                        if adversarial_findings.status != adversarial_status.status
+                            || adversarial_findings.reason.as_deref()
+                                != adversarial_status.reason.as_deref()
+                        {
+                            write_status_fn(
+                                StatusPatch {
+                                    status: Some(adversarial_findings.status),
+                                    round: Some(round),
+                                    reason: adversarial_findings.reason.clone(),
+                                    ..StatusPatch::default()
+                                },
+                                config,
+                            );
+                            adversarial_status = read_status_fn(config);
+                        }
+                    }
+
                     let adversarial_summary = match adversarial_status.status {
                         Status::Approved => "APPROVED (adversarial)".to_string(),
                         Status::NeedsChanges => format!(
@@ -1764,6 +2067,10 @@ where
                             );
 
                             let review = read_state_file_fn("review.md", config);
+                            let open_findings = findings_for_prompt(&normalize_findings_for_round(
+                                read_findings(config),
+                                round,
+                            ));
                             let consensus_prompt_timestamp = timestamp_fn();
                             if let Err(err) = run_agent_fn(
                                 config.implementer,
@@ -1772,6 +2079,7 @@ where
                                     &task,
                                     &plan,
                                     &review,
+                                    &open_findings,
                                     round,
                                     &consensus_prompt_timestamp,
                                     &paths,
@@ -1831,10 +2139,7 @@ where
                                 Status::Disputed => {
                                     format!(
                                         "DISPUTED — {}",
-                                        final_status
-                                            .reason
-                                            .as_deref()
-                                            .unwrap_or("see status.json")
+                                        final_status.reason.as_deref().unwrap_or("see status.json")
                                     )
                                 }
                                 other => format!("{other}"),
@@ -1928,6 +2233,10 @@ where
                     );
 
                     let review = read_state_file_fn("review.md", config);
+                    let open_findings = findings_for_prompt(&normalize_findings_for_round(
+                        read_findings(config),
+                        round,
+                    ));
                     let consensus_prompt_timestamp = timestamp_fn();
                     if let Err(err) = run_agent_fn(
                         config.implementer,
@@ -1936,6 +2245,7 @@ where
                             &task,
                             &plan,
                             &review,
+                            &open_findings,
                             round,
                             &consensus_prompt_timestamp,
                             &paths,
@@ -2097,7 +2407,21 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent, prompt, current_config| run_agent(agent, prompt, current_config).map(|_| ()),
+        |agent, prompt, current_config| {
+            let role = role_for_agent(agent, current_config);
+            let sp = system_prompt_for_role(role, current_config);
+            let sp_ref = if sp.is_empty() {
+                None
+            } else {
+                Some(sp.as_str())
+            };
+            let session_key = match role {
+                AgentRole::Implementer => "implementer",
+                AgentRole::Reviewer => "reviewer",
+            };
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+                .map(|_| ())
+        },
         |message, current_config, current_baseline| {
             git_checkpoint(message, current_config, current_baseline);
         },
@@ -2131,7 +2455,21 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent, prompt, current_config| run_agent(agent, prompt, current_config).map(|_| ()),
+        |agent, prompt, current_config| {
+            let role = role_for_agent(agent, current_config);
+            let sp = system_prompt_for_role(role, current_config);
+            let sp_ref = if sp.is_empty() {
+                None
+            } else {
+                Some(sp.as_str())
+            };
+            let session_key = match role {
+                AgentRole::Implementer => "implementer",
+                AgentRole::Reviewer => "reviewer",
+            };
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(session_key))
+                .map(|_| ())
+        },
         |message, current_config, current_baseline| {
             git_checkpoint(message, current_config, current_baseline);
         },
@@ -2165,7 +2503,6 @@ pub fn print_summary(config: &Config) {
     let status = read_status(config);
     println!("{}", format_summary_block(&status));
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2285,7 +2622,10 @@ mod tests {
             },
             &mut |_message, _config| {},
         );
-        assert_eq!(disabled_calls, 0, "compound should be skipped when disabled");
+        assert_eq!(
+            disabled_calls, 0,
+            "compound should be skipped when disabled"
+        );
     }
 
     #[test]
@@ -2299,12 +2639,78 @@ mod tests {
         assert!(content.contains("| Round: 3 | Date: "));
 
         // Date should be YYYY-MM-DD (10 chars) right after the Date label.
-        let date_start = content
-            .find("| Date: ")
-            .expect("date field should exist")
-            + "| Date: ".len();
+        let date_start =
+            content.find("| Date: ").expect("date field should exist") + "| Date: ".len();
         let date = &content[date_start..date_start + 10];
         assert_eq!(date.len(), 10);
         assert!(date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-');
+    }
+
+    #[test]
+    fn reconcile_findings_needs_changes_synthesizes_when_missing() {
+        let previous = FindingsFile::default();
+        let current = FindingsFile::default();
+
+        let result = reconcile_findings_after_review(
+            2,
+            Status::NeedsChanges,
+            Some("missing validation"),
+            &previous,
+            current,
+        );
+
+        assert_eq!(result.status, Status::NeedsChanges);
+        assert_eq!(result.findings.round, 2);
+        assert_eq!(result.findings.findings.len(), 1);
+        assert_eq!(result.findings.findings[0].id, "F-001");
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Open findings: F-001")
+        );
+    }
+
+    #[test]
+    fn reconcile_findings_approved_with_open_forces_needs_changes() {
+        let previous = FindingsFile::default();
+        let current = FindingsFile {
+            round: 3,
+            findings: vec![FindingEntry {
+                id: "F-002".to_string(),
+                severity: "HIGH".to_string(),
+                summary: "hash mismatch".to_string(),
+                file_refs: vec!["src/lib.rs:20".to_string()],
+            }],
+        };
+
+        let result = reconcile_findings_after_review(3, Status::Approved, None, &previous, current);
+
+        assert_eq!(result.status, Status::NeedsChanges);
+        assert_eq!(result.findings.findings.len(), 1);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Cannot approve with unresolved findings: F-002")
+        );
+    }
+
+    #[test]
+    fn findings_for_prompt_renders_summary_lines() {
+        let findings = FindingsFile {
+            round: 4,
+            findings: vec![FindingEntry {
+                id: "F-010".to_string(),
+                severity: "LOW".to_string(),
+                summary: "missing docs".to_string(),
+                file_refs: vec!["README.md:1".to_string()],
+            }],
+        };
+
+        let rendered = findings_for_prompt(&findings);
+        assert!(rendered.contains("F-010 [LOW] missing docs (README.md:1)"));
     }
 }

@@ -94,9 +94,18 @@ fn plan_creates_plan_md_and_not_tasks_md() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let plan_path = project_dir.join(".agent-loop").join("state").join("plan.md");
-    let tasks_path = project_dir.join(".agent-loop").join("state").join("tasks.md");
-    assert!(plan_path.is_file(), "plan.md should exist after plan command");
+    let plan_path = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join("plan.md");
+    let tasks_path = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join("tasks.md");
+    assert!(
+        plan_path.is_file(),
+        "plan.md should exist after plan command"
+    );
     assert!(
         !tasks_path.exists(),
         "tasks.md should not be created by plan command"

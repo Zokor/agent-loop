@@ -12,9 +12,9 @@ use std::{
 };
 
 use crate::config::{
-    Agent, Config, DEFAULT_DECISIONS_MAX_LINES, DEFAULT_DECOMPOSITION_MAX_ROUNDS,
-    DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS, DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS,
-    QualityCommand, RunMode,
+    Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
+    DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS,
+    DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS, QualityCommand, RunMode,
 };
 
 #[derive(Debug, Clone)]
@@ -37,6 +37,15 @@ pub struct TestConfigOptions {
     pub max_parallel: u32,
     pub batch_implement: bool,
     pub verbose: bool,
+    pub claude_full_access: bool,
+    pub claude_allowed_tools: String,
+    pub claude_session_persistence: bool,
+    pub claude_effort_level: Option<String>,
+    pub claude_max_output_tokens: Option<u32>,
+    pub claude_max_thinking_tokens: Option<u32>,
+    pub implementer_effort_level: Option<String>,
+    pub reviewer_effort_level: Option<String>,
+    pub codex_full_access: bool,
 }
 
 impl Default for TestConfigOptions {
@@ -60,6 +69,15 @@ impl Default for TestConfigOptions {
             max_parallel: DEFAULT_MAX_PARALLEL,
             batch_implement: true,
             verbose: false,
+            claude_full_access: false,
+            claude_allowed_tools: DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string(),
+            claude_session_persistence: true,
+            claude_effort_level: None,
+            claude_max_output_tokens: None,
+            claude_max_thinking_tokens: None,
+            implementer_effort_level: None,
+            reviewer_effort_level: None,
+            codex_full_access: false,
         }
     }
 }
@@ -101,6 +119,15 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         max_parallel: options.max_parallel,
         batch_implement: options.batch_implement,
         verbose: options.verbose,
+        claude_full_access: options.claude_full_access,
+        claude_allowed_tools: options.claude_allowed_tools.clone(),
+        claude_session_persistence: options.claude_session_persistence,
+        claude_effort_level: options.claude_effort_level.clone(),
+        claude_max_output_tokens: options.claude_max_output_tokens,
+        claude_max_thinking_tokens: options.claude_max_thinking_tokens,
+        implementer_effort_level: options.implementer_effort_level.clone(),
+        reviewer_effort_level: options.reviewer_effort_level.clone(),
+        codex_full_access: options.codex_full_access,
     }
 }
 

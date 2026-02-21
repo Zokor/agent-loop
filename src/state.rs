@@ -786,6 +786,67 @@ fn cap_conversation_file(config: &Config) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Reviewer findings persistence (findings.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingEntry {
+    pub id: String,
+    pub severity: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FindingsFile {
+    pub round: u32,
+    pub findings: Vec<FindingEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FindingsReadResult {
+    pub findings_file: FindingsFile,
+    #[allow(dead_code)]
+    pub warnings: Vec<String>,
+}
+
+pub fn read_findings_with_warnings(config: &Config) -> FindingsReadResult {
+    let raw = read_state_file("findings.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return FindingsReadResult {
+            findings_file: FindingsFile::default(),
+            warnings: Vec::new(),
+        };
+    }
+
+    match serde_json::from_str::<FindingsFile>(trimmed) {
+        Ok(findings_file) => FindingsReadResult {
+            findings_file,
+            warnings: Vec::new(),
+        },
+        Err(err) => {
+            let warning = format!("invalid findings.json: {err}; starting fresh");
+            eprintln!("\u{26a0} {warning}");
+            FindingsReadResult {
+                findings_file: FindingsFile::default(),
+                warnings: vec![warning],
+            }
+        }
+    }
+}
+
+pub fn read_findings(config: &Config) -> FindingsFile {
+    read_findings_with_warnings(config).findings_file
+}
+
+pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
+    write_state_file("findings.json", &serialized, config)
+}
+
+// ---------------------------------------------------------------------------
 // Task lifecycle persistence (task_status.json)
 // ---------------------------------------------------------------------------
 
@@ -990,6 +1051,7 @@ pub fn init(
     write_state_file("task.md", task, config)?;
     write_state_file("plan.md", "", config)?;
     write_state_file("review.md", "", config)?;
+    write_findings(&FindingsFile::default(), config)?;
     write_state_file("changes.md", "", config)?;
     write_state_file("conversation.md", "", config)?;
     write_state_file("log.txt", "", config)?;
@@ -1254,6 +1316,7 @@ mod tests {
             "task.md",
             "plan.md",
             "review.md",
+            "findings.json",
             "changes.md",
             "log.txt",
             "status.json",
@@ -2411,6 +2474,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Findings persistence tests (findings.json)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn findings_round_trip_read_write() {
+        let project = new_project();
+        let findings = FindingsFile {
+            round: 2,
+            findings: vec![
+                FindingEntry {
+                    id: "F-001".to_string(),
+                    severity: "HIGH".to_string(),
+                    summary: "Recompute hash after ID migration".to_string(),
+                    file_refs: vec![
+                        "ActivityVariation.php:48".to_string(),
+                        "StoreActivityVariationRequest.php:92".to_string(),
+                    ],
+                },
+                FindingEntry {
+                    id: "F-002".to_string(),
+                    severity: "MEDIUM".to_string(),
+                    summary: "Add validation rules for nested IDs".to_string(),
+                    file_refs: vec![],
+                },
+            ],
+        };
+
+        write_findings(&findings, &project.config).expect("write_findings should succeed");
+        let reloaded = read_findings(&project.config);
+        assert_eq!(reloaded, findings);
+    }
+
+    #[test]
+    fn findings_missing_or_empty_returns_default() {
+        let project = new_project();
+
+        // Missing file
+        let result = read_findings(&project.config);
+        assert_eq!(result, FindingsFile::default());
+        assert!(result.findings.is_empty());
+
+        // Empty file
+        write_state_file("findings.json", "", &project.config).expect("empty write should succeed");
+        let result = read_findings(&project.config);
+        assert_eq!(result, FindingsFile::default());
+
+        // Whitespace-only file
+        write_state_file("findings.json", "   \n\t  ", &project.config)
+            .expect("whitespace write should succeed");
+        let result = read_findings(&project.config);
+        assert_eq!(result, FindingsFile::default());
+    }
+
+    #[test]
+    fn findings_corrupt_json_recovers_with_warning() {
+        let project = new_project();
+        write_state_file("findings.json", "{broken json", &project.config)
+            .expect("corrupt write should succeed");
+
+        let result = read_findings_with_warnings(&project.config);
+        assert_eq!(result.findings_file, FindingsFile::default());
+        assert_eq!(result.warnings.len(), 1);
+        assert!(
+            result.warnings[0].contains("invalid findings.json"),
+            "warning should mention corruption, got: {}",
+            result.warnings[0]
+        );
+    }
+
+    #[test]
+    fn findings_omits_empty_file_refs() {
+        let finding = FindingEntry {
+            id: "F-123".to_string(),
+            severity: "LOW".to_string(),
+            summary: "Minor naming mismatch".to_string(),
+            file_refs: vec![],
+        };
+
+        let json = serde_json::to_value(&finding).expect("finding should serialize");
+        assert!(!json.as_object().unwrap().contains_key("file_refs"));
+
+        let with_refs = FindingEntry {
+            file_refs: vec!["src/main.rs:42".to_string()],
+            ..finding
+        };
+        let json = serde_json::to_value(&with_refs).expect("finding with refs should serialize");
+        assert_eq!(json["file_refs"][0], "src/main.rs:42");
+    }
+
+    // -----------------------------------------------------------------------
     // Task status persistence tests
     // -----------------------------------------------------------------------
 
@@ -2754,11 +2907,17 @@ mod tests {
 
         write_workflow(WorkflowKind::Decompose, &project.config)
             .expect("write_workflow Decompose should succeed");
-        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Decompose));
+        assert_eq!(
+            read_workflow(&project.config),
+            Some(WorkflowKind::Decompose)
+        );
 
         write_workflow(WorkflowKind::Implement, &project.config)
             .expect("write_workflow Implement should succeed");
-        assert_eq!(read_workflow(&project.config), Some(WorkflowKind::Implement));
+        assert_eq!(
+            read_workflow(&project.config),
+            Some(WorkflowKind::Implement)
+        );
     }
 
     #[test]

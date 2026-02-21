@@ -65,6 +65,7 @@ const READ_TIMESTAMP_SNIPPET: &str = r#"
 STATE_DIR="$(pwd)/.agent-loop/state"
 mkdir -p "$STATE_DIR"
 STATUS_FILE="$STATE_DIR/status.json"
+FINDINGS_FILE="$STATE_DIR/findings.json"
 ALL_ARGS="$*"
 CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
 if [ -z "$CURRENT_TS" ]; then
@@ -82,6 +83,7 @@ for arg in "$@"; do
     esac
 done
 {READ_TIMESTAMP_SNIPPET}
+printf '{{"round":1,"findings":[]}}' > "$FINDINGS_FILE"
 printf '{{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
 exit 0
 "#
@@ -108,9 +110,11 @@ fi
 COUNT=$((COUNT + 1))
 echo "$COUNT" > "$COUNTER_FILE"
 if [ "$COUNT" -ge {succeed_on} ]; then
+    printf '{{"round":1,"findings":[]}}' > "$FINDINGS_FILE"
     printf '{{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
     exit 0
 fi
+printf '{{"round":1,"findings":[{{"id":"F-001","severity":"MEDIUM","summary":"not ready","file_refs":[]}}]}}' > "$FINDINGS_FILE"
 printf '{{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"not ready","timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
 exit 1
 "#
@@ -195,7 +199,10 @@ fn implement_runs_all_tasks_in_one_batch_by_default() {
         "batch metrics entry should use aggregate title"
     );
     assert!(
-        metric_entries[0]["duration_ms"].as_u64().unwrap_or_default() > 0,
+        metric_entries[0]["duration_ms"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
         "batch metrics should include duration"
     );
 
@@ -215,7 +222,10 @@ fn implement_continue_on_fail_runs_remaining_tasks() {
     );
 
     let output = run_implement_cmd(&project_dir, &["--per-task", "--continue-on-fail"]);
-    assert!(!output.status.success(), "should exit non-zero with failures");
+    assert!(
+        !output.status.success(),
+        "should exit non-zero with failures"
+    );
 
     let status = read_task_status(&project_dir);
     let tasks = status["tasks"].as_array().expect("tasks array");
@@ -254,8 +264,11 @@ fn implement_fail_fast_stops_after_first_failure_in_per_task_mode() {
 fn implement_uses_per_task_mode_when_batch_implement_disabled_in_toml() {
     let project_dir = create_project_dir("batch_implement_disabled");
     create_succeeding_agents(&project_dir);
-    fs::write(project_dir.join(".agent-loop.toml"), "batch_implement = false\n")
-        .expect("toml should be written");
+    fs::write(
+        project_dir.join(".agent-loop.toml"),
+        "batch_implement = false\n",
+    )
+    .expect("toml should be written");
 
     write_state_file(
         &project_dir,

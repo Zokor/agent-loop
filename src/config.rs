@@ -18,6 +18,7 @@ pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 200;
 pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 pub const DEFAULT_DECISIONS_MAX_LINES: u32 = 50;
+pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob,WebFetch";
 
 const CONFIG_FILE_NAME: &str = ".agent-loop.toml";
 
@@ -70,6 +71,28 @@ struct FileConfig {
     max_parallel: Option<u32>,
     /// Implement all tasks from tasks.md in one batch loop (default true).
     batch_implement: Option<bool>,
+
+    // ── Claude CLI tuning ──────────────────────────────────────────
+    /// Bypass allowedTools and use `--dangerously-skip-permissions`.
+    claude_full_access: Option<bool>,
+    /// Comma-separated list of tools Claude is allowed to use.
+    claude_allowed_tools: Option<String>,
+    /// Persist Claude sessions across implementation rounds.
+    claude_session_persistence: Option<bool>,
+    /// Global Claude effort level: `"low"`, `"medium"`, `"high"`.
+    claude_effort_level: Option<String>,
+    /// Max output tokens for Claude (up to 64000).
+    claude_max_output_tokens: Option<u32>,
+    /// Max thinking tokens for Claude extended thinking.
+    claude_max_thinking_tokens: Option<u32>,
+    /// Effort level override for the implementer role.
+    implementer_effort_level: Option<String>,
+    /// Effort level override for the reviewer role.
+    reviewer_effort_level: Option<String>,
+
+    // ── Codex CLI tuning ───────────────────────────────────────────
+    /// Bypass --full-auto and use `--dangerously-bypass-approvals-and-sandbox`.
+    codex_full_access: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +149,28 @@ pub struct Config {
     pub max_parallel: u32,
     pub batch_implement: bool,
     pub verbose: bool,
+
+    // ── Claude CLI tuning ──────────────────────────────────────────
+    /// When true, use `--dangerously-skip-permissions` instead of `--allowedTools`.
+    pub claude_full_access: bool,
+    /// Comma-separated list of tools Claude is allowed to use.
+    pub claude_allowed_tools: String,
+    /// Persist Claude sessions across implementation rounds.
+    pub claude_session_persistence: bool,
+    /// Global Claude effort level: `"low"`, `"medium"`, `"high"`.
+    pub claude_effort_level: Option<String>,
+    /// Max output tokens for Claude (up to 64000).
+    pub claude_max_output_tokens: Option<u32>,
+    /// Max thinking tokens for Claude extended thinking.
+    pub claude_max_thinking_tokens: Option<u32>,
+    /// Effort level override for the implementer role.
+    pub implementer_effort_level: Option<String>,
+    /// Effort level override for the reviewer role.
+    pub reviewer_effort_level: Option<String>,
+
+    // ── Codex CLI tuning ───────────────────────────────────────────
+    /// When true, use `--dangerously-bypass-approvals-and-sandbox` instead of `--full-auto`.
+    pub codex_full_access: bool,
 }
 
 impl Config {
@@ -234,6 +279,32 @@ impl Config {
         // --- verbose: CLI flag > env > default (false) ---
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
+        // --- Claude CLI tuning: env > TOML > default ---
+        let claude_full_access = env_bool("CLAUDE_FULL_ACCESS")
+            .or(file.claude_full_access)
+            .unwrap_or(false);
+        let claude_allowed_tools = env_trimmed_string("CLAUDE_ALLOWED_TOOLS")
+            .or(file.claude_allowed_tools)
+            .unwrap_or_else(|| DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string());
+        let claude_session_persistence = env_bool("CLAUDE_SESSION_PERSISTENCE")
+            .or(file.claude_session_persistence)
+            .unwrap_or(true);
+        let claude_effort_level =
+            env_trimmed_string("CLAUDE_EFFORT_LEVEL").or(file.claude_effort_level);
+        let claude_max_output_tokens: Option<u32> =
+            parse_env("CLAUDE_MAX_OUTPUT_TOKENS").or(file.claude_max_output_tokens);
+        let claude_max_thinking_tokens: Option<u32> =
+            parse_env("CLAUDE_MAX_THINKING_TOKENS").or(file.claude_max_thinking_tokens);
+        let implementer_effort_level =
+            env_trimmed_string("IMPLEMENTER_EFFORT_LEVEL").or(file.implementer_effort_level);
+        let reviewer_effort_level =
+            env_trimmed_string("REVIEWER_EFFORT_LEVEL").or(file.reviewer_effort_level);
+
+        // --- Codex CLI tuning: env > TOML > default ---
+        let codex_full_access = env_bool("CODEX_FULL_ACCESS")
+            .or(file.codex_full_access)
+            .unwrap_or(false);
+
         let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
             run_mode: resolve_run_mode(single_agent),
@@ -257,6 +328,15 @@ impl Config {
             max_parallel,
             batch_implement,
             verbose,
+            claude_full_access,
+            claude_allowed_tools,
+            claude_session_persistence,
+            claude_effort_level,
+            claude_max_output_tokens,
+            claude_max_thinking_tokens,
+            implementer_effort_level,
+            reviewer_effort_level,
+            codex_full_access,
         };
 
         validate_config_bounds(&config)?;
@@ -448,6 +528,35 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         ));
     }
 
+    fn validate_effort_level(value: Option<&str>, field_name: &str) -> Result<(), AgentLoopError> {
+        if let Some(level) = value
+            && !matches!(level, "low" | "medium" | "high")
+        {
+            return Err(AgentLoopError::Config(format!(
+                "{field_name} must be one of [\"low\", \"medium\", \"high\"], got \"{level}\""
+            )));
+        }
+        Ok(())
+    }
+
+    validate_effort_level(config.claude_effort_level.as_deref(), "claude_effort_level")?;
+    validate_effort_level(
+        config.implementer_effort_level.as_deref(),
+        "implementer_effort_level",
+    )?;
+    validate_effort_level(
+        config.reviewer_effort_level.as_deref(),
+        "reviewer_effort_level",
+    )?;
+
+    if let Some(max) = config.claude_max_output_tokens
+        && (max == 0 || max > 64000)
+    {
+        return Err(AgentLoopError::Config(format!(
+            "claude_max_output_tokens must be between 1 and 64000, got {max}"
+        )));
+    }
+
     Ok(())
 }
 
@@ -479,6 +588,17 @@ mod tests {
             "PLANNING_CONTEXT_EXCERPT_LINES",
             "BATCH_IMPLEMENT",
             "VERBOSE",
+            // Claude CLI tuning
+            "CLAUDE_FULL_ACCESS",
+            "CLAUDE_ALLOWED_TOOLS",
+            "CLAUDE_SESSION_PERSISTENCE",
+            "CLAUDE_EFFORT_LEVEL",
+            "CLAUDE_MAX_OUTPUT_TOKENS",
+            "CLAUDE_MAX_THINKING_TOKENS",
+            "IMPLEMENTER_EFFORT_LEVEL",
+            "REVIEWER_EFFORT_LEVEL",
+            // Codex CLI tuning
+            "CODEX_FULL_ACCESS",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
             unsafe {
@@ -692,8 +812,8 @@ command = "cargo test"
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_defaults");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.project_dir, project_dir);
         assert_eq!(config.state_dir, project_dir.join(".agent-loop/state"));
@@ -735,8 +855,8 @@ command = "cargo test"
         set_env("TIMEOUT", "900");
 
         let project_dir = create_temp_project_root("cfg_env_overrides");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 42);
         assert_eq!(config.planning_max_rounds, 7);
@@ -760,8 +880,8 @@ command = "cargo test"
         set_env("TIMEOUT", "-1");
 
         let project_dir = create_temp_project_root("cfg_invalid_env");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, DEFAULT_MAX_ROUNDS);
         assert_eq!(config.planning_max_rounds, DEFAULT_PLANNING_MAX_ROUNDS);
@@ -792,8 +912,8 @@ command = "cargo test"
         clear_env();
 
         let project_dir = create_temp_project_root("cfg_auto_test_off");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -806,8 +926,8 @@ command = "cargo test"
         set_env("AUTO_TEST", "1");
 
         let project_dir = create_temp_project_root("cfg_auto_test_on");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_test);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -820,13 +940,13 @@ command = "cargo test"
         set_env("AUTO_TEST_CMD", "make test");
 
         let project_dir = create_temp_project_root("cfg_auto_test_cmd");
-        let config = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.auto_test_cmd, Some("make test".to_string()));
 
         set_env("AUTO_TEST_CMD", "   ");
-        let config2 = Config::from_cli(project_dir.clone(), false, false)
-            .expect("from_cli should succeed");
+        let config2 =
+            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config2.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -839,8 +959,8 @@ command = "cargo test"
         set_env("IMPLEMENTER", "codex");
 
         let project_dir = create_temp_project_root("cfg_cli_flag");
-        let config = Config::from_cli(project_dir.clone(), true, false)
-            .expect("from_cli should succeed");
+        let config =
+            Config::from_cli(project_dir.clone(), true, false).expect("from_cli should succeed");
 
         assert!(config.single_agent);
         assert_eq!(config.reviewer, Agent::Codex);
@@ -877,8 +997,7 @@ batch_implement = false
 "#,
         );
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
@@ -930,8 +1049,7 @@ batch_implement = true
         set_env("AUTO_TEST", "1");
         set_env("AUTO_TEST_CMD", "npm test");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
         assert_eq!(config.max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
@@ -959,8 +1077,7 @@ batch_implement = true
         write_toml(&dir, "single_agent = false\n");
         set_env("SINGLE_AGENT", "false");
 
-        let config =
-            Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
         assert!(config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -978,8 +1095,7 @@ batch_implement = true
         write_toml(&dir, "single_agent = true\n");
         set_env("SINGLE_AGENT", "0");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -993,8 +1109,7 @@ batch_implement = true
         write_toml(&dir, "auto_test = true\n");
         set_env("AUTO_TEST", "0");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.auto_test);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1008,8 +1123,7 @@ batch_implement = true
         write_toml(&dir, "auto_commit = true\n");
         set_env("AUTO_COMMIT", "0");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1026,8 +1140,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_reviewer_toml");
         write_toml(&dir, "reviewer = \"claude\"\nimplementer = \"claude\"\n");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         // Both claude -> explicit reviewer override honored
         assert_eq!(config.implementer, Agent::Claude);
         assert_eq!(config.reviewer, Agent::Claude);
@@ -1043,8 +1156,7 @@ batch_implement = true
         write_toml(&dir, "reviewer = \"claude\"\n");
         set_env("REVIEWER", "codex");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Codex);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1060,8 +1172,7 @@ batch_implement = true
             "implementer = \"codex\"\nreviewer = \"claude\"\nsingle_agent = true\n",
         );
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.single_agent);
         assert_eq!(config.implementer, Agent::Codex);
         assert_eq!(config.reviewer, Agent::Codex);
@@ -1076,8 +1187,7 @@ batch_implement = true
         set_env("IMPLEMENTER", "claude");
 
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
-        let config =
-            Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::Claude);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1092,8 +1202,7 @@ batch_implement = true
         clear_env();
 
         let dir = create_temp_project_root("cfg_ac_default");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1105,8 +1214,7 @@ batch_implement = true
         set_env("AUTO_COMMIT", "anything");
 
         let dir = create_temp_project_root("cfg_ac_nonzero");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1151,8 +1259,7 @@ batch_implement = true
         set_env("TIMEOUT", "0");
 
         let dir = create_temp_project_root("cfg_zero_timeout");
-        let err =
-            Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
+        let err = Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
         assert!(err.to_string().contains("timeout must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1249,8 +1356,8 @@ command = "cargo test"
         clear_env();
 
         let dir = create_temp_project_root("cfg_valid_defaults");
-        let config = Config::from_cli(dir.clone(), false, false)
-            .expect("default config should be valid");
+        let config =
+            Config::from_cli(dir.clone(), false, false).expect("default config should be valid");
         assert!(config.max_rounds > 0);
         assert!(config.planning_max_rounds > 0);
         assert!(config.timeout_seconds > 0);
@@ -1288,8 +1395,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_new_fields_default");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, None);
         assert_eq!(config.context_line_cap, None);
         assert_eq!(config.planning_context_excerpt_lines, None);
@@ -1316,8 +1422,7 @@ planning_context_excerpt_lines = 75
             &dir,
             "diff_max_lines = 250\ncontext_line_cap = 120\nplanning_context_excerpt_lines = 60\n",
         );
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(120));
         assert_eq!(config.planning_context_excerpt_lines, Some(60));
@@ -1336,8 +1441,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "diff_max_lines = 250\n");
         set_env("DIFF_MAX_LINES", "999");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(999));
         assert_eq!(config.effective_diff_max_lines(), 999);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1352,8 +1456,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "context_line_cap = 120\n");
         set_env("CONTEXT_LINE_CAP", "300");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.context_line_cap, Some(300));
         assert_eq!(config.effective_context_line_cap(), 300);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1368,8 +1471,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "planning_context_excerpt_lines = 60\n");
         set_env("PLANNING_CONTEXT_EXCERPT_LINES", "200");
 
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.planning_context_excerpt_lines, Some(200));
         assert_eq!(config.effective_planning_context_excerpt_lines(), 200);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1385,8 +1487,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_verbose_default");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1397,8 +1498,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_verbose_flag");
-        let config =
-            Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1410,8 +1510,7 @@ planning_context_excerpt_lines = 75
         set_env("VERBOSE", "1");
 
         let dir = create_temp_project_root("cfg_verbose_env");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1423,8 +1522,7 @@ planning_context_excerpt_lines = 75
         set_env("VERBOSE", "0");
 
         let dir = create_temp_project_root("cfg_verbose_flag_over_env");
-        let config =
-            Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1448,8 +1546,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_max_parallel_default");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, DEFAULT_MAX_PARALLEL);
         assert_eq!(config.max_parallel, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1462,8 +1559,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_toml_max_parallel");
         write_toml(&dir, "max_parallel = 4\n");
-        let config =
-            Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1475,8 +1571,8 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_zero_max_parallel");
         write_toml(&dir, "max_parallel = 0\n");
-        let err = Config::from_cli(dir.clone(), false, false)
-            .expect_err("max_parallel=0 should fail");
+        let err =
+            Config::from_cli(dir.clone(), false, false).expect_err("max_parallel=0 should fail");
         assert!(err.to_string().contains("max_parallel must be >= 1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
