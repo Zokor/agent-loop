@@ -10,8 +10,8 @@ use crate::{
     stuck::{StuckDetector, StuckSignal},
     git::{git_checkpoint, git_diff_for_review, git_rev_parse_head},
     prompts::{
-        AgentRole, compound_prompt, decomposition_initial_prompt, decomposition_reviewer_prompt,
-        decomposition_revision_prompt, gather_project_context,
+        AgentRole, PlanningReviewerParams, compound_prompt, decomposition_initial_prompt,
+        decomposition_reviewer_prompt, decomposition_revision_prompt, gather_project_context,
         implementation_adversarial_review_prompt, implementation_consensus_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths, state_manifest,
         planning_implementer_revision_prompt, planning_initial_prompt, planning_reviewer_prompt,
@@ -257,6 +257,136 @@ fn planning_reviewer_action(status: Status) -> PlanningReviewerAction {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Planning VERDICT parsing and findings reconciliation (Tasks 13 & 14)
+// ---------------------------------------------------------------------------
+
+/// Parse `VERDICT: APPROVED` or `VERDICT: REVISE` from reviewer output.
+fn parse_planning_verdict(text: &str) -> Option<&str> {
+    let re = regex::Regex::new(r"(?i)VERDICT:\s*(APPROVED|REVISE)").ok()?;
+    re.captures(text).map(|caps| {
+        let m = caps.get(1).unwrap();
+        if m.as_str().eq_ignore_ascii_case("APPROVED") {
+            "APPROVED"
+        } else {
+            "REVISE"
+        }
+    })
+}
+
+/// Parse planning findings JSON block from reviewer output.
+/// Looks for ```json\n[...]\n``` blocks containing findings with "id" and "description".
+fn parse_planning_findings_from_output(
+    text: &str,
+    round: u32,
+) -> Vec<crate::state::PlanningFindingEntry> {
+    use crate::state::{PlanningFindingEntry, PlanningFindingStatus};
+
+    // Look for JSON array in code blocks
+    let re = regex::Regex::new(r"```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```").ok();
+    let json_text = re
+        .and_then(|r| r.captures(text))
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str());
+
+    let Some(json_str) = json_text else {
+        return Vec::new();
+    };
+
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|v| {
+            let id = v.get("id")?.as_str()?.to_string();
+            let description = v.get("description")?.as_str()?.to_string();
+            Some(PlanningFindingEntry {
+                id,
+                description,
+                status: PlanningFindingStatus::Open,
+                round_introduced: round,
+                round_resolved: None,
+            })
+        })
+        .collect()
+}
+
+/// Reconcile planning verdict with findings, applying safety nets:
+/// - REVISE + empty findings → synthesize P-001 from reviewer prose
+/// - APPROVED + open findings → force NEEDS_REVISION
+fn reconcile_planning_verdict(
+    verdict: Option<&str>,
+    mut new_findings: Vec<crate::state::PlanningFindingEntry>,
+    existing: &crate::state::PlanningFindingsFile,
+    review_status: &LoopStatus,
+    round: u32,
+    config: &Config,
+) -> (PlanningReviewerAction, crate::state::PlanningFindingsFile) {
+    use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
+
+    // Count open findings from both existing and new
+    let existing_open: Vec<_> = existing
+        .findings
+        .iter()
+        .filter(|f| f.status == PlanningFindingStatus::Open)
+        .cloned()
+        .collect();
+
+    let action = match verdict {
+        Some("REVISE") => {
+            // Safety net: REVISE + empty findings → synthesize P-001
+            if new_findings.is_empty() {
+                let desc = review_status
+                    .reason
+                    .as_deref()
+                    .unwrap_or("Reviewer requested revision but did not provide structured findings.");
+                let next_id = crate::state::next_planning_finding_id(existing);
+                new_findings.push(PlanningFindingEntry {
+                    id: next_id,
+                    description: desc.to_string(),
+                    status: PlanningFindingStatus::Open,
+                    round_introduced: round,
+                    round_resolved: None,
+                });
+                let _ = log(
+                    "Planning reconciliation: REVISE with empty findings — synthesized finding from reviewer prose",
+                    config,
+                );
+            }
+            PlanningReviewerAction::NeedsRevision
+        }
+        Some("APPROVED") => {
+            // Safety net: APPROVED + open findings → force NEEDS_REVISION
+            let has_open = !existing_open.is_empty() || !new_findings.is_empty();
+            if has_open {
+                let _ = log(
+                    "Planning reconciliation: APPROVED with open findings — forcing NEEDS_REVISION",
+                    config,
+                );
+                PlanningReviewerAction::NeedsRevision
+            } else {
+                PlanningReviewerAction::Approved
+            }
+        }
+        _ => {
+            // Fall back to status-based decision
+            planning_reviewer_action(review_status.status)
+        }
+    };
+
+    // Merge findings: keep existing open ones, add new ones
+    let mut merged = existing.findings.clone();
+    for new_f in new_findings {
+        if !merged.iter().any(|f| f.id == new_f.id) {
+            merged.push(new_f);
+        }
+    }
+
+    let findings_file = PlanningFindingsFile { findings: merged };
+    (action, findings_file)
+}
+
 fn planning_implementer_reached_consensus(status: Status) -> bool {
     status == Status::Consensus
 }
@@ -372,7 +502,7 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
         &mut |message, current_config| {
@@ -487,7 +617,7 @@ fn run_agent_or_record_error(
         AgentRole::Planner => "planner",
     };
     let session_key = format!("{}-{}", role_str, agent.name());
-    match run_agent_with_session(agent, prompt, config, sp_ref, Some(&session_key)) {
+    match run_agent_with_session(agent, prompt, config, sp_ref, Some(&session_key), Some(role)) {
         Ok(_) => true,
         Err(AgentLoopError::Interrupted(reason)) => {
             let _ = write_status(
@@ -1123,10 +1253,17 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         )
     };
 
+    // Build a planning agent: use implementer with planner_model override if configured.
+    let planner_agent = if config.planner_model.is_some() {
+        config.implementer.clone().with_model(config.planner_model.clone())
+    } else {
+        config.implementer.clone()
+    };
+
     let _ = log("📝 Implementer proposing plan...", config);
     if !run_agent_or_record_error(
         config,
-        &config.implementer,
+        &planner_agent,
         &planning_initial_prompt(&task, &project_context, &decisions, &paths),
         Some(0),
         AgentRole::Planner,
@@ -1160,16 +1297,16 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         if !run_agent_or_record_error(
             config,
             &config.reviewer,
-            &planning_reviewer_prompt(
+            &planning_reviewer_prompt(&PlanningReviewerParams {
                 config,
-                &task,
-                &plan,
-                planning_round,
-                &reviewer_prompt_timestamp,
-                &paths,
-                dispute_reason.as_deref(),
-                &open_findings_text,
-            ),
+                task: &task,
+                plan: &plan,
+                round: planning_round,
+                prompt_timestamp: &reviewer_prompt_timestamp,
+                paths: &paths,
+                dispute_reason: dispute_reason.as_deref(),
+                open_findings: &open_findings_text,
+            }),
             Some(planning_round),
             AgentRole::Reviewer,
         ) {
@@ -1197,15 +1334,53 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             review_status = read_status(config);
         }
 
+        // --- VERDICT parsing and findings reconciliation (Tasks 13 & 14) ---
+        // Read the review output (reviewer writes to review.md or plan.md).
+        let review_output = read_state_file("review.md", config);
+        let verdict = parse_planning_verdict(&review_output);
+        let new_findings =
+            parse_planning_findings_from_output(&review_output, planning_round);
+
+        let (reconciled_action, updated_findings) = reconcile_planning_verdict(
+            verdict,
+            new_findings,
+            &planning_findings,
+            &review_status,
+            planning_round,
+            config,
+        );
+
+        // Persist updated planning findings.
+        let _ = crate::state::write_planning_findings(&updated_findings, config);
+
+        // If reconciliation overrode the status (e.g. forced NEEDS_REVISION),
+        // update status.json accordingly.
+        if reconciled_action == PlanningReviewerAction::NeedsRevision
+            && review_status.status == Status::Approved
+        {
+            warn_on_status_write(
+                "NEEDS_REVISION",
+                StatusPatch {
+                    status: Some(Status::NeedsRevision),
+                    round: Some(planning_round),
+                    reason: Some("Forced NEEDS_REVISION: open planning findings remain".to_string()),
+                    ..StatusPatch::default()
+                },
+                config,
+            );
+            review_status = read_status(config);
+        }
+
         // Append planning progress after each reviewer round.
         let progress_summary = format!(
-            "Reviewer: {} — {}",
+            "Reviewer: {} — {} (verdict: {})",
             review_status.status,
-            review_status.reason.as_deref().unwrap_or("(no reason)")
+            review_status.reason.as_deref().unwrap_or("(no reason)"),
+            verdict.unwrap_or("none"),
         );
         crate::state::append_planning_progress(planning_round, &progress_summary, config);
 
-        match planning_reviewer_action(review_status.status) {
+        match reconciled_action {
             PlanningReviewerAction::NeedsRevision => {
                 let _ = log(
                     &format!(
@@ -1220,7 +1395,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 let implementer_prompt_timestamp = timestamp();
                 if !run_agent_or_record_error(
                     config,
-                    &config.implementer,
+                    &planner_agent,
                     &planning_implementer_revision_prompt(
                         config,
                         &task,
@@ -2502,7 +2677,7 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
         |message, current_config, current_baseline| {
@@ -2552,7 +2727,7 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key))
+            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
         |message, current_config, current_baseline| {
@@ -2797,5 +2972,66 @@ mod tests {
 
         let rendered = findings_for_prompt(&findings);
         assert!(rendered.contains("F-010 [LOW] missing docs (README.md:1)"));
+    }
+
+    #[test]
+    fn parse_planning_verdict_extracts_approved() {
+        assert_eq!(
+            parse_planning_verdict("Some text\nVERDICT: APPROVED\nmore text"),
+            Some("APPROVED")
+        );
+    }
+
+    #[test]
+    fn parse_planning_verdict_extracts_revise() {
+        assert_eq!(
+            parse_planning_verdict("VERDICT:  REVISE"),
+            Some("REVISE")
+        );
+    }
+
+    #[test]
+    fn parse_planning_verdict_returns_none_when_absent() {
+        assert_eq!(parse_planning_verdict("no verdict here"), None);
+    }
+
+    #[test]
+    fn parse_planning_verdict_is_case_insensitive() {
+        assert_eq!(
+            parse_planning_verdict("verdict: approved"),
+            Some("APPROVED")
+        );
+        assert_eq!(
+            parse_planning_verdict("Verdict: revise"),
+            Some("REVISE")
+        );
+    }
+
+    #[test]
+    fn parse_planning_findings_extracts_valid_json_block() {
+        let text = r#"Here are findings:
+```json
+[{"id": "P-001", "description": "Missing error handling"}]
+```
+"#;
+        let findings = parse_planning_findings_from_output(text, 2);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].id, "P-001");
+        assert_eq!(findings[0].description, "Missing error handling");
+        assert_eq!(findings[0].round_introduced, 2);
+    }
+
+    #[test]
+    fn parse_planning_findings_returns_empty_for_no_json_block() {
+        let text = "No JSON block here, just plain text.";
+        let findings = parse_planning_findings_from_output(text, 1);
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_planning_findings_returns_empty_for_invalid_json() {
+        let text = "```json\n{not valid json}\n```";
+        let findings = parse_planning_findings_from_output(text, 1);
+        assert!(findings.is_empty());
     }
 }

@@ -247,6 +247,7 @@ pub struct Config {
     pub planning_context_excerpt_lines: Option<u32>,
     pub max_parallel: u32,
     pub batch_implement: bool,
+    #[allow(dead_code)]
     pub verbose: bool,
 
     // ── Progressive context ────────────────────────────────────────
@@ -375,7 +376,7 @@ impl Config {
         let implementer = implementer.with_model(implementer_model);
         let reviewer = if single_agent {
             if reviewer_model.is_some() {
-                eprintln!("⚠ reviewer_model is ignored in single-agent mode.");
+                eprintln!("reviewer_model is ignored when single_agent=true");
             }
             reviewer
         } else {

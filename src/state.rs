@@ -963,6 +963,8 @@ pub struct TaskStatusEntry {
     pub retries: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2660,18 +2662,21 @@ mod tests {
                     status: TaskRunStatus::Done,
                     retries: 1,
                     last_error: None,
+                    skip_reason: None,
                 },
                 TaskStatusEntry {
                     title: "Task 2: Add retries".to_string(),
                     status: TaskRunStatus::Failed,
                     retries: 2,
                     last_error: Some("MAX_ROUNDS reached".to_string()),
+                    skip_reason: None,
                 },
                 TaskStatusEntry {
                     title: "Task 3: Cleanup".to_string(),
                     status: TaskRunStatus::Pending,
                     retries: 0,
                     last_error: None,
+                    skip_reason: None,
                 },
             ],
         };
@@ -2777,6 +2782,7 @@ mod tests {
             status: TaskRunStatus::Done,
             retries: 0,
             last_error: None,
+            skip_reason: None,
         };
 
         let json = serde_json::to_value(&entry).unwrap();
@@ -2791,6 +2797,27 @@ mod tests {
     }
 
     #[test]
+    fn task_status_omits_none_skip_reason_and_includes_when_set() {
+        let entry = TaskStatusEntry {
+            title: "Task 1".to_string(),
+            status: TaskRunStatus::Skipped,
+            retries: 0,
+            last_error: None,
+            skip_reason: None,
+        };
+
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("skip_reason"));
+
+        let with_reason = TaskStatusEntry {
+            skip_reason: Some("dependency failed: Task 0".to_string()),
+            ..entry
+        };
+        let json = serde_json::to_value(&with_reason).unwrap();
+        assert_eq!(json["skip_reason"], "dependency failed: Task 0");
+    }
+
+    #[test]
     fn task_status_write_uses_atomic_state_file() {
         let project = new_project();
         let status_file = TaskStatusFile {
@@ -2799,6 +2826,7 @@ mod tests {
                 status: TaskRunStatus::Running,
                 retries: 0,
                 last_error: None,
+                skip_reason: None,
             }],
         };
 

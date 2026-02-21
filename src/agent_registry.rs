@@ -222,6 +222,7 @@ pub fn get_agent_spec(name: &str) -> Option<&'static AgentSpec> {
 
 /// Validate that every agent's `default_reviewer` references another valid
 /// agent in the registry. Panics on the first violation found.
+#[allow(dead_code)]
 pub fn validate_registry() {
     for (name, spec) in REGISTRY.iter() {
         assert!(

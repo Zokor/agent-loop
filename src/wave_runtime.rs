@@ -21,6 +21,7 @@ pub struct LockFileContent {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct WaveRunLock {
     pub pid: u32,
     pub started_at: String,
@@ -44,34 +45,9 @@ impl WaveRunLock {
         max_parallel: u32,
         stale_seconds: u64,
     ) -> Result<Self, String> {
-        if lock_path.exists() {
-            let raw = fs::read_to_string(&lock_path)
-                .map_err(|e| format!("Failed to read lock file: {e}"))?;
-            let existing: LockFileContent = serde_json::from_str(&raw)
-                .map_err(|e| format!("Failed to parse lock file: {e}"))?;
-
-            let stale = is_lock_stale(&lock_path, stale_seconds);
-            let alive = is_pid_alive(existing.pid);
-
-            if alive && !stale {
-                return Err(format!(
-                    "Wave lock held by PID {} since {}",
-                    existing.pid, existing.started_at
-                ));
-            }
-
-            // Reclaim the stale / dead-owner lock.
-            if !alive {
-                eprintln!(
-                    "Warning: reclaiming wave lock from dead PID {}",
-                    existing.pid
-                );
-            } else {
-                eprintln!(
-                    "Warning: reclaiming stale wave lock (older than {}s) from PID {}",
-                    stale_seconds, existing.pid
-                );
-            }
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create lock directory: {e}"))?;
         }
 
         let pid = std::process::id();
@@ -87,13 +63,55 @@ impl WaveRunLock {
         let json = serde_json::to_string(&content)
             .map_err(|e| format!("Failed to serialize lock file: {e}"))?;
 
-        if let Some(parent) = lock_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create lock directory: {e}"))?;
-        }
+        // Attempt atomic creation via O_CREAT | O_EXCL to avoid TOCTOU.
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                file.write_all(json.as_bytes())
+                    .map_err(|e| format!("Failed to write lock file: {e}"))?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Lock file exists — check if reclaimable.
+                let raw = fs::read_to_string(&lock_path)
+                    .map_err(|e| format!("Failed to read lock file: {e}"))?;
+                let existing: LockFileContent = serde_json::from_str(&raw)
+                    .map_err(|e| format!("Failed to parse lock file: {e}"))?;
 
-        fs::write(&lock_path, json)
-            .map_err(|e| format!("Failed to write lock file: {e}"))?;
+                let stale = is_lock_stale(&lock_path, stale_seconds);
+                let alive = is_pid_alive(existing.pid);
+
+                if alive && !stale {
+                    return Err(format!(
+                        "Wave run already in progress (PID {}, started {}). \
+                         Use 'agent-loop reset --wave-lock' to force.",
+                        existing.pid, existing.started_at
+                    ));
+                }
+
+                // Reclaim the stale / dead-owner lock.
+                if !alive {
+                    eprintln!(
+                        "Warning: reclaiming wave lock from dead process (PID {})",
+                        existing.pid
+                    );
+                } else {
+                    eprintln!(
+                        "Warning: reclaiming stale wave lock (older than {}s) from PID {}",
+                        stale_seconds, existing.pid
+                    );
+                }
+
+                // Overwrite with our lock content.
+                fs::write(&lock_path, json)
+                    .map_err(|e| format!("Failed to write lock file: {e}"))?;
+            }
+            Err(e) => {
+                return Err(format!("Failed to create lock file: {e}"));
+            }
+        }
 
         Ok(Self {
             pid,
@@ -113,6 +131,7 @@ impl WaveRunLock {
 
     /// Returns `true` when the lock file's modification time is older than
     /// `stale_seconds` from *now*.
+    #[cfg(test)]
     fn is_stale(&self, stale_seconds: u64) -> bool {
         is_lock_stale(&self.lock_path, stale_seconds)
     }
@@ -227,7 +246,7 @@ pub fn read_recent_events(
     let reader = std::io::BufReader::new(file);
     let all_events: Vec<WaveProgressEvent> = reader
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter_map(|line| serde_json::from_str::<WaveProgressEvent>(&line).ok())
         .collect();
 
@@ -328,7 +347,7 @@ mod tests {
         let err = WaveRunLock::acquire(lock_path.clone(), "wave", 4, 300);
         assert!(err.is_err(), "second acquire should fail while lock is held");
         assert!(
-            err.unwrap_err().contains("Wave lock held by PID"),
+            err.unwrap_err().contains("Wave run already in progress"),
             "error should mention the holding PID"
         );
 

@@ -224,9 +224,9 @@ impl ImplementArgs {
             ));
         }
 
-        if self.wave && (self.task.is_some() || self.file.is_some() || self.resume) {
+        if self.wave && (self.task.is_some() || self.file.is_some()) {
             return Err(AgentLoopError::Config(
-                "--wave cannot be combined with --task, --file, or --resume.".to_string(),
+                "--wave cannot be combined with --task or --file.".to_string(),
             ));
         }
 
@@ -804,6 +804,7 @@ fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<Ta
                     status: TaskRunStatus::Pending,
                     retries: 0,
                     last_error: None,
+                    skip_reason: None,
                 }
             }
         })
@@ -971,6 +972,7 @@ fn persist_batch_task_state(
                 status: task_status,
                 retries: 0,
                 last_error,
+                skip_reason: None,
             }],
         },
         config,
@@ -1250,7 +1252,7 @@ fn implement_all_tasks_wave(
         effective_max_parallel as u32,
         config.wave_lock_stale_seconds,
     )
-    .map_err(|e| AgentLoopError::Wave(e))?;
+    .map_err(AgentLoopError::Wave)?;
 
     // Journal file for progress events.
     let journal_path = config.state_dir.join("wave-progress.jsonl");
@@ -1284,6 +1286,7 @@ fn implement_all_tasks_wave(
             status: TaskRunStatus::Pending,
             retries: 0,
             last_error: None,
+            skip_reason: None,
         })
         .collect();
     let persisted = state::read_task_status(config);
@@ -1294,10 +1297,15 @@ fn implement_all_tasks_wave(
     }
 
     let mut task_results: Vec<Option<bool>> = vec![None; parsed_tasks.len()];
-    // Pre-fill results from persisted state.
-    for (i, entry) in wave_statuses.iter().enumerate() {
+    // Pre-fill results from persisted state; reset interrupted/skipped tasks for re-run.
+    for (i, entry) in wave_statuses.iter_mut().enumerate() {
         if entry.status == TaskRunStatus::Done {
             task_results[i] = Some(true);
+        } else if entry.status == TaskRunStatus::Skipped || entry.status == TaskRunStatus::Failed {
+            // On resume, reset non-done tasks so they are re-evaluated.
+            entry.status = TaskRunStatus::Pending;
+            entry.skip_reason = None;
+            entry.last_error = None;
         }
     }
     let mut had_failures = false;
@@ -1306,6 +1314,8 @@ fn implement_all_tasks_wave(
     for (wave_idx, wave_tasks) in schedule.waves.iter().enumerate() {
         // Check for interrupt before starting each wave.
         if interrupt::is_interrupted() {
+            terminalize_interrupted_tasks(&mut wave_statuses);
+            persist_wave_statuses(&wave_statuses, config)?;
             let _ = wave_runtime::append_journal_event(
                 &journal_path,
                 &wave_runtime::WaveProgressEvent::RunInterrupted {
@@ -1327,18 +1337,22 @@ fn implement_all_tasks_wave(
                 continue;
             }
 
-            let deps_ok = deps[task_idx]
+            let failed_deps: Vec<&str> = deps[task_idx]
                 .iter()
-                .all(|&dep| task_results[dep] == Some(true));
-            if deps_ok {
+                .filter(|&&dep| task_results[dep] != Some(true))
+                .map(|&dep| parsed_tasks[dep].title.as_str())
+                .collect();
+            if failed_deps.is_empty() {
                 runnable.push(task_idx);
             } else {
+                let reason = format!("dependency failed: {}", failed_deps.join(", "));
                 println!(
-                    "⏭ Skipping '{}' — dependency failed",
-                    parsed_tasks[task_idx].title
+                    "⏭ Skipping '{}' — {}",
+                    parsed_tasks[task_idx].title, reason
                 );
                 task_results[task_idx] = Some(false);
                 wave_statuses[task_idx].status = TaskRunStatus::Skipped;
+                wave_statuses[task_idx].skip_reason = Some(reason);
                 persist_wave_statuses(&wave_statuses, config)?;
                 had_failures = true;
             }
@@ -1440,11 +1454,29 @@ fn implement_all_tasks_wave(
 
             // Check interrupt before launching next task.
             if interrupt::is_interrupted() {
-                // Drain remaining in-flight.
+                // Drain remaining in-flight with a grace period.
+                let grace = std::time::Duration::from_millis(config.wave_shutdown_grace_ms);
+                let deadline = std::time::Instant::now() + grace;
                 while in_flight > 0 {
-                    let _ = rx.recv();
-                    in_flight -= 1;
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(remaining) {
+                        Ok((idx, ok)) => {
+                            in_flight -= 1;
+                            task_results[idx] = Some(ok);
+                            wave_statuses[idx].status = if ok {
+                                TaskRunStatus::Done
+                            } else {
+                                TaskRunStatus::Failed
+                            };
+                        }
+                        Err(_) => {
+                            // Grace period expired; mark remaining in-flight as interrupted.
+                            break;
+                        }
+                    }
                 }
+                terminalize_interrupted_tasks(&mut wave_statuses);
+                persist_wave_statuses(&wave_statuses, config)?;
                 let _ = wave_runtime::append_journal_event(
                     &journal_path,
                     &wave_runtime::WaveProgressEvent::RunInterrupted {
@@ -1884,6 +1916,17 @@ fn persist_wave_statuses(
     )?)
 }
 
+/// Mark any Pending or Running tasks as Skipped with an "interrupted" reason,
+/// so that `--resume` knows they were never completed.
+fn terminalize_interrupted_tasks(statuses: &mut [TaskStatusEntry]) {
+    for entry in statuses.iter_mut() {
+        if entry.status == TaskRunStatus::Pending || entry.status == TaskRunStatus::Running {
+            entry.status = TaskRunStatus::Skipped;
+            entry.skip_reason = Some("interrupted".to_string());
+        }
+    }
+}
+
 fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
     let state_dir = project_dir.join(".agent-loop").join("state");
@@ -1984,21 +2027,20 @@ fn status_command() -> Result<i32, AgentLoopError> {
 
     // Wave lock info.
     let lock_path = config.state_dir.join("wave.lock");
-    if lock_path.exists() {
-        if let Ok(raw) = fs::read_to_string(&lock_path) {
-            if let Ok(lock) = serde_json::from_str::<wave_runtime::LockFileContent>(&raw) {
-                println!();
-                println!(
-                    "wave lock: PID {} since {} (mode={}, parallel={})",
-                    lock.pid, lock.started_at, lock.mode, lock.max_parallel
-                );
-                if !wave_runtime::is_pid_alive(lock.pid) {
-                    println!(
-                        "  ⚠ Lock holder (PID {}) is dead. Run `agent-loop reset --wave-lock` to clear.",
-                        lock.pid
-                    );
-                }
-            }
+    if lock_path.exists()
+        && let Ok(raw) = fs::read_to_string(&lock_path)
+        && let Ok(lock) = serde_json::from_str::<wave_runtime::LockFileContent>(&raw)
+    {
+        println!();
+        println!(
+            "wave lock: PID {} since {} (mode={}, parallel={})",
+            lock.pid, lock.started_at, lock.mode, lock.max_parallel
+        );
+        if !wave_runtime::is_pid_alive(lock.pid) {
+            println!(
+                "  ⚠ Lock holder (PID {}) is dead. Run `agent-loop reset --wave-lock` to clear.",
+                lock.pid
+            );
         }
     }
 
@@ -2121,5 +2163,86 @@ mod tests {
         let reset = dispatch_from_cli(Cli::try_parse_from(["agent-loop", "reset"]).unwrap())
             .expect("reset dispatch should succeed");
         assert!(matches!(reset, Dispatch::Reset(_)));
+    }
+
+    #[test]
+    fn wave_resume_is_allowed() {
+        // --wave --resume should parse and validate successfully (not error).
+        let cli = Cli::try_parse_from(["agent-loop", "implement", "--wave", "--resume"])
+            .expect("--wave --resume should parse");
+        if let Some(Commands::Implement(args)) = cli.command {
+            let result = args.validate();
+            assert!(result.is_ok(), "--wave --resume should not be rejected by validate");
+        } else {
+            panic!("expected Implement command");
+        }
+    }
+
+    #[test]
+    fn wave_task_and_file_still_rejected() {
+        let cli = Cli::try_parse_from([
+            "agent-loop",
+            "implement",
+            "--wave",
+            "--task",
+            "do something",
+        ])
+        .expect("--wave --task should parse");
+        if let Some(Commands::Implement(args)) = cli.command {
+            let err = args.validate();
+            assert!(err.is_err(), "--wave --task should be rejected by validate");
+        } else {
+            panic!("expected Implement command");
+        }
+    }
+
+    #[test]
+    fn terminalize_interrupted_tasks_marks_pending_and_running_as_skipped() {
+        let mut statuses = vec![
+            TaskStatusEntry {
+                title: "Task 1".into(),
+                status: state::TaskRunStatus::Done,
+                retries: 0,
+                last_error: None,
+                skip_reason: None,
+            },
+            TaskStatusEntry {
+                title: "Task 2".into(),
+                status: state::TaskRunStatus::Pending,
+                retries: 0,
+                last_error: None,
+                skip_reason: None,
+            },
+            TaskStatusEntry {
+                title: "Task 3".into(),
+                status: state::TaskRunStatus::Running,
+                retries: 0,
+                last_error: None,
+                skip_reason: None,
+            },
+            TaskStatusEntry {
+                title: "Task 4".into(),
+                status: state::TaskRunStatus::Failed,
+                retries: 1,
+                last_error: Some("error".into()),
+                skip_reason: None,
+            },
+        ];
+
+        terminalize_interrupted_tasks(&mut statuses);
+
+        // Done and Failed should be unchanged.
+        assert_eq!(statuses[0].status, state::TaskRunStatus::Done);
+        assert!(statuses[0].skip_reason.is_none());
+
+        assert_eq!(statuses[3].status, state::TaskRunStatus::Failed);
+        assert!(statuses[3].skip_reason.is_none());
+
+        // Pending and Running should become Skipped with reason.
+        assert_eq!(statuses[1].status, state::TaskRunStatus::Skipped);
+        assert_eq!(statuses[1].skip_reason.as_deref(), Some("interrupted"));
+
+        assert_eq!(statuses[2].status, state::TaskRunStatus::Skipped);
+        assert_eq!(statuses[2].skip_reason.as_deref(), Some("interrupted"));
     }
 }

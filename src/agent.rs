@@ -14,17 +14,20 @@ use std::{
 use std::os::unix::process::CommandExt;
 
 use crate::{
+    agent_registry::OutputFormat,
     config::{Agent, Config},
     error::AgentLoopError,
+    prompts::AgentRole,
     state::{log, timestamp},
 };
 
-fn resolve_command(
+pub(crate) fn resolve_command(
     agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
     session_id: Option<&str>,
+    role: Option<AgentRole>,
 ) -> (&'static str, Vec<String>) {
     let spec = agent.spec();
 
@@ -58,9 +61,8 @@ fn resolve_command(
             args.push("--dangerously-skip-permissions".to_string());
         } else {
             args.push("--allowedTools".to_string());
-            // Reviewer gets read-only tools by default.
-            let is_reviewer = *agent == config.reviewer && config.implementer != config.reviewer;
-            let tools = if is_reviewer {
+            // Reviewer role gets read-only tools by default.
+            let tools = if role == Some(AgentRole::Reviewer) {
                 config.reviewer_allowed_tools.clone()
             } else {
                 config.claude_allowed_tools.clone()
@@ -77,11 +79,9 @@ fn resolve_command(
     }
 
     // System prompt (claude only).
-    if agent.name() == "claude" {
-        if let Some(sp) = system_prompt {
-            args.push("--append-system-prompt".to_string());
-            args.push(sp.to_string());
-        }
+    if agent.name() == "claude" && let Some(sp) = system_prompt {
+        args.push("--append-system-prompt".to_string());
+        args.push(sp.to_string());
     }
 
     (spec.binary, args)
@@ -528,10 +528,15 @@ fn extract_codex_json_usage(output: &str) -> AgentUsage {
 }
 
 fn normalize_agent_output(agent: &Agent, output: String) -> String {
-    match agent.name() {
-        "claude" => extract_claude_stream_json_text(&output).unwrap_or(output),
-        "codex" => extract_codex_json_text(&output).unwrap_or(output),
-        _ => output,
+    match agent.spec().output_format {
+        OutputFormat::ClaudeStreamJson => {
+            extract_claude_stream_json_text(&output).unwrap_or(output)
+        }
+        OutputFormat::PlainText => {
+            // For PlainText agents that emit structured JSON (e.g. Codex with --json),
+            // attempt to extract the message text from the JSON envelope.
+            extract_codex_json_text(&output).unwrap_or(output)
+        }
     }
 }
 
@@ -606,25 +611,28 @@ pub(crate) fn run_agent(
     config: &Config,
     system_prompt: Option<&str>,
 ) -> Result<String, AgentLoopError> {
-    run_agent_inner(agent, prompt, config, system_prompt, None)
+    run_agent_inner(agent, prompt, config, system_prompt, None, None)
 }
 
-/// Run an agent with optional session persistence.
+/// Run an agent with optional session persistence and explicit role.
 ///
-/// When `session_key` is `Some("implementer")` or `Some("reviewer")` and the
-/// agent is Claude with `claude_session_persistence` enabled, the function:
+/// When `session_key` is `Some("implementer-claude")` etc. and the
+/// agent supports session resume with persistence enabled, the function:
 /// 1. Reads the previous session_id from the state dir (if any)
 /// 2. Passes `--resume <session_id>` to continue the session
 /// 3. After a successful run, extracts the new session_id and stores it
 /// 4. On failure with `--resume`, clears the session file so the next call starts fresh
+///
+/// `role` is threaded through to `resolve_command` for role-based tool selection.
 pub fn run_agent_with_session(
     agent: &Agent,
     prompt: &str,
     config: &Config,
     system_prompt: Option<&str>,
     session_key: Option<&str>,
+    role: Option<AgentRole>,
 ) -> Result<String, AgentLoopError> {
-    run_agent_inner(agent, prompt, config, system_prompt, session_key)
+    run_agent_inner(agent, prompt, config, system_prompt, session_key, role)
 }
 
 fn run_agent_inner(
@@ -633,6 +641,7 @@ fn run_agent_inner(
     config: &Config,
     system_prompt: Option<&str>,
     session_key: Option<&str>,
+    role: Option<AgentRole>,
 ) -> Result<String, AgentLoopError> {
     let _ = log(&format!("▶ Running {agent}..."), config);
 
@@ -653,7 +662,7 @@ fn run_agent_inner(
     }
 
     let (command, args) =
-        resolve_command(agent, prompt, config, system_prompt, session_id.as_deref());
+        resolve_command(agent, prompt, config, system_prompt, session_id.as_deref(), role);
     let mut cmd = Command::new(command);
     cmd.args(args)
         .current_dir(&config.project_dir)
@@ -817,10 +826,9 @@ fn run_agent_inner(
         .map(|mut guard| std::mem::take(&mut *guard))
         .unwrap_or_default();
     let combined_output = String::from_utf8_lossy(&raw_bytes).into_owned();
-    let usage = match agent.name() {
-        "claude" => extract_stream_json_usage(&combined_output),
-        "codex" => extract_codex_json_usage(&combined_output),
-        _ => AgentUsage::default(),
+    let usage = match agent.spec().output_format {
+        OutputFormat::ClaudeStreamJson => extract_stream_json_usage(&combined_output),
+        OutputFormat::PlainText => extract_codex_json_usage(&combined_output),
     };
     record_agent_invocation(usage);
 
@@ -916,7 +924,7 @@ mod tests {
     #[test]
     fn resolve_command_builds_claude_with_allowed_tools_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None, None);
         assert_eq!(command, "claude");
         assert!(args.contains(&"--allowedTools".to_string()));
         assert!(args.contains(&crate::config::DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()));
@@ -927,7 +935,7 @@ mod tests {
     fn resolve_command_builds_claude_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.claude_full_access = true;
-        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None, None);
         assert_eq!(command, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--allowedTools".to_string()));
@@ -941,6 +949,7 @@ mod tests {
             "hello",
             &project.config,
             Some("system instructions"),
+            None,
             None,
         );
         assert!(args.contains(&"--append-system-prompt".to_string()));
@@ -956,6 +965,7 @@ mod tests {
             &project.config,
             None,
             Some("abc-123-session"),
+            None,
         );
         assert!(args.contains(&"--resume".to_string()));
         assert!(args.contains(&"abc-123-session".to_string()));
@@ -972,6 +982,7 @@ mod tests {
             &project.config,
             None,
             Some("sess_codex_42"),
+            None,
         );
         // Should have `exec resume <id>` in sequence
         let exec_pos = args.iter().position(|a| a == "exec").expect("exec arg");
@@ -984,7 +995,7 @@ mod tests {
     #[test]
     fn resolve_command_builds_codex_with_full_auto_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None, None);
         assert_eq!(command, "codex");
         assert!(args.contains(&"--full-auto".to_string()));
         assert!(args.contains(&"--json".to_string()));
@@ -996,7 +1007,7 @@ mod tests {
     fn resolve_command_builds_codex_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.codex_full_access = true;
-        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None);
+        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None, None);
         assert_eq!(command, "codex");
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args.contains(&"--full-auto".to_string()));

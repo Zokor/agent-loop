@@ -304,16 +304,30 @@ pub(crate) fn planning_initial_prompt(
     )
 }
 
-pub(crate) fn planning_reviewer_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    round: u32,
-    prompt_timestamp: &str,
-    paths: &PhasePaths,
-    dispute_reason: Option<&str>,
-    open_findings: &str,
-) -> String {
+/// Planning reviewer prompt parameters bundled to satisfy clippy::too_many_arguments.
+pub(crate) struct PlanningReviewerParams<'a> {
+    pub config: &'a Config,
+    pub task: &'a str,
+    pub plan: &'a str,
+    pub round: u32,
+    pub prompt_timestamp: &'a str,
+    pub paths: &'a PhasePaths,
+    pub dispute_reason: Option<&'a str>,
+    pub open_findings: &'a str,
+}
+
+pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> String {
+    let PlanningReviewerParams {
+        config,
+        task,
+        plan,
+        round,
+        prompt_timestamp,
+        paths,
+        dispute_reason,
+        open_findings,
+    } = params;
+
     let concerns_section = match dispute_reason {
         Some(reason) if !reason.trim().is_empty() => {
             format!("\n\nIMPLEMENTER'S CONCERNS:\n{reason}")
@@ -324,21 +338,21 @@ pub(crate) fn planning_reviewer_prompt(
     let findings_section = if open_findings.is_empty() {
         String::new()
     } else {
-        format!("\n\n{open_findings}")
+        format!("\n\nOPEN PLANNING FINDINGS (address or resolve each):\n{open_findings}")
     };
 
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {} and write this JSON to {}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        single_agent_reviewer_preamble(config),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        path_text(&paths.plan_md),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Findings\nList specific issues as a JSON block (use IDs like P-001, P-002, ...):\n```json\n[{{\"id\": \"P-001\", \"description\": \"issue description\"}}]\n```\nOmit the block if there are no findings.\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        preamble = single_agent_reviewer_preamble(config),
+        status_path = path_text(&paths.status_json),
+        impl_name = config.implementer,
+        rev_name = config.reviewer,
+        mode = config.run_mode,
+        plan_path = path_text(&paths.plan_md),
+        status_path2 = path_text(&paths.status_json),
+        impl_name2 = config.implementer,
+        rev_name2 = config.reviewer,
+        mode2 = config.run_mode,
     )
 }
 
@@ -930,16 +944,16 @@ mod tests {
     fn planning_reviewer_prompt_includes_concerns_when_dispute_reason_present() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            2,
-            "2026-02-14T10:00:00.000Z",
-            &paths,
-            Some("I disagree with the rollback plan"),
-            "",
-        );
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            round: 2,
+            prompt_timestamp: "2026-02-14T10:00:00.000Z",
+            paths: &paths,
+            dispute_reason: Some("I disagree with the rollback plan"),
+            open_findings: "",
+        });
 
         assert!(
             prompt.contains("IMPLEMENTER'S CONCERNS:\nI disagree with the rollback plan"),
@@ -951,16 +965,16 @@ mod tests {
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_absent() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            2,
-            "2026-02-14T10:00:00.000Z",
-            &paths,
-            None,
-            "",
-        );
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            round: 2,
+            prompt_timestamp: "2026-02-14T10:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
 
         assert!(
             !prompt.contains("IMPLEMENTER'S CONCERNS:"),
@@ -972,16 +986,16 @@ mod tests {
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_is_empty() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            2,
-            "2026-02-14T10:00:00.000Z",
-            &paths,
-            Some("   "),
-            "",
-        );
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            round: 2,
+            prompt_timestamp: "2026-02-14T10:00:00.000Z",
+            paths: &paths,
+            dispute_reason: Some("   "),
+            open_findings: "",
+        });
 
         assert!(
             !prompt.contains("IMPLEMENTER'S CONCERNS:"),
@@ -1267,16 +1281,16 @@ mod tests {
     fn planning_reviewer_prompt_includes_structured_sections() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            None,
-            "",
-        );
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
 
         assert!(
             prompt.contains("## Completeness"),
@@ -1324,16 +1338,16 @@ mod tests {
     fn planning_reviewer_prompt_preserves_json_status_format() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            None,
-            "",
-        );
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
 
         assert!(
             prompt.contains("\"status\": \"APPROVED\""),
