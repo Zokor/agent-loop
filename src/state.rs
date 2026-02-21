@@ -965,6 +965,8 @@ pub struct TaskStatusEntry {
     pub last_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wave_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2663,6 +2665,7 @@ mod tests {
                     retries: 1,
                     last_error: None,
                     skip_reason: None,
+                    wave_index: None,
                 },
                 TaskStatusEntry {
                     title: "Task 2: Add retries".to_string(),
@@ -2670,6 +2673,7 @@ mod tests {
                     retries: 2,
                     last_error: Some("MAX_ROUNDS reached".to_string()),
                     skip_reason: None,
+                    wave_index: None,
                 },
                 TaskStatusEntry {
                     title: "Task 3: Cleanup".to_string(),
@@ -2677,6 +2681,7 @@ mod tests {
                     retries: 0,
                     last_error: None,
                     skip_reason: None,
+                    wave_index: None,
                 },
             ],
         };
@@ -2783,6 +2788,7 @@ mod tests {
             retries: 0,
             last_error: None,
             skip_reason: None,
+            wave_index: None,
         };
 
         let json = serde_json::to_value(&entry).unwrap();
@@ -2804,6 +2810,7 @@ mod tests {
             retries: 0,
             last_error: None,
             skip_reason: None,
+            wave_index: None,
         };
 
         let json = serde_json::to_value(&entry).unwrap();
@@ -2827,6 +2834,7 @@ mod tests {
                 retries: 0,
                 last_error: None,
                 skip_reason: None,
+                wave_index: None,
             }],
         };
 
@@ -3058,5 +3066,75 @@ mod tests {
         write_state_file("workflow.txt", "PLAN\n", &project.config)
             .expect("uppercase write should succeed");
         assert_eq!(read_workflow(&project.config), None);
+    }
+
+    #[test]
+    fn task_status_entry_wave_index_omitted_when_none() {
+        let entry = TaskStatusEntry {
+            title: "Task 1".to_string(),
+            status: TaskRunStatus::Pending,
+            retries: 0,
+            last_error: None,
+            skip_reason: None,
+            wave_index: None,
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert!(
+            !json.as_object().unwrap().contains_key("wave_index"),
+            "wave_index should be omitted when None"
+        );
+    }
+
+    #[test]
+    fn task_status_entry_wave_index_included_when_set() {
+        let entry = TaskStatusEntry {
+            title: "Task 1".to_string(),
+            status: TaskRunStatus::Pending,
+            retries: 0,
+            last_error: None,
+            skip_reason: None,
+            wave_index: Some(2),
+        };
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["wave_index"], 2);
+    }
+
+    #[test]
+    fn task_status_entry_wave_index_round_trip() {
+        let project = new_project();
+        let status_file = TaskStatusFile {
+            tasks: vec![
+                TaskStatusEntry {
+                    title: "Task A".to_string(),
+                    status: TaskRunStatus::Pending,
+                    retries: 0,
+                    last_error: None,
+                    skip_reason: None,
+                    wave_index: Some(0),
+                },
+                TaskStatusEntry {
+                    title: "Task B".to_string(),
+                    status: TaskRunStatus::Running,
+                    retries: 0,
+                    last_error: None,
+                    skip_reason: None,
+                    wave_index: Some(1),
+                },
+                TaskStatusEntry {
+                    title: "Task C".to_string(),
+                    status: TaskRunStatus::Done,
+                    retries: 0,
+                    last_error: None,
+                    skip_reason: None,
+                    wave_index: None,
+                },
+            ],
+        };
+
+        write_task_status(&status_file, &project.config).expect("write should succeed");
+        let reloaded = read_task_status(&project.config);
+        assert_eq!(reloaded.tasks[0].wave_index, Some(0));
+        assert_eq!(reloaded.tasks[1].wave_index, Some(1));
+        assert_eq!(reloaded.tasks[2].wave_index, None);
     }
 }

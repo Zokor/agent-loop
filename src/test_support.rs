@@ -56,6 +56,7 @@ pub struct TestConfigOptions {
     pub implementer_effort_level: Option<String>,
     pub reviewer_effort_level: Option<String>,
     pub codex_full_access: bool,
+    pub codex_session_persistence: bool,
 }
 
 impl Default for TestConfigOptions {
@@ -84,7 +85,7 @@ impl Default for TestConfigOptions {
             stuck_no_diff_rounds: crate::config::DEFAULT_STUCK_NO_DIFF_ROUNDS,
             stuck_threshold_minutes: crate::config::DEFAULT_STUCK_THRESHOLD_MINUTES,
             stuck_action: crate::config::StuckAction::Warn,
-            wave_lock_stale_seconds: 300,
+            wave_lock_stale_seconds: 30,
             wave_shutdown_grace_ms: 30_000,
             planner_model: None,
             claude_full_access: false,
@@ -97,6 +98,7 @@ impl Default for TestConfigOptions {
             implementer_effort_level: None,
             reviewer_effort_level: None,
             codex_full_access: false,
+            codex_session_persistence: true,
         }
     }
 }
@@ -153,6 +155,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         implementer_effort_level: options.implementer_effort_level.clone(),
         reviewer_effort_level: options.reviewer_effort_level.clone(),
         codex_full_access: options.codex_full_access,
+        codex_session_persistence: options.codex_session_persistence,
     }
 }
 

@@ -398,7 +398,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent: claude|codex\n  REVIEWER                              Reviewer agent: claude|codex (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 300) Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -537,7 +537,15 @@ fn parse_tasks_markdown(raw_tasks: &str) -> Result<Vec<ParsedTask>, AgentLoopErr
             .unwrap_or(lines.len());
 
         let content = lines[*start_line..end_line].join("\n").trim().to_string();
-        let dependencies = wave::parse_dependencies(&content);
+        // Parse dependencies from the body after the heading line so the
+        // heading doesn't consume one of the 3 non-blank line slots.
+        let body_start = *start_line + 1;
+        let body = if body_start < end_line {
+            lines[body_start..end_line].join("\n")
+        } else {
+            String::new()
+        };
+        let dependencies = wave::parse_dependencies(&body);
         parsed.push(ParsedTask {
             title: title.clone(),
             content,
@@ -589,6 +597,7 @@ fn is_timeout_reason(reason: Option<&str>) -> bool {
 fn is_retryable_run_tasks_status(status: Option<&LoopStatus>) -> bool {
     match status {
         Some(value) if value.status == Status::MaxRounds => true,
+        Some(value) if value.status == Status::Stuck => true,
         Some(value) if value.status == Status::Error => is_timeout_reason(value.reason.as_deref()),
         _ => false,
     }
@@ -805,6 +814,7 @@ fn reconcile_task_status(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<Ta
                     retries: 0,
                     last_error: None,
                     skip_reason: None,
+                    wave_index: None,
                 }
             }
         })
@@ -973,6 +983,7 @@ fn persist_batch_task_state(
                 retries: 0,
                 last_error,
                 skip_reason: None,
+                wave_index: None,
             }],
         },
         config,
@@ -1281,12 +1292,14 @@ fn implement_all_tasks_wave(
     // Load persisted wave status for resume support.
     let mut wave_statuses: Vec<TaskStatusEntry> = parsed_tasks
         .iter()
-        .map(|t| TaskStatusEntry {
+        .enumerate()
+        .map(|(i, t)| TaskStatusEntry {
             title: t.title.clone(),
             status: TaskRunStatus::Pending,
             retries: 0,
             last_error: None,
             skip_reason: None,
+            wave_index: schedule.task_wave.get(i).copied(),
         })
         .collect();
     let persisted = state::read_task_status(config);
@@ -2044,6 +2057,20 @@ fn status_command() -> Result<i32, AgentLoopError> {
         }
     }
 
+    // Planning artifacts.
+    let planning_progress_path = config.state_dir.join("planning-progress.md");
+    let planning_findings_path = config.state_dir.join("planning_findings.json");
+    if planning_progress_path.exists() || planning_findings_path.exists() {
+        println!();
+        println!("Planning artifacts:");
+        if planning_progress_path.exists() {
+            println!("  - {}", planning_progress_path.display());
+        }
+        if planning_findings_path.exists() {
+            println!("  - {}", planning_findings_path.display());
+        }
+    }
+
     // Recent wave progress events.
     let journal_path = config.state_dir.join("wave-progress.jsonl");
     let recent = wave_runtime::read_recent_events(&journal_path, 5);
@@ -2205,6 +2232,7 @@ mod tests {
                 retries: 0,
                 last_error: None,
                 skip_reason: None,
+                wave_index: None,
             },
             TaskStatusEntry {
                 title: "Task 2".into(),
@@ -2212,6 +2240,7 @@ mod tests {
                 retries: 0,
                 last_error: None,
                 skip_reason: None,
+                wave_index: None,
             },
             TaskStatusEntry {
                 title: "Task 3".into(),
@@ -2219,6 +2248,7 @@ mod tests {
                 retries: 0,
                 last_error: None,
                 skip_reason: None,
+                wave_index: None,
             },
             TaskStatusEntry {
                 title: "Task 4".into(),
@@ -2226,6 +2256,7 @@ mod tests {
                 retries: 1,
                 last_error: Some("error".into()),
                 skip_reason: None,
+                wave_index: None,
             },
         ];
 
@@ -2244,5 +2275,69 @@ mod tests {
 
         assert_eq!(statuses[2].status, state::TaskRunStatus::Skipped);
         assert_eq!(statuses[2].skip_reason.as_deref(), Some("interrupted"));
+    }
+
+    fn test_loop_status(status: state::Status) -> state::LoopStatus {
+        state::LoopStatus {
+            status,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "claude".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: String::new(),
+            reason: None,
+            rating: None,
+            timestamp: "2026-02-21T00:00:00.000Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn stuck_status_is_retryable() {
+        let mut stuck = test_loop_status(state::Status::Stuck);
+        stuck.round = 3;
+        stuck.reason = Some("no diff for 3 rounds".to_string());
+        assert!(
+            is_retryable_run_tasks_status(Some(&stuck)),
+            "Status::Stuck should be retryable"
+        );
+    }
+
+    #[test]
+    fn max_rounds_status_is_retryable() {
+        let mut max_rounds = test_loop_status(state::Status::MaxRounds);
+        max_rounds.round = 5;
+        assert!(
+            is_retryable_run_tasks_status(Some(&max_rounds)),
+            "Status::MaxRounds should be retryable"
+        );
+    }
+
+    #[test]
+    fn approved_status_is_not_retryable() {
+        let approved = test_loop_status(state::Status::Approved);
+        assert!(
+            !is_retryable_run_tasks_status(Some(&approved)),
+            "Status::Approved should not be retryable"
+        );
+    }
+
+    #[test]
+    fn wave_dep_parsing_skips_heading_line() {
+        // Simulate what parse_tasks_markdown now passes: body only (no heading).
+        let body = "depends: 1, 3\nSome description of the task.";
+        let deps = wave::parse_dependencies(body);
+        assert_eq!(deps, vec![0, 2]);
+
+        // With heading included (old behavior), the heading consumes a slot.
+        // But parse_dependencies should still find depends: in first 3 non-blank lines.
+        let with_heading = "### Task 2: Do something\ndepends: 1, 3\nSome description.";
+        let deps2 = wave::parse_dependencies(with_heading);
+        assert_eq!(deps2, vec![0, 2]);
+
+        // When depends: is on line 4 (after heading), it would be missed with old heading-included content.
+        // Now we pass body only, so depends: on line 3 of the body is still found.
+        let body_line3 = "description line 1\nsome more info\ndepends: 2\n";
+        let deps3 = wave::parse_dependencies(body_line3);
+        assert_eq!(deps3, vec![1]);
     }
 }

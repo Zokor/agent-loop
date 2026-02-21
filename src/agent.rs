@@ -648,8 +648,13 @@ fn run_agent_inner(
     // Session persistence: read existing session_id if applicable.
     // Uses the registry's `supports_session_resume` flag instead of hardcoding
     // agent names, so Codex and future agents get resume support automatically.
+    let session_persistence_enabled = match agent.name() {
+        "claude" => config.claude_session_persistence,
+        "codex" => config.codex_session_persistence,
+        _ => config.claude_session_persistence,
+    };
     let session_id = if agent.spec().supports_session_resume
-        && config.claude_session_persistence
+        && session_persistence_enabled
         && let Some(key) = session_key
     {
         read_session_id(config, key)
@@ -658,7 +663,10 @@ fn run_agent_inner(
     };
 
     if session_id.is_some() {
-        let _ = log("  ↳ Resuming existing Claude session", config);
+        let _ = log(
+            &format!("  ↳ Resuming existing {} session", agent.name()),
+            config,
+        );
     }
 
     let (command, args) =
@@ -834,7 +842,7 @@ fn run_agent_inner(
 
     // Session persistence: extract and store session_id from agent output.
     if agent.spec().supports_session_resume
-        && config.claude_session_persistence
+        && session_persistence_enabled
         && let Some(key) = session_key
     {
         let sid = match agent.name() {
@@ -887,15 +895,27 @@ fn run_agent_inner(
 
     if !exit_status.success() {
         // If we were resuming a session and it failed, clear the stale session
-        // so the next invocation starts fresh.
+        // and retry once fresh (Task 15 requirement).
         if session_id.is_some()
             && let Some(key) = session_key
         {
             let _ = log(
-                &format!("  ↳ Clearing stale {} session after failure", agent.name()),
+                &format!(
+                    "Session resume failed for {}/{}, retrying fresh",
+                    match role {
+                        Some(AgentRole::Implementer) => "implementer",
+                        Some(AgentRole::Reviewer) => "reviewer",
+                        Some(AgentRole::Planner) => "planner",
+                        None => "unknown",
+                    },
+                    agent.name()
+                ),
                 config,
             );
             clear_session_id(config, key);
+
+            // Retry once without session resume.
+            return run_agent_inner(agent, prompt, config, system_prompt, session_key, role);
         }
 
         let code = exit_status

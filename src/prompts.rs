@@ -163,6 +163,7 @@ pub(crate) fn state_manifest(config: &Config) -> String {
     let doc_files: &[(&str, &str)] = &[
         ("README.md", "project documentation"),
         ("CLAUDE.md", "project instructions for AI"),
+        ("AGENTS.md", "agent conventions & guidelines"),
         (".agent-loop/decisions.md", "prior decisions & learnings"),
     ];
 
@@ -173,12 +174,17 @@ pub(crate) fn state_manifest(config: &Config) -> String {
         }
     }
 
-    let conversation = state.join("conversation.md");
-    if conversation.exists() {
-        lines.push(format!(
-            "- conversation.md: {} -- round history",
-            conversation.display()
-        ));
+    let state_files: &[(&str, &str)] = &[
+        ("conversation.md", "round history"),
+        ("plan.md", "agreed development plan"),
+        ("tasks.md", "task breakdown"),
+    ];
+
+    for (filename, description) in state_files {
+        let full = state.join(filename);
+        if full.exists() {
+            lines.push(format!("- {filename}: {} -- {description}", full.display()));
+        }
     }
 
     lines.join("\n")
@@ -1537,5 +1543,70 @@ mod tests {
             prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
             "missing timestamp in JSON status"
         );
+    }
+
+    #[test]
+    fn state_manifest_includes_plan_tasks_and_agents_md() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        let state_dir = dir.join(".agent-loop").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Create the project-level files.
+        fs::write(dir.join("README.md"), "readme").unwrap();
+        fs::write(dir.join("CLAUDE.md"), "claude").unwrap();
+        fs::write(dir.join("AGENTS.md"), "agents guide").unwrap();
+
+        // Create the state files.
+        fs::write(state_dir.join("conversation.md"), "convo").unwrap();
+        fs::write(state_dir.join("plan.md"), "the plan").unwrap();
+        fs::write(state_dir.join("tasks.md"), "task list").unwrap();
+
+        // Create decisions.md.
+        let decisions_dir = dir.join(".agent-loop");
+        fs::write(decisions_dir.join("decisions.md"), "decisions").unwrap();
+
+        let config = Config {
+            project_dir: dir.clone(),
+            state_dir: state_dir.clone(),
+            ..crate::test_support::make_test_config(
+                &dir,
+                crate::test_support::TestConfigOptions::default(),
+            )
+        };
+
+        let manifest = state_manifest(&config);
+
+        assert!(manifest.contains("AGENTS.md"), "manifest should include AGENTS.md");
+        assert!(manifest.contains("plan.md"), "manifest should include plan.md");
+        assert!(manifest.contains("tasks.md"), "manifest should include tasks.md");
+        assert!(manifest.contains("conversation.md"), "manifest should include conversation.md");
+        assert!(manifest.contains("decisions.md"), "manifest should include decisions.md");
+    }
+
+    #[test]
+    fn state_manifest_omits_missing_files() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        let state_dir = dir.join(".agent-loop").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let config = Config {
+            project_dir: dir.clone(),
+            state_dir: state_dir.clone(),
+            ..crate::test_support::make_test_config(
+                &dir,
+                crate::test_support::TestConfigOptions::default(),
+            )
+        };
+
+        let manifest = state_manifest(&config);
+
+        assert!(!manifest.contains("AGENTS.md"), "absent AGENTS.md should be omitted");
+        assert!(!manifest.contains("plan.md"), "absent plan.md should be omitted");
+        assert!(!manifest.contains("tasks.md"), "absent tasks.md should be omitted");
+        assert!(!manifest.contains("conversation.md"), "absent conversation.md should be omitted");
     }
 }

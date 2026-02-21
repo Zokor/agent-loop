@@ -153,6 +153,8 @@ struct FileConfig {
     // ── Codex CLI tuning ───────────────────────────────────────────
     /// Bypass --full-auto and use `--dangerously-bypass-approvals-and-sandbox`.
     codex_full_access: Option<bool>,
+    /// Persist Codex sessions across rounds (mirrors claude_session_persistence).
+    codex_session_persistence: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -298,6 +300,8 @@ pub struct Config {
     // ── Codex CLI tuning ───────────────────────────────────────────
     /// When true, use `--dangerously-bypass-approvals-and-sandbox` instead of `--full-auto`.
     pub codex_full_access: bool,
+    /// Persist Codex sessions across rounds (default true).
+    pub codex_session_persistence: bool,
 }
 
 impl Config {
@@ -450,7 +454,7 @@ impl Config {
         // --- Wave runtime: env > TOML > default ---
         let wave_lock_stale_seconds = parse_env("WAVE_LOCK_STALE_SECONDS")
             .or(file.wave_lock_stale_seconds)
-            .unwrap_or(300);
+            .unwrap_or(30);
         let wave_shutdown_grace_ms = parse_env("WAVE_SHUTDOWN_GRACE_MS")
             .or(file.wave_shutdown_grace_ms)
             .unwrap_or(30_000);
@@ -486,6 +490,9 @@ impl Config {
         let codex_full_access = env_bool("CODEX_FULL_ACCESS")
             .or(file.codex_full_access)
             .unwrap_or(false);
+        let codex_session_persistence = env_bool("CODEX_SESSION_PERSISTENCE")
+            .or(file.codex_session_persistence)
+            .unwrap_or(true);
 
         let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
@@ -528,6 +535,7 @@ impl Config {
             implementer_effort_level,
             reviewer_effort_level,
             codex_full_access,
+            codex_session_persistence,
         };
 
         validate_config_bounds(&config)?;

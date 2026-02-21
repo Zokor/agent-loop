@@ -501,7 +501,7 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
                 AgentRole::Reviewer => "reviewer",
                 AgentRole::Planner => "planner",
             };
-            let session_key = format!("{}-{}", role_str, agent.name());
+            let session_key = format!("implement-{}-{}", role_str, agent.name());
             run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
@@ -604,6 +604,7 @@ fn run_agent_or_record_error(
     prompt: &str,
     round: Option<u32>,
     role: AgentRole,
+    workflow: &str,
 ) -> bool {
     let sp = system_prompt_for_role(role, config);
     let sp_ref = if sp.is_empty() {
@@ -616,7 +617,7 @@ fn run_agent_or_record_error(
         AgentRole::Reviewer => "reviewer",
         AgentRole::Planner => "planner",
     };
-    let session_key = format!("{}-{}", role_str, agent.name());
+    let session_key = format!("{}-{}-{}", workflow, role_str, agent.name());
     match run_agent_with_session(agent, prompt, config, sp_ref, Some(&session_key), Some(role)) {
         Ok(_) => true,
         Err(AgentLoopError::Interrupted(reason)) => {
@@ -1267,6 +1268,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         &planning_initial_prompt(&task, &project_context, &decisions, &paths),
         Some(0),
         AgentRole::Planner,
+        "plan",
     ) {
         return false;
     }
@@ -1309,6 +1311,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             }),
             Some(planning_round),
             AgentRole::Reviewer,
+            "plan",
         ) {
             return false;
         }
@@ -1410,6 +1413,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     ),
                     Some(planning_round),
                     AgentRole::Planner,
+                    "plan",
                 ) {
                     return false;
                 }
@@ -1629,6 +1633,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 &decomposition_initial_prompt(&task, &plan, &project_context, &paths),
                 Some(round),
                 AgentRole::Implementer,
+                "decompose",
             ) {
                 return false;
             }
@@ -1661,6 +1666,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 ),
                 Some(round),
                 AgentRole::Implementer,
+                "decompose",
             ) {
                 return false;
             }
@@ -1709,6 +1715,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             ),
             Some(round),
             AgentRole::Reviewer,
+            "decompose",
         ) {
             return false;
         }
@@ -2676,7 +2683,7 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
                 AgentRole::Reviewer => "reviewer",
                 AgentRole::Planner => "planner",
             };
-            let session_key = format!("{}-{}", role_str, agent.name());
+            let session_key = format!("implement-{}-{}", role_str, agent.name());
             run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
@@ -2726,7 +2733,7 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
                 AgentRole::Reviewer => "reviewer",
                 AgentRole::Planner => "planner",
             };
-            let session_key = format!("{}-{}", role_str, agent.name());
+            let session_key = format!("implement-{}-{}", role_str, agent.name());
             run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
                 .map(|_| ())
         },
