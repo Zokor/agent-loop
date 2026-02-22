@@ -266,26 +266,22 @@ pub(crate) enum AgentRole {
     Planner,
 }
 
-/// Determine the role based on which agent is being invoked.
-///
-/// In single-agent mode (where implementer == reviewer), this always returns
-/// `Implementer`. The reviewer preamble is still injected via the user prompt
-/// in single-agent mode, so this is acceptable.
-pub(crate) fn role_for_agent(agent: &crate::config::Agent, config: &Config) -> AgentRole {
-    if *agent == config.reviewer && config.implementer != config.reviewer {
-        AgentRole::Reviewer
-    } else {
-        AgentRole::Implementer
-    }
-}
-
 pub(crate) fn system_prompt_for_role(role: AgentRole, config: &Config) -> String {
-    let mut parts: Vec<&str> = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
 
-    parts.push(DECISION_CAPTURE_INSTRUCTIONS);
+    parts.push(DECISION_CAPTURE_INSTRUCTIONS.to_string());
 
     if role == AgentRole::Reviewer && config.single_agent {
-        parts.push(SINGLE_AGENT_REVIEWER_PREAMBLE);
+        parts.push(SINGLE_AGENT_REVIEWER_PREAMBLE.to_string());
+    }
+
+    // When progressive context is enabled, append the state manifest so the agent
+    // knows which files are available and can read them on-demand.
+    if config.progressive_context {
+        let manifest = state_manifest(config);
+        if !manifest.is_empty() {
+            parts.push(manifest);
+        }
     }
 
     parts.join("\n\n")
@@ -348,7 +344,7 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
     };
 
     format!(
-        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Findings\nList specific issues as a JSON block (use IDs like P-001, P-002, ...):\n```json\n[{{\"id\": \"P-001\", \"description\": \"issue description\"}}]\n```\nOmit the block if there are no findings.\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Findings\nList specific issues as a JSON block (use IDs like P-001, P-002, ...):\n```json\n[{{\"id\": \"P-001\", \"description\": \"issue description\", \"status\": \"open\"}}]\n```\nUse `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. Use `\"status\": \"open\"` for issues that still need attention. Omit the block entirely if there are no findings at all.\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
         preamble = single_agent_reviewer_preamble(config),
         status_path = path_text(&paths.status_json),
         impl_name = config.implementer,

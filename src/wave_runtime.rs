@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,9 @@ pub struct WaveRunLock {
     pub mode: String,
     pub max_parallel: u32,
     pub lock_path: PathBuf,
+    /// Guards against deleting a lock file acquired by a *different* process
+    /// in the window between an explicit `release()` call and `Drop`.
+    released: AtomicBool,
 }
 
 impl WaveRunLock {
@@ -119,14 +123,22 @@ impl WaveRunLock {
             mode: mode.to_string(),
             max_parallel,
             lock_path,
+            released: AtomicBool::new(false),
         })
     }
 
     /// Release the lock by deleting the lock file.
+    ///
+    /// Idempotent: the first call deletes the lock file; subsequent calls
+    /// (including the implicit one from `Drop`) are no-ops, preventing the
+    /// race where another process re-acquires the lock between an explicit
+    /// `release()` and `Drop`.
     pub fn release(&self) {
-        if self.lock_path.exists() {
-            let _ = fs::remove_file(&self.lock_path);
+        if self.released.swap(true, Ordering::AcqRel) {
+            // Already released — do nothing.
+            return;
         }
+        let _ = fs::remove_file(&self.lock_path);
     }
 
     /// Returns `true` when the lock file's modification time is older than
@@ -134,6 +146,16 @@ impl WaveRunLock {
     #[cfg(test)]
     fn is_stale(&self, stale_seconds: u64) -> bool {
         is_lock_stale(&self.lock_path, stale_seconds)
+    }
+}
+
+impl Drop for WaveRunLock {
+    /// RAII release: ensures the lock file is removed even when the holder
+    /// exits via an early `?` return or panic. The `released` flag makes this
+    /// a true no-op after an explicit `release()`, preventing deletion of a
+    /// lock file that was re-acquired by another process.
+    fn drop(&mut self) {
+        self.release();
     }
 }
 

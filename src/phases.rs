@@ -15,7 +15,7 @@ use crate::{
         implementation_adversarial_review_prompt, implementation_consensus_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths, state_manifest,
         planning_implementer_revision_prompt, planning_initial_prompt, planning_reviewer_prompt,
-        role_for_agent, system_prompt_for_role,
+        system_prompt_for_role,
     },
     state::{
         FindingEntry, FindingsFile, LoopStatus, Status, StatusPatch, append_decision,
@@ -301,10 +301,21 @@ fn parse_planning_findings_from_output(
         .filter_map(|v| {
             let id = v.get("id")?.as_str()?.to_string();
             let description = v.get("description")?.as_str()?.to_string();
+            // Read optional "status" field; case-insensitive, default to Open for
+            // backward compatibility ("resolved", "Resolved", "RESOLVED" all accepted).
+            let status = match v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("resolved") => PlanningFindingStatus::Resolved,
+                _ => PlanningFindingStatus::Open,
+            };
             Some(PlanningFindingEntry {
                 id,
                 description,
-                status: PlanningFindingStatus::Open,
+                status,
                 round_introduced: round,
                 round_resolved: None,
             })
@@ -317,7 +328,7 @@ fn parse_planning_findings_from_output(
 /// - APPROVED + open findings → force NEEDS_REVISION
 fn reconcile_planning_verdict(
     verdict: Option<&str>,
-    mut new_findings: Vec<crate::state::PlanningFindingEntry>,
+    new_findings: Vec<crate::state::PlanningFindingEntry>,
     existing: &crate::state::PlanningFindingsFile,
     review_status: &LoopStatus,
     round: u32,
@@ -325,13 +336,39 @@ fn reconcile_planning_verdict(
 ) -> (PlanningReviewerAction, crate::state::PlanningFindingsFile) {
     use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
 
-    // Count open findings from both existing and new
-    let existing_open: Vec<_> = existing
-        .findings
+    // ID-based merge: update existing findings, add new ones, resolve transitions.
+    let mut merged = existing.findings.clone();
+    for new_f in &new_findings {
+        if let Some(existing_entry) = merged.iter_mut().find(|f| f.id == new_f.id) {
+            // Update description if changed, transition status.
+            existing_entry.description = new_f.description.clone();
+            if new_f.status == PlanningFindingStatus::Resolved
+                && existing_entry.status == PlanningFindingStatus::Open
+            {
+                existing_entry.status = PlanningFindingStatus::Resolved;
+                existing_entry.round_resolved = Some(round);
+            } else if new_f.status == PlanningFindingStatus::Open
+                && existing_entry.status == PlanningFindingStatus::Resolved
+            {
+                // Reopened — reviewer flagged it again.
+                existing_entry.status = PlanningFindingStatus::Open;
+                existing_entry.round_resolved = None;
+            }
+        } else {
+            // New finding not previously seen.
+            let mut entry = new_f.clone();
+            if entry.status == PlanningFindingStatus::Resolved {
+                entry.round_resolved = Some(round);
+            }
+            merged.push(entry);
+        }
+    }
+
+    // Count open findings in the merged result (after reconciliation).
+    let open_after_merge = merged
         .iter()
         .filter(|f| f.status == PlanningFindingStatus::Open)
-        .cloned()
-        .collect();
+        .count();
 
     let action = match verdict {
         Some("REVISE") => {
@@ -341,8 +378,10 @@ fn reconcile_planning_verdict(
                     .reason
                     .as_deref()
                     .unwrap_or("Reviewer requested revision but did not provide structured findings.");
-                let next_id = crate::state::next_planning_finding_id(existing);
-                new_findings.push(PlanningFindingEntry {
+                let next_id = crate::state::next_planning_finding_id(&PlanningFindingsFile {
+                    findings: merged.clone(),
+                });
+                merged.push(PlanningFindingEntry {
                     id: next_id,
                     description: desc.to_string(),
                     status: PlanningFindingStatus::Open,
@@ -357,9 +396,8 @@ fn reconcile_planning_verdict(
             PlanningReviewerAction::NeedsRevision
         }
         Some("APPROVED") => {
-            // Safety net: APPROVED + open findings → force NEEDS_REVISION
-            let has_open = !existing_open.is_empty() || !new_findings.is_empty();
-            if has_open {
+            // Safety net: APPROVED + open findings remaining after reconciliation → force NEEDS_REVISION
+            if open_after_merge > 0 {
                 let _ = log(
                     "Planning reconciliation: APPROVED with open findings — forcing NEEDS_REVISION",
                     config,
@@ -374,14 +412,6 @@ fn reconcile_planning_verdict(
             planning_reviewer_action(review_status.status)
         }
     };
-
-    // Merge findings: keep existing open ones, add new ones
-    let mut merged = existing.findings.clone();
-    for new_f in new_findings {
-        if !merged.iter().any(|f| f.id == new_f.id) {
-            merged.push(new_f);
-        }
-    }
 
     let findings_file = PlanningFindingsFile { findings: merged };
     (action, findings_file)
@@ -464,7 +494,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     run_agent_fn: &mut FRunAgent,
     log_fn: &mut FLog,
 ) where
-    FRunAgent: FnMut(&crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(&crate::config::Agent, AgentRole, &str, &Config) -> Result<(), AgentLoopError>,
     FLog: FnMut(&str, &Config),
 {
     if !config.compound {
@@ -472,7 +502,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     }
 
     log_fn("🧠 Running compound learning phase...", config);
-    if let Err(err) = run_agent_fn(&config.implementer, &compound_prompt(task, plan), config) {
+    if let Err(err) = run_agent_fn(&config.implementer, AgentRole::Implementer, &compound_prompt(task, plan), config) {
         log_fn(
             &format!("WARN: compound phase failed (continuing): {err}"),
             config,
@@ -488,8 +518,7 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
         task,
         plan,
         config,
-        &mut |agent: &crate::config::Agent, prompt, current_config| {
-            let role = role_for_agent(agent, current_config);
+        &mut |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -1835,7 +1864,7 @@ fn implementation_loop_internal<
     resume: bool,
 ) -> bool
 where
-    FRunAgent: FnMut(&crate::config::Agent, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(&crate::config::Agent, AgentRole, &str, &Config) -> Result<(), AgentLoopError>,
     FCheckpoint: FnMut(&str, &Config, &HashSet<String>),
     FLog: FnMut(&str, &Config),
     FWriteStatus: FnMut(StatusPatch, &Config),
@@ -1847,7 +1876,13 @@ where
     FAppendHistory: FnMut(u32, &str, &str, &Config),
 {
     let paths = phase_paths(config);
-    let phase_decisions = read_decisions(config);
+    // When progressive context is enabled, skip front-loaded decisions/history;
+    // the state manifest is injected per-round so agents can fetch context on-demand.
+    let phase_decisions = if config.progressive_context {
+        String::new()
+    } else {
+        read_decisions(config)
+    };
 
     if config.max_rounds == 0 {
         let task = read_state_file_fn("task.md", config);
@@ -1950,11 +1985,16 @@ where
             normalize_findings_for_round(previous_findings_result.findings_file, round);
         let open_findings_for_prompt = findings_for_prompt(&findings_before_review);
 
-        let impl_history = read_history_fn(config, HISTORY_MAX_LINES);
+        let impl_history = if config.progressive_context {
+            String::new()
+        } else {
+            read_history_fn(config, HISTORY_MAX_LINES)
+        };
 
         log_fn("🔨 Implementer working...", config);
         if let Err(err) = run_agent_fn(
             &config.implementer,
+            AgentRole::Implementer,
             &implementation_implementer_prompt(
                 round,
                 &task,
@@ -2037,7 +2077,11 @@ where
 
         let quality_checks_output = run_quality_checks(config);
 
-        let reviewer_history = read_history_fn(config, HISTORY_MAX_LINES);
+        let reviewer_history = if config.progressive_context {
+            String::new()
+        } else {
+            read_history_fn(config, HISTORY_MAX_LINES)
+        };
 
         write_status_fn(
             StatusPatch {
@@ -2051,6 +2095,7 @@ where
         let reviewer_prompt_timestamp = timestamp_fn();
         if let Err(err) = run_agent_fn(
             &config.reviewer,
+            AgentRole::Reviewer,
             &implementation_reviewer_prompt(
                 config,
                 &task,
@@ -2218,6 +2263,7 @@ where
 
                     if let Err(err) = run_agent_fn(
                         &config.reviewer,
+                        AgentRole::Reviewer,
                         &implementation_adversarial_review_prompt(
                             config,
                             &task,
@@ -2337,6 +2383,7 @@ where
                             let consensus_prompt_timestamp = timestamp_fn();
                             if let Err(err) = run_agent_fn(
                                 &config.implementer,
+                                AgentRole::Implementer,
                                 &implementation_consensus_prompt(
                                     config,
                                     &task,
@@ -2503,6 +2550,7 @@ where
                     let consensus_prompt_timestamp = timestamp_fn();
                     if let Err(err) = run_agent_fn(
                         &config.implementer,
+                        AgentRole::Implementer,
                         &implementation_consensus_prompt(
                             config,
                             &task,
@@ -2670,8 +2718,7 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent: &crate::config::Agent, prompt, current_config| {
-            let role = role_for_agent(agent, current_config);
+        |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -2720,8 +2767,7 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent: &crate::config::Agent, prompt, current_config| {
-            let role = role_for_agent(agent, current_config);
+        |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -2870,7 +2916,7 @@ mod tests {
             "Task",
             "Plan",
             &enabled,
-            &mut |_agent: &crate::config::Agent, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent, _role: AgentRole, _prompt, _config| {
                 enabled_calls += 1;
                 Ok(())
             },
@@ -2883,7 +2929,7 @@ mod tests {
             "Task",
             "Plan",
             &disabled,
-            &mut |_agent: &crate::config::Agent, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent, _role: AgentRole, _prompt, _config| {
                 disabled_calls += 1;
                 Ok(())
             },
@@ -3040,6 +3086,36 @@ mod tests {
         let text = "```json\n{not valid json}\n```";
         let findings = parse_planning_findings_from_output(text, 1);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn parse_planning_findings_status_field_case_insensitive() {
+        // "Resolved" (title case) → Resolved
+        let text = "```json\n[{\"id\": \"P-001\", \"description\": \"Fixed\", \"status\": \"Resolved\"}]\n```\n";
+        let findings = parse_planning_findings_from_output(text, 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].status,
+            crate::state::PlanningFindingStatus::Resolved
+        );
+
+        // "RESOLVED" (upper case) → Resolved
+        let text = "```json\n[{\"id\": \"P-002\", \"description\": \"Fixed\", \"status\": \"RESOLVED\"}]\n```\n";
+        let findings = parse_planning_findings_from_output(text, 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].status,
+            crate::state::PlanningFindingStatus::Resolved
+        );
+
+        // missing status field → defaults to Open
+        let text = "```json\n[{\"id\": \"P-003\", \"description\": \"Still open\"}]\n```\n";
+        let findings = parse_planning_findings_from_output(text, 1);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].status,
+            crate::state::PlanningFindingStatus::Open
+        );
     }
 
     #[test]

@@ -55,7 +55,29 @@ pub(crate) fn resolve_command(
         }
     }
 
-    // Permission / sandbox policy.
+    // System prompt delivery — must happen while the prompt text is still the
+    // last arg from command_builder.  Claude uses --append-system-prompt; other
+    // agents (e.g. Codex) don't support that flag, so the manifest/preamble is
+    // prepended directly to the prompt text.
+    if let Some(sp) = system_prompt {
+        if agent.name() == "claude" {
+            args.push("--append-system-prompt".to_string());
+            args.push(sp.to_string());
+        } else if !sp.is_empty() {
+            // Prepend to the prompt arg (last element from command_builder).
+            if let Some(last) = args.last_mut() {
+                *last = format!("{sp}\n\n{last}");
+            }
+            // Sanity-check the command_builder contract in debug builds.
+            debug_assert!(
+                args.iter().any(|arg| arg.contains(prompt)),
+                "system prompt injection lost prompt text; check command_builder contract"
+            );
+        }
+    }
+
+    // Permission / sandbox policy — added after system prompt so that sandbox
+    // flags never accidentally become the target of prepend logic above.
     if agent.name() == "claude" {
         if config.claude_full_access {
             args.push("--dangerously-skip-permissions".to_string());
@@ -76,12 +98,6 @@ pub(crate) fn resolve_command(
         } else {
             args.push("--full-auto".to_string());
         }
-    }
-
-    // System prompt (claude only).
-    if agent.name() == "claude" && let Some(sp) = system_prompt {
-        args.push("--append-system-prompt".to_string());
-        args.push(sp.to_string());
     }
 
     (spec.binary, args)
@@ -1173,6 +1189,30 @@ mod tests {
         );
         assert!(args.contains(&"--append-system-prompt".to_string()));
         assert!(args.contains(&"system instructions".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_non_claude_prepends_system_prompt_into_prompt_text() {
+        let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("codex"),
+            "do the work",
+            &project.config,
+            Some("system instructions"),
+            None,
+            None,
+        );
+        // Non-Claude agents must NOT use --append-system-prompt
+        assert!(!args.contains(&"--append-system-prompt".to_string()));
+        // The system prompt must be prepended to the prompt text arg — find it by
+        // looking for an arg that contains both the preamble and the original prompt.
+        let combined = args
+            .iter()
+            .find(|a| a.contains("system instructions") && a.contains("do the work"));
+        assert!(
+            combined.is_some(),
+            "no arg found containing both system prompt and original prompt; args={args:?}"
+        );
     }
 
     #[test]

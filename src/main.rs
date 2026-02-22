@@ -34,7 +34,7 @@ use state::{
     TaskStatusEntry, TaskStatusFile,
 };
 
-const KNOWN_SUBCOMMANDS: [&str; 11] = [
+const KNOWN_SUBCOMMANDS: [&str; 8] = [
     "plan",
     "tasks",
     "implement",
@@ -42,10 +42,7 @@ const KNOWN_SUBCOMMANDS: [&str; 11] = [
     "status",
     "version",
     "help",
-    "run",
-    "run-tasks",
-    "init",
-    "resume",
+    "config",
 ];
 
 #[derive(Debug, Parser)]
@@ -73,14 +70,12 @@ enum Commands {
     Status,
     /// Print version
     Version,
-    #[command(name = "run", hide = true)]
-    Run(RunArgs),
-    #[command(name = "run-tasks", hide = true)]
-    RunTasksDeprecated(LegacyRunTasksArgs),
-    #[command(name = "init", hide = true)]
-    Init,
-    #[command(name = "resume", hide = true)]
-    Resume(ResumeArgs),
+    /// Configuration management
+    #[command(name = "config")]
+    ConfigCmd {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -140,32 +135,17 @@ struct ImplementArgs {
     max_parallel: Option<u32>,
 }
 
-#[derive(Debug, Clone, Args, PartialEq, Eq)]
-struct ResumeArgs {
-    #[arg(long)]
-    single_agent: bool,
+#[derive(Debug, Subcommand)]
+enum ConfigCommands {
+    /// Generate default .agent-loop.toml
+    Init(ConfigInitArgs),
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
-struct LegacyRunTasksArgs {
-    #[arg(long, value_name = "PATH")]
-    file: Option<PathBuf>,
-    #[arg(long, value_name = "PATH")]
-    tasks_file: Option<PathBuf>,
+struct ConfigInitArgs {
+    /// Overwrite existing .agent-loop.toml
     #[arg(long)]
-    per_task: bool,
-    #[arg(long, default_value_t = 2)]
-    max_retries: u32,
-    #[arg(long, default_value_t = 2)]
-    round_step: u32,
-    #[arg(long)]
-    single_agent: bool,
-    #[arg(long)]
-    continue_on_fail: bool,
-    #[arg(long)]
-    fail_fast: bool,
-    #[arg(long)]
-    max_parallel: Option<u32>,
+    force: bool,
 }
 
 #[derive(Debug, Clone, Args, PartialEq, Eq)]
@@ -189,7 +169,7 @@ enum Dispatch {
     Reset(ResetArgs),
     Status,
     Version,
-    MigrationError(String),
+    ConfigInit(ConfigInitArgs),
 }
 
 impl TasksArgs {
@@ -319,7 +299,7 @@ fn dispatch_from_cli(cli: Cli) -> Result<Dispatch, AgentLoopError> {
         Some(Commands::Plan(args)) => Ok(Dispatch::Plan(args)),
         Some(Commands::Tasks(args)) => {
             if args.tasks_file.is_some() {
-                return Ok(Dispatch::MigrationError(
+                return Err(AgentLoopError::Config(
                     "'--tasks-file' has been removed. Use '--file' instead.".to_string(),
                 ));
             }
@@ -329,32 +309,9 @@ fn dispatch_from_cli(cli: Cli) -> Result<Dispatch, AgentLoopError> {
         Some(Commands::Reset(args)) => Ok(Dispatch::Reset(args)),
         Some(Commands::Status) => Ok(Dispatch::Status),
         Some(Commands::Version) => Ok(Dispatch::Version),
-        Some(Commands::Run(args)) => {
-            if args.planning_only {
-                Ok(Dispatch::MigrationError(
-                    "'run --planning-only' has been removed. Use 'plan'.".to_string(),
-                ))
-            } else if args.resume {
-                Ok(Dispatch::MigrationError(
-                    "'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
-                        .to_string(),
-                ))
-            } else {
-                Ok(Dispatch::MigrationError(
-                    "'run' has been removed. Use 'implement'.".to_string(),
-                ))
-            }
-        }
-        Some(Commands::RunTasksDeprecated(_)) => Ok(Dispatch::MigrationError(
-            "'run-tasks' has been removed. Use 'implement'.".to_string(),
-        )),
-        Some(Commands::Init) => Ok(Dispatch::MigrationError(
-            "'init' has been removed. Use 'plan' or 'implement' — state is created automatically."
-                .to_string(),
-        )),
-        Some(Commands::Resume(_)) => Ok(Dispatch::MigrationError(
-            "'resume' has been removed. Use 'implement --resume' or 'tasks --resume'.".to_string(),
-        )),
+        Some(Commands::ConfigCmd { action }) => match action {
+            ConfigCommands::Init(args) => Ok(Dispatch::ConfigInit(args)),
+        },
         None => Ok(Dispatch::ShowHelp),
     }
 }
@@ -367,10 +324,7 @@ fn execute_dispatch(dispatch: Dispatch) -> Result<i32, AgentLoopError> {
         Dispatch::Reset(args) => reset_command(&args),
         Dispatch::Status => status_command(),
         Dispatch::Version => version_command(),
-        Dispatch::MigrationError(message) => {
-            eprintln!("Error: {message}");
-            Ok(1)
-        }
+        Dispatch::ConfigInit(args) => config_init_command(args),
         Dispatch::ShowHelp => {
             print_help_message()?;
             Ok(0)
@@ -398,7 +352,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -652,12 +606,13 @@ fn run_command_with_max_rounds(
     }
 
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli_with_overrides(
+    let mut config = Config::from_cli_with_overrides(
         project_dir,
         args.single_agent,
         false,
         max_rounds_override,
     )?;
+    preflight::run_preflight(&mut config)?;
 
     let task = resolve_task_for_run(&args)?;
 
@@ -1021,8 +976,9 @@ fn implementation_resume_with_max_rounds(
     ensure_resume_state_dir_exists(&state_dir)?;
     let task = read_resume_task_from_state_dir(&state_dir)?;
 
-    let config =
+    let mut config =
         Config::from_cli_with_overrides(project_dir, single_agent, false, max_rounds_override)?;
+    preflight::run_preflight(&mut config)?;
     let workflow = state::read_workflow(&config);
     if workflow != Some(state::WorkflowKind::Implement) {
         return Err(AgentLoopError::State(
@@ -1255,8 +1211,16 @@ fn implement_all_tasks_wave(
         .unwrap_or(config.max_parallel)
         .max(1) as usize;
 
+    // Durable runtime artifacts live in .agent-loop/ (parent of state/) so that
+    // `reset` (which removes state/) does not delete them.
+    let agent_loop_dir = config
+        .state_dir
+        .parent()
+        .unwrap_or(&config.state_dir)
+        .to_path_buf();
+
     // Acquire wave lock to prevent concurrent wave runs.
-    let lock_path = config.state_dir.join("wave.lock");
+    let lock_path = agent_loop_dir.join("wave.lock");
     let wave_lock = wave_runtime::WaveRunLock::acquire(
         lock_path,
         "wave",
@@ -1265,8 +1229,8 @@ fn implement_all_tasks_wave(
     )
     .map_err(AgentLoopError::Wave)?;
 
-    // Journal file for progress events.
-    let journal_path = config.state_dir.join("wave-progress.jsonl");
+    // Journal file for progress events (append-only, survives reset).
+    let journal_path = agent_loop_dir.join("wave-progress.jsonl");
 
     println!(
         "Wave mode: {} task(s), {} wave(s), max_parallel={}",
@@ -1289,7 +1253,7 @@ fn implement_all_tasks_wave(
         },
     );
 
-    // Load persisted wave status for resume support.
+    // Initialize wave statuses; on fresh run start all Pending, on --resume reuse Done entries.
     let mut wave_statuses: Vec<TaskStatusEntry> = parsed_tasks
         .iter()
         .enumerate()
@@ -1302,20 +1266,26 @@ fn implement_all_tasks_wave(
             wave_index: schedule.task_wave.get(i).copied(),
         })
         .collect();
-    let persisted = state::read_task_status(config);
-    for (i, entry) in persisted.tasks.iter().enumerate() {
-        if i < wave_statuses.len() && entry.title == wave_statuses[i].title {
-            wave_statuses[i] = entry.clone();
+
+    if args.resume {
+        // Resume: load persisted statuses; Done tasks are kept, non-done tasks are reset.
+        let persisted = state::read_task_status(config);
+        for (i, entry) in persisted.tasks.iter().enumerate() {
+            if i < wave_statuses.len() && entry.title == wave_statuses[i].title {
+                wave_statuses[i] = entry.clone();
+            }
         }
+    } else {
+        // Fresh run: overwrite any stale persisted state so reset is authoritative.
+        persist_wave_statuses(&wave_statuses, config)?;
     }
 
     let mut task_results: Vec<Option<bool>> = vec![None; parsed_tasks.len()];
-    // Pre-fill results from persisted state; reset interrupted/skipped tasks for re-run.
+    // Pre-fill results from persisted state; reset non-done tasks so they are re-evaluated.
     for (i, entry) in wave_statuses.iter_mut().enumerate() {
         if entry.status == TaskRunStatus::Done {
             task_results[i] = Some(true);
         } else if entry.status == TaskRunStatus::Skipped || entry.status == TaskRunStatus::Failed {
-            // On resume, reset non-done tasks so they are re-evaluated.
             entry.status = TaskRunStatus::Pending;
             entry.skip_reason = None;
             entry.last_error = None;
@@ -1455,12 +1425,27 @@ fn implement_all_tasks_wave(
             persist_wave_statuses(&wave_statuses, config)?;
 
             if !succeeded && args.fail_fast {
-                // Drain remaining in-flight results.
+                // Drain remaining in-flight results, capturing outcomes.
                 while in_flight > 0 {
-                    let _ = rx.recv();
+                    if let Ok((idx, ok)) = rx.recv() {
+                        task_results[idx] = Some(ok);
+                        wave_statuses[idx].status = if ok {
+                            TaskRunStatus::Done
+                        } else {
+                            TaskRunStatus::Failed
+                        };
+                    }
                     in_flight -= 1;
                 }
-                wave_lock.release();
+                // Mark any tasks that were never started or still pending as skipped.
+                for (i, result) in task_results.iter().enumerate() {
+                    if result.is_none() {
+                        wave_statuses[i].status = TaskRunStatus::Skipped;
+                        wave_statuses[i].skip_reason = Some("fail-fast".to_string());
+                    }
+                }
+                persist_wave_statuses(&wave_statuses, config)?;
+                // wave_lock released by Drop
                 println!("Aborting (--fail-fast).");
                 return Ok(1);
             }
@@ -1540,9 +1525,11 @@ fn implement_all_tasks_wave(
         }
     }
 
-    let total_passed = task_results.iter().filter(|r| **r == Some(true)).count();
-    let total_failed = task_results.iter().filter(|r| **r == Some(false)).count();
-    let total_skipped = task_results.iter().filter(|r| r.is_none()).count();
+    // Derive summary counts from wave_statuses (authoritative) so that tasks
+    // skipped due to dependency failures are counted as skipped, not failed.
+    let total_passed = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Done).count();
+    let total_failed = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Failed).count();
+    let total_skipped = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Skipped).count();
 
     // Journal: RunEnd event.
     let _ = wave_runtime::append_journal_event(
@@ -1588,11 +1575,7 @@ fn launch_wave_task(
 
     let task_title = parsed_tasks[task_idx].title.clone();
     let task_content = parsed_tasks[task_idx].content.clone();
-    let task_state_dir = config
-        .state_dir
-        .parent()
-        .unwrap_or(&config.state_dir)
-        .join(format!("task-{}", task_idx + 1));
+    let task_state_dir = config.state_dir.join(format!("task-{}", task_idx + 1));
     let task_config = config.with_state_dir(task_state_dir);
     let tx = tx.clone();
 
@@ -1945,7 +1928,8 @@ fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
     let state_dir = project_dir.join(".agent-loop").join("state");
 
     if args.wave_lock {
-        let lock_path = state_dir.join("wave.lock");
+        // Lock lives in .agent-loop/ (parent of state/) to survive reset.
+        let lock_path = project_dir.join(".agent-loop").join("wave.lock");
         if lock_path.exists() {
             fs::remove_file(&lock_path)?;
             println!("Wave lock removed.");
@@ -2038,8 +2022,13 @@ fn status_command() -> Result<i32, AgentLoopError> {
         );
     }
 
-    // Wave lock info.
-    let lock_path = config.state_dir.join("wave.lock");
+    // Wave lock info. Durable artifacts live in .agent-loop/ (parent of state/).
+    let agent_loop_dir = config
+        .state_dir
+        .parent()
+        .unwrap_or(&config.state_dir)
+        .to_path_buf();
+    let lock_path = agent_loop_dir.join("wave.lock");
     if lock_path.exists()
         && let Ok(raw) = fs::read_to_string(&lock_path)
         && let Ok(lock) = serde_json::from_str::<wave_runtime::LockFileContent>(&raw)
@@ -2071,8 +2060,8 @@ fn status_command() -> Result<i32, AgentLoopError> {
         }
     }
 
-    // Recent wave progress events.
-    let journal_path = config.state_dir.join("wave-progress.jsonl");
+    // Recent wave progress events (journal also lives in .agent-loop/).
+    let journal_path = agent_loop_dir.join("wave-progress.jsonl");
     let recent = wave_runtime::read_recent_events(&journal_path, 5);
     if !recent.is_empty() {
         println!();
@@ -2113,6 +2102,36 @@ fn version_command() -> Result<i32, AgentLoopError> {
     Ok(0)
 }
 
+fn config_init_command(args: ConfigInitArgs) -> Result<i32, AgentLoopError> {
+    let project_dir = current_project_dir().map_err(|e| {
+        AgentLoopError::Config(format!("failed to determine project directory: {e}"))
+    })?;
+    config_init_to_dir(&args, &project_dir)
+}
+
+fn config_init_to_dir(args: &ConfigInitArgs, project_dir: &Path) -> Result<i32, AgentLoopError> {
+    let config_path = project_dir.join(".agent-loop.toml");
+
+    if config_path.exists() && !args.force {
+        eprintln!(
+            "Error: {} already exists. Use --force to overwrite.",
+            config_path.display()
+        );
+        return Ok(1);
+    }
+
+    let template = config::generate_default_config_template();
+    fs::write(&config_path, template).map_err(|err| {
+        AgentLoopError::Config(format!(
+            "failed to write {}: {err}",
+            config_path.display()
+        ))
+    })?;
+
+    println!("Generated .agent-loop.toml with defaults.");
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2128,47 +2147,65 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_tasks_with_removed_tasks_file_returns_migration_error() {
+    fn dispatch_tasks_with_removed_tasks_file_returns_config_error() {
         let cli = Cli::try_parse_from(["agent-loop", "tasks", "--tasks-file", "old.md"])
-            .expect("tasks --tasks-file should parse for migration");
-        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::MigrationError(
-                "'--tasks-file' has been removed. Use '--file' instead.".to_string()
-            )
+            .expect("tasks --tasks-file should parse");
+        let result = dispatch_from_cli(cli);
+        assert!(
+            matches!(result, Err(AgentLoopError::Config(ref msg)) if msg.contains("--tasks-file")),
+            "expected Config error about --tasks-file, got: {result:?}"
         );
     }
 
     #[test]
-    fn dispatch_legacy_run_variants_return_exact_migration_messages() {
-        let run =
-            Cli::try_parse_from(["agent-loop", "run", "task text"]).expect("run should parse");
-        let dispatch = dispatch_from_cli(run).expect("dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::MigrationError("'run' has been removed. Use 'implement'.".to_string())
-        );
+    fn parse_removed_run_command_is_error() {
+        let result = Cli::try_parse_from(["agent-loop", "run", "some-task"]);
+        assert!(result.is_err(), "removed 'run' command should not parse");
+    }
 
-        let run_planning = Cli::try_parse_from(["agent-loop", "run", "--planning-only"])
-            .expect("run planning should parse");
-        let dispatch = dispatch_from_cli(run_planning).expect("dispatch should succeed");
-        assert_eq!(
-            dispatch,
-            Dispatch::MigrationError(
-                "'run --planning-only' has been removed. Use 'plan'.".to_string()
-            )
+    #[test]
+    fn parse_removed_run_tasks_command_is_error() {
+        let result = Cli::try_parse_from(["agent-loop", "run-tasks"]);
+        assert!(
+            result.is_err(),
+            "removed 'run-tasks' command should not parse"
         );
+    }
 
-        let run_resume = Cli::try_parse_from(["agent-loop", "run", "--resume"])
-            .expect("run resume should parse");
-        let dispatch = dispatch_from_cli(run_resume).expect("dispatch should succeed");
+    #[test]
+    fn parse_removed_init_command_is_error() {
+        let result = Cli::try_parse_from(["agent-loop", "init"]);
+        assert!(result.is_err(), "removed 'init' command should not parse");
+    }
+
+    #[test]
+    fn parse_removed_resume_command_is_error() {
+        let result = Cli::try_parse_from(["agent-loop", "resume"]);
+        assert!(
+            result.is_err(),
+            "removed 'resume' command should not parse"
+        );
+    }
+
+    #[test]
+    fn dispatch_config_init() {
+        let cli = Cli::try_parse_from(["agent-loop", "config", "init"])
+            .expect("config init should parse");
+        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
         assert_eq!(
             dispatch,
-            Dispatch::MigrationError(
-                "'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
-                    .to_string()
-            )
+            Dispatch::ConfigInit(ConfigInitArgs { force: false })
+        );
+    }
+
+    #[test]
+    fn dispatch_config_init_force() {
+        let cli = Cli::try_parse_from(["agent-loop", "config", "init", "--force"])
+            .expect("config init --force should parse");
+        let dispatch = dispatch_from_cli(cli).expect("dispatch should succeed");
+        assert_eq!(
+            dispatch,
+            Dispatch::ConfigInit(ConfigInitArgs { force: true })
         );
     }
 
@@ -2339,5 +2376,60 @@ mod tests {
         let body_line3 = "description line 1\nsome more info\ndepends: 2\n";
         let deps3 = wave::parse_dependencies(body_line3);
         assert_eq!(deps3, vec![1]);
+    }
+
+    #[test]
+    fn config_init_writes_template_to_new_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let args = ConfigInitArgs { force: false };
+        let result = config_init_to_dir(&args, dir.path());
+        assert_eq!(result.unwrap(), 0);
+
+        let config_path = dir.path().join(".agent-loop.toml");
+        assert!(config_path.exists());
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("# ── Agents"), "template should contain Agents section");
+    }
+
+    #[test]
+    fn config_init_existing_file_without_force_returns_exit_1() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(".agent-loop.toml");
+        fs::write(&config_path, "existing").unwrap();
+
+        let args = ConfigInitArgs { force: false };
+        let result = config_init_to_dir(&args, dir.path());
+        assert_eq!(result.unwrap(), 1);
+
+        // File should be unchanged.
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert_eq!(content, "existing");
+    }
+
+    #[test]
+    fn config_init_force_overwrites_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join(".agent-loop.toml");
+        fs::write(&config_path, "old content").unwrap();
+
+        let args = ConfigInitArgs { force: true };
+        let result = config_init_to_dir(&args, dir.path());
+        assert_eq!(result.unwrap(), 0);
+
+        let content = fs::read_to_string(&config_path).unwrap();
+        assert!(content.contains("# ── Agents"), "template should overwrite old content");
+        assert!(!content.contains("old content"));
+    }
+
+    #[test]
+    fn config_init_write_failure_returns_config_error() {
+        // Point to a non-existent directory so fs::write fails.
+        let bad_dir = std::path::PathBuf::from("/nonexistent/path/that/does/not/exist");
+        let args = ConfigInitArgs { force: false };
+        let result = config_init_to_dir(&args, &bad_dir);
+        assert!(
+            matches!(result, Err(AgentLoopError::Config(ref msg)) if msg.contains("failed to write")),
+            "expected Config error for write failure, got: {result:?}"
+        );
     }
 }

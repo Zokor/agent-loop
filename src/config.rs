@@ -353,7 +353,10 @@ impl Config {
         verbose_flag: bool,
         max_rounds_override: Option<u32>,
     ) -> Result<Self, AgentLoopError> {
-        let file = load_file_config(&project_dir)?;
+        let FileConfigResult {
+            config: file,
+            file_found: config_file_found,
+        } = load_file_config(&project_dir)?;
 
         // --- single_agent: CLI > env > TOML > default ---
         let single_agent = if single_agent_flag {
@@ -549,7 +552,7 @@ impl Config {
         };
 
         validate_config_bounds(&config)?;
-        emit_config_warnings(&config);
+        emit_config_warnings(&config, config_file_found);
 
         Ok(config)
     }
@@ -578,13 +581,24 @@ fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoo
     Ok(())
 }
 
+#[derive(Debug)]
+struct FileConfigResult {
+    config: FileConfig,
+    file_found: bool,
+}
+
 /// Load `.agent-loop.toml` from `project_dir`. Returns default on missing file.
 /// Returns an error on I/O failures (other than not-found) or parse failures.
-fn load_file_config(project_dir: &Path) -> Result<FileConfig, AgentLoopError> {
+fn load_file_config(project_dir: &Path) -> Result<FileConfigResult, AgentLoopError> {
     let path = project_dir.join(CONFIG_FILE_NAME);
     let content = match std::fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(FileConfigResult {
+                config: FileConfig::default(),
+                file_found: false,
+            });
+        }
         Err(err) => {
             return Err(AgentLoopError::Config(format!(
                 "failed to read {}: {err}",
@@ -597,7 +611,10 @@ fn load_file_config(project_dir: &Path) -> Result<FileConfig, AgentLoopError> {
         AgentLoopError::Config(format!("failed to parse {}: {err}", path.display()))
     })?;
     validate_file_config(&config, &path)?;
-    Ok(config)
+    Ok(FileConfigResult {
+        config,
+        file_found: true,
+    })
 }
 
 pub fn is_truthy(value: Option<&str>) -> bool {
@@ -758,8 +775,111 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
     Ok(())
 }
 
-fn emit_config_warnings(_config: &Config) {
-    // No active warnings. Retained as a hook for future config warnings.
+fn emit_config_warnings(_config: &Config, config_file_found: bool) {
+    use std::io::IsTerminal;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static MISSING_CONFIG_HINT_EMITTED: AtomicBool = AtomicBool::new(false);
+
+    if config_file_found {
+        return;
+    }
+    if std::env::var_os("CI").is_some() {
+        return;
+    }
+    if !std::io::stderr().is_terminal() {
+        return;
+    }
+    if MISSING_CONFIG_HINT_EMITTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    eprintln!("Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one.");
+}
+
+/// Generate a fully-commented TOML config template with all settings organized
+/// by section and values sourced from `DEFAULT_*` constants.
+pub fn generate_default_config_template() -> String {
+    format!(
+        r#"# agent-loop configuration
+# All settings are optional — uncomment and modify as needed.
+# Precedence: CLI flags > environment variables > this file > built-in defaults.
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+# max_rounds = {max_rounds}
+# planning_max_rounds = {planning_max_rounds}
+# decomposition_max_rounds = {decomposition_max_rounds}
+# timeout = {timeout}
+# auto_commit = true
+# auto_test = false
+# auto_test_cmd = ""
+# compound = true
+# decisions_max_lines = {decisions_max_lines}
+# diff_max_lines = {diff_max_lines}
+# context_line_cap = {context_line_cap}
+# planning_context_excerpt_lines = {planning_context_excerpt_lines}
+# batch_implement = true
+# progressive_context = false
+
+# ── Agents ───────────────────────────────────────────────────────────────────
+# implementer = "claude"
+# reviewer = "codex"
+# single_agent = false
+
+# ── Model selection ──────────────────────────────────────────────────────────
+# implementer_model = ""
+# reviewer_model = ""
+# planner_model = ""
+
+# ── Claude CLI tuning ────────────────────────────────────────────────────────
+# claude_full_access = false
+# claude_allowed_tools = "{claude_allowed_tools}"
+# reviewer_allowed_tools = "{reviewer_allowed_tools}"
+# claude_session_persistence = true
+# claude_effort_level = ""
+# claude_max_output_tokens = 16000
+# claude_max_thinking_tokens = 10000
+# implementer_effort_level = ""
+# reviewer_effort_level = ""
+
+# ── Codex CLI tuning ────────────────────────────────────────────────────────
+# codex_full_access = false
+# codex_session_persistence = true
+
+# ── Stuck detection ──────────────────────────────────────────────────────────
+# stuck_detection_enabled = false
+# stuck_no_diff_rounds = {stuck_no_diff_rounds}
+# stuck_threshold_minutes = {stuck_threshold_minutes}
+# stuck_action = "warn"
+
+# ── Wave runtime ─────────────────────────────────────────────────────────────
+# max_parallel = {max_parallel}
+# wave_lock_stale_seconds = 30
+# wave_shutdown_grace_ms = 30000
+
+# ── Quality commands ─────────────────────────────────────────────────────────
+# Uncomment and customize to define explicit quality checks.
+# [[quality_commands]]
+# command = "cargo clippy -- -D warnings"
+# remediation = "Fix all clippy warnings."
+#
+# [[quality_commands]]
+# command = "cargo test"
+"#,
+        max_rounds = DEFAULT_MAX_ROUNDS,
+        planning_max_rounds = DEFAULT_PLANNING_MAX_ROUNDS,
+        decomposition_max_rounds = DEFAULT_DECOMPOSITION_MAX_ROUNDS,
+        timeout = DEFAULT_TIMEOUT_SECONDS,
+        decisions_max_lines = DEFAULT_DECISIONS_MAX_LINES,
+        diff_max_lines = DEFAULT_DIFF_MAX_LINES,
+        context_line_cap = DEFAULT_CONTEXT_LINE_CAP,
+        planning_context_excerpt_lines = DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES,
+        claude_allowed_tools = DEFAULT_CLAUDE_ALLOWED_TOOLS,
+        reviewer_allowed_tools = DEFAULT_REVIEWER_ALLOWED_TOOLS,
+        stuck_no_diff_rounds = DEFAULT_STUCK_NO_DIFF_ROUNDS,
+        stuck_threshold_minutes = DEFAULT_STUCK_THRESHOLD_MINUTES,
+        max_parallel = DEFAULT_MAX_PARALLEL,
+    )
 }
 
 #[cfg(test)]
@@ -923,9 +1043,10 @@ mod tests {
     #[test]
     fn load_file_config_missing_file_returns_default() {
         let dir = create_temp_project_root("toml_missing");
-        let config = load_file_config(&dir).expect("missing file should return Ok(default)");
-        assert!(config.max_rounds.is_none());
-        assert!(config.implementer.is_none());
+        let result = load_file_config(&dir).expect("missing file should return Ok(default)");
+        assert!(!result.file_found);
+        assert!(result.config.max_rounds.is_none());
+        assert!(result.config.implementer.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -961,7 +1082,9 @@ remediation = "Fix all clippy warnings."
 command = "cargo test"
 "#,
         );
-        let config = load_file_config(&dir).expect("valid full file should parse");
+        let result = load_file_config(&dir).expect("valid full file should parse");
+        assert!(result.file_found);
+        let config = result.config;
         assert_eq!(config.max_rounds, Some(10));
         assert_eq!(config.planning_max_rounds, Some(5));
         assert_eq!(config.decomposition_max_rounds, Some(4));
@@ -998,10 +1121,11 @@ command = "cargo test"
     fn load_file_config_partial_file() {
         let dir = create_temp_project_root("toml_partial");
         write_toml(&dir, "max_rounds = 7\n");
-        let config = load_file_config(&dir).expect("partial file should parse");
-        assert_eq!(config.max_rounds, Some(7));
-        assert!(config.implementer.is_none());
-        assert!(config.auto_test.is_none());
+        let result = load_file_config(&dir).expect("partial file should parse");
+        assert!(result.file_found);
+        assert_eq!(result.config.max_rounds, Some(7));
+        assert!(result.config.implementer.is_none());
+        assert!(result.config.auto_test.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1564,8 +1688,10 @@ command = "cargo test"
 "#,
         );
 
-        let config = load_file_config(&dir).expect("quality_commands should parse");
-        let quality_commands = config
+        let result = load_file_config(&dir).expect("quality_commands should parse");
+        assert!(result.file_found);
+        let quality_commands = result
+            .config
             .quality_commands
             .expect("quality_commands should exist");
         assert_eq!(quality_commands.len(), 2);
@@ -1609,13 +1735,14 @@ context_line_cap = 150
 planning_context_excerpt_lines = 75
 "#,
         );
-        let config = load_file_config(&dir).expect("should parse new-only fields");
-        assert_eq!(config.diff_max_lines, Some(300));
-        assert_eq!(config.context_line_cap, Some(150));
-        assert_eq!(config.planning_context_excerpt_lines, Some(75));
+        let result = load_file_config(&dir).expect("should parse new-only fields");
+        assert!(result.file_found);
+        assert_eq!(result.config.diff_max_lines, Some(300));
+        assert_eq!(result.config.context_line_cap, Some(150));
+        assert_eq!(result.config.planning_context_excerpt_lines, Some(75));
         // Other fields remain None
-        assert!(config.max_rounds.is_none());
-        assert!(config.implementer.is_none());
+        assert!(result.config.max_rounds.is_none());
+        assert!(result.config.implementer.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1765,8 +1892,9 @@ planning_context_excerpt_lines = 75
     fn load_file_config_parses_max_parallel() {
         let dir = create_temp_project_root("toml_max_parallel");
         write_toml(&dir, "max_parallel = 4\n");
-        let config = load_file_config(&dir).expect("max_parallel should parse");
-        assert_eq!(config.max_parallel, Some(4));
+        let result = load_file_config(&dir).expect("max_parallel should parse");
+        assert!(result.file_found);
+        assert_eq!(result.config.max_parallel, Some(4));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1850,9 +1978,10 @@ planning_context_excerpt_lines = 75
     fn load_file_config_accepts_valid_agent_values() {
         let dir = create_temp_project_root("toml_valid_agents");
         write_toml(&dir, "implementer = \"claude\"\nreviewer = \"codex\"\n");
-        let config = load_file_config(&dir).expect("valid agents should parse");
-        assert_eq!(config.implementer.as_deref(), Some("claude"));
-        assert_eq!(config.reviewer.as_deref(), Some("codex"));
+        let result = load_file_config(&dir).expect("valid agents should parse");
+        assert!(result.file_found);
+        assert_eq!(result.config.implementer.as_deref(), Some("claude"));
+        assert_eq!(result.config.reviewer.as_deref(), Some("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1911,5 +2040,91 @@ planning_context_excerpt_lines = 75
             .expect("override max_rounds should win");
         assert_eq!(config.max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_default_config_template
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_default_config_template_contains_sections_and_defaults() {
+        let template = generate_default_config_template();
+
+        // Section markers
+        assert!(template.contains("# ── Core"), "missing Core section");
+        assert!(template.contains("# ── Agents"), "missing Agents section");
+        assert!(
+            template.contains("# ── Model selection"),
+            "missing Model selection section"
+        );
+        assert!(
+            template.contains("# ── Claude CLI tuning"),
+            "missing Claude CLI tuning section"
+        );
+        assert!(
+            template.contains("# ── Codex CLI tuning"),
+            "missing Codex CLI tuning section"
+        );
+        assert!(
+            template.contains("# ── Stuck detection"),
+            "missing Stuck detection section"
+        );
+        assert!(
+            template.contains("# ── Wave runtime"),
+            "missing Wave runtime section"
+        );
+        assert!(
+            template.contains("# ── Quality commands"),
+            "missing Quality commands section"
+        );
+
+        // DEFAULT_* constant values
+        assert!(
+            template.contains(&format!("# max_rounds = {}", DEFAULT_MAX_ROUNDS)),
+            "missing DEFAULT_MAX_ROUNDS"
+        );
+        assert!(
+            template.contains(&format!(
+                "# planning_max_rounds = {}",
+                DEFAULT_PLANNING_MAX_ROUNDS
+            )),
+            "missing DEFAULT_PLANNING_MAX_ROUNDS"
+        );
+        assert!(
+            template.contains(&format!("# timeout = {}", DEFAULT_TIMEOUT_SECONDS)),
+            "missing DEFAULT_TIMEOUT_SECONDS"
+        );
+        assert!(
+            template.contains(&format!(
+                "# decisions_max_lines = {}",
+                DEFAULT_DECISIONS_MAX_LINES
+            )),
+            "missing DEFAULT_DECISIONS_MAX_LINES"
+        );
+        assert!(
+            template.contains(&format!(
+                "# stuck_no_diff_rounds = {}",
+                DEFAULT_STUCK_NO_DIFF_ROUNDS
+            )),
+            "missing DEFAULT_STUCK_NO_DIFF_ROUNDS"
+        );
+        assert!(
+            template.contains(DEFAULT_CLAUDE_ALLOWED_TOOLS),
+            "missing DEFAULT_CLAUDE_ALLOWED_TOOLS"
+        );
+        assert!(
+            template.contains(DEFAULT_REVIEWER_ALLOWED_TOOLS),
+            "missing DEFAULT_REVIEWER_ALLOWED_TOOLS"
+        );
+
+        // All value lines should be commented out
+        for line in template.lines() {
+            let trimmed = line.trim();
+            // Skip blank lines, section headers, and comment-only lines
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            panic!("found uncommented value line: {trimmed}");
+        }
     }
 }

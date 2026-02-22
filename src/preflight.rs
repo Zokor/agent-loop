@@ -137,7 +137,10 @@ fn check_git_when_required(config: &Config) -> Result<(), AgentLoopError> {
 }
 
 fn validate_session_resume_support(config: &Config) {
-    if !config.claude_session_persistence {
+    // Check any enabled persistence setting — not just claude_session_persistence.
+    let any_persistence_enabled =
+        config.claude_session_persistence || config.codex_session_persistence;
+    if !any_persistence_enabled {
         return;
     }
     for agent in required_agents(config) {
@@ -164,6 +167,15 @@ fn validate_model_support(config: &mut Config) {
             config.reviewer.name(),
         );
         config.reviewer.clear_model();
+    }
+    // Planner uses the implementer agent with a model override; validate against
+    // the implementer's capability.
+    if config.planner_model.is_some() && !config.implementer.spec().supports_model_flag {
+        eprintln!(
+            "⚠ Agent '{}' does not support --model. Clearing planner_model.",
+            config.implementer.name(),
+        );
+        config.planner_model = None;
     }
 }
 

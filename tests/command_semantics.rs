@@ -170,3 +170,51 @@ fn reset_clears_state_and_preserves_decisions() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+#[test]
+fn status_reads_wave_lock_and_journal_from_agent_loop_dir() {
+    let project_dir = create_project_dir("status_wave_paths");
+    let agent_loop_dir = project_dir.join(".agent-loop");
+    let state_dir = agent_loop_dir.join("state");
+    fs::create_dir_all(&state_dir).expect("state dir should be created");
+
+    // status.json lives under state/
+    fs::write(
+        state_dir.join("status.json"),
+        r#"{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"2026-01-01T00:00:00Z"}"#,
+    )
+    .expect("status.json should be written");
+
+    // wave.lock lives under .agent-loop/ (NOT state/)
+    fs::write(
+        agent_loop_dir.join("wave.lock"),
+        r#"{"pid":99999,"started_at":"2026-01-01T00:00:00Z","mode":"wave","max_parallel":2}"#,
+    )
+    .expect("wave.lock should be written");
+
+    // wave-progress.jsonl also lives under .agent-loop/
+    fs::write(
+        agent_loop_dir.join("wave-progress.jsonl"),
+        "{\"type\":\"RunStart\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"max_parallel\":2,\"total_tasks\":1,\"total_waves\":1}\n",
+    )
+    .expect("wave-progress.jsonl should be written");
+
+    let output = run_cmd(&project_dir, &["status"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "status should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("wave lock:"),
+        "status should report wave lock read from .agent-loop/: {stdout}"
+    );
+    assert!(
+        stdout.contains("Recent wave events:"),
+        "status should report journal events read from .agent-loop/: {stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}

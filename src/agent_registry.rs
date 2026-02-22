@@ -26,6 +26,11 @@ pub struct AgentSpec {
     pub binary: &'static str,
     pub install_hint: &'static str,
     pub default_reviewer: &'static str,
+    /// Builds the base CLI arg list for the agent.
+    ///
+    /// Contract: the prompt text MUST be the last element of the returned
+    /// `Vec`. `resolve_command` relies on this to prepend system-prompt
+    /// content into the correct arg for non-Claude agents.
     pub command_builder: fn(&str, Option<&str>) -> Vec<String>,
     pub output_format: OutputFormat,
     pub tier: Tier,
