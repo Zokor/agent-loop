@@ -483,7 +483,7 @@ fn parse_tasks_findings_from_output(
 }
 
 /// Reconcile tasks verdict with findings, applying safety nets:
-/// - NEEDS_REVISION + empty new findings + empty existing → synthesize T-001 from reason
+/// - NEEDS_REVISION + no new findings + no open findings after merge → synthesize from reason
 /// - APPROVED + open findings remaining after merge → force NEEDS_REVISION
 fn reconcile_tasks_verdict(
     status: Status,
