@@ -288,10 +288,6 @@ pub struct Config {
     pub wave_shutdown_grace_ms: u64,
 
     // ── Model selection ─────────────────────────────────────────────
-    /// Model override for planning phase. Kept for backward compatibility;
-    /// the model is now applied directly to the `planner` agent during resolution.
-    #[allow(dead_code)]
-    pub planner_model: Option<String>,
     /// Planner permission mode: "default" (normal) or "plan" (Claude read-only).
     pub planner_permission_mode: String,
 
@@ -574,7 +570,6 @@ impl Config {
             stuck_action,
             wave_lock_stale_seconds,
             wave_shutdown_grace_ms,
-            planner_model,
             planner_permission_mode,
             claude_full_access,
             claude_allowed_tools,

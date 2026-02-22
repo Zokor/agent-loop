@@ -46,7 +46,6 @@ pub struct TestConfigOptions {
     pub stuck_action: crate::config::StuckAction,
     pub wave_lock_stale_seconds: u64,
     pub wave_shutdown_grace_ms: u64,
-    pub planner_model: Option<String>,
     pub planner_permission_mode: String,
     pub claude_full_access: bool,
     pub claude_allowed_tools: String,
@@ -90,7 +89,6 @@ impl Default for TestConfigOptions {
             stuck_action: crate::config::StuckAction::Warn,
             wave_lock_stale_seconds: 30,
             wave_shutdown_grace_ms: 30_000,
-            planner_model: None,
             planner_permission_mode: "default".to_string(),
             claude_full_access: false,
             claude_allowed_tools: DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string(),
@@ -117,14 +115,9 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
     let planner = if options.single_agent {
         options.implementer.clone()
     } else {
-        let base = options
+        options
             .planner
-            .unwrap_or_else(|| options.implementer.clone());
-        if let Some(model) = options.planner_model.clone() {
-            base.with_model(Some(model))
-        } else {
-            base
-        }
+            .unwrap_or_else(|| options.implementer.clone())
     };
 
     Config {
@@ -162,7 +155,6 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         stuck_action: options.stuck_action,
         wave_lock_stale_seconds: options.wave_lock_stale_seconds,
         wave_shutdown_grace_ms: options.wave_shutdown_grace_ms,
-        planner_model: options.planner_model.clone(),
         planner_permission_mode: options.planner_permission_mode.clone(),
         claude_full_access: options.claude_full_access,
         claude_allowed_tools: options.claude_allowed_tools.clone(),
