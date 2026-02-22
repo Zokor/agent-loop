@@ -1,4 +1,4 @@
-//! Integration tests for migration errors on removed legacy commands.
+//! Integration tests verifying removed legacy commands produce clap parse errors.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,61 +45,73 @@ fn run_in_tmp(tmp: &TempDir, args: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn run_returns_migration_error() {
+fn run_returns_clap_parse_error() {
     let tmp = TempDir::new("run");
     let output = run_in_tmp(&tmp, &["run"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("Error: 'run' has been removed. Use 'implement'."));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'run', got: {stderr}"
+    );
 }
 
 #[test]
-fn run_planning_only_returns_migration_error() {
+fn run_planning_only_returns_clap_parse_error() {
     let tmp = TempDir::new("run_planning_only");
     let output = run_in_tmp(&tmp, &["run", "--planning-only"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("Error: 'run --planning-only' has been removed. Use 'plan'."));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'run --planning-only', got: {stderr}"
+    );
 }
 
 #[test]
-fn run_resume_returns_migration_error() {
+fn run_resume_returns_clap_parse_error() {
     let tmp = TempDir::new("run_resume");
     let output = run_in_tmp(&tmp, &["run", "--resume"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains(
-        "Error: 'run --resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
-    ));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'run --resume', got: {stderr}"
+    );
 }
 
 #[test]
-fn run_tasks_returns_migration_error() {
+fn run_tasks_returns_clap_parse_error() {
     let tmp = TempDir::new("run_tasks");
     let output = run_in_tmp(&tmp, &["run-tasks"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains("Error: 'run-tasks' has been removed. Use 'implement'."));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'run-tasks', got: {stderr}"
+    );
 }
 
 #[test]
-fn init_returns_migration_error() {
+fn init_returns_clap_parse_error() {
     let tmp = TempDir::new("init");
     let output = run_in_tmp(&tmp, &["init"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains(
-        "Error: 'init' has been removed. Use 'plan' or 'implement' — state is created automatically."
-    ));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'init', got: {stderr}"
+    );
 }
 
 #[test]
-fn resume_returns_migration_error() {
+fn resume_returns_clap_parse_error() {
     let tmp = TempDir::new("resume");
     let output = run_in_tmp(&tmp, &["resume"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
-    assert!(stderr.contains(
-        "Error: 'resume' has been removed. Use 'implement --resume' or 'tasks --resume'."
-    ));
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap parse error for 'resume', got: {stderr}"
+    );
 }

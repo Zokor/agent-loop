@@ -37,7 +37,7 @@ impl Drop for TempDir {
 }
 
 #[test]
-fn tasks_tasks_file_returns_migration_error() {
+fn tasks_tasks_file_returns_config_error() {
     let tmp = TempDir::new("tasks_file");
 
     let output = Command::new(agent_loop_bin())
@@ -49,7 +49,7 @@ fn tasks_tasks_file_returns_migration_error() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success());
     assert!(
-        stderr.contains("Error: '--tasks-file' has been removed. Use '--file' instead."),
-        "stderr should contain migration error, got: {stderr}"
+        stderr.contains("'--tasks-file' has been removed. Use '--file' instead."),
+        "stderr should contain config error about --tasks-file, got: {stderr}"
     );
 }
