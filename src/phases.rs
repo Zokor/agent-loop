@@ -540,7 +540,13 @@ fn reconcile_tasks_verdict(
             }
         }
         Status::NeedsRevision => {
-            if new_findings.is_empty() && merged.is_empty() {
+            // Safety net: NEEDS_REVISION + no new findings from reviewer → synthesize
+            // a finding from reason text. Mirrors planning behavior (line 378): we check
+            // only new_findings.is_empty(), NOT merged.is_empty(), because merged may
+            // contain resolved entries from prior rounds that don't represent the current
+            // issue. Without this, a NEEDS_REVISION with only resolved prior findings
+            // would silently drop the reviewer's concern.
+            if new_findings.is_empty() && open_after_merge == 0 {
                 let desc = status_reason
                     .unwrap_or("Reviewer requested revision but did not provide structured findings.");
                 let next_id = crate::state::next_tasks_finding_id(&TasksFindingsFile {
@@ -3864,6 +3870,73 @@ mod tests {
         assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Open);
         assert_eq!(findings.findings[0].round_resolved, None);
         assert_eq!(findings.findings[0].description, "Testing task still insufficient");
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_needs_revision_resolved_findings_synthesizes() {
+        // Edge case: prior rounds left only resolved findings in merged,
+        // and reviewer returns NEEDS_REVISION with no new findings.
+        // The safety net must still synthesize a finding from reason text.
+        // Before the fix, `merged.is_empty()` was false (resolved entries exist),
+        // so synthesis was skipped, silently dropping the reviewer's concern.
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Old issue now resolved".to_string(),
+                status: crate::state::TasksFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::NeedsRevision,
+            Some("new problem with task ordering"),
+            Vec::new(), // no structured findings from reviewer
+            &existing,
+            3,
+            &config,
+        );
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        // Should have the original resolved finding + synthesized new one
+        assert_eq!(findings.findings.len(), 2);
+        // Original resolved finding preserved
+        assert_eq!(findings.findings[0].id, "T-001");
+        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Resolved);
+        // Synthesized finding from reason text
+        assert_eq!(findings.findings[1].id, "T-002");
+        assert_eq!(findings.findings[1].description, "new problem with task ordering");
+        assert_eq!(findings.findings[1].status, crate::state::TasksFindingStatus::Open);
+        assert_eq!(findings.findings[1].round_introduced, 3);
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_needs_revision_with_open_findings_no_synthesis() {
+        // When NEEDS_REVISION is returned with no new findings but open findings
+        // already exist from prior rounds, we should NOT synthesize — the existing
+        // open findings already capture the issue.
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Existing open issue".to_string(),
+                status: crate::state::TasksFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::NeedsRevision,
+            Some("still not fixed"),
+            Vec::new(), // no new structured findings
+            &existing,
+            2,
+            &config,
+        );
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        // Should NOT synthesize: open findings already exist
+        assert_eq!(findings.findings.len(), 1);
+        assert_eq!(findings.findings[0].id, "T-001");
     }
 
     // -----------------------------------------------------------------------
