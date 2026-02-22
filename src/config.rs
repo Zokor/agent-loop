@@ -775,26 +775,59 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
     Ok(())
 }
 
+/// Returns true if the missing-config hint should be emitted based on environment
+/// conditions, excluding the one-time process guard. Extracted as a pure function
+/// for unit testability (integration tests run with piped stderr so the
+/// `is_terminal` branch cannot be exercised there).
+fn should_emit_missing_config_hint(
+    config_file_found: bool,
+    ci_set: bool,
+    is_terminal: bool,
+) -> bool {
+    if config_file_found {
+        return false;
+    }
+    if ci_set {
+        return false;
+    }
+    if !is_terminal {
+        return false;
+    }
+    true
+}
+
+/// Combines environment checks with a one-time guard. Returns true if the hint
+/// should be printed (first eligible call only). Takes `guard` as a parameter
+/// so unit tests can supply their own `AtomicBool` instead of sharing the
+/// process-wide static.
+fn try_emit_missing_config_hint(
+    config_file_found: bool,
+    ci_set: bool,
+    is_terminal: bool,
+    guard: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if !should_emit_missing_config_hint(config_file_found, ci_set, is_terminal) {
+        return false;
+    }
+    // swap returns the *previous* value; true means already emitted.
+    !guard.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 fn emit_config_warnings(_config: &Config, config_file_found: bool) {
-    use std::io::IsTerminal;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     static MISSING_CONFIG_HINT_EMITTED: AtomicBool = AtomicBool::new(false);
 
-    if config_file_found {
-        return;
+    if try_emit_missing_config_hint(
+        config_file_found,
+        std::env::var_os("CI").is_some(),
+        std::io::IsTerminal::is_terminal(&std::io::stderr()),
+        &MISSING_CONFIG_HINT_EMITTED,
+    ) {
+        eprintln!(
+            "Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one."
+        );
     }
-    if std::env::var_os("CI").is_some() {
-        return;
-    }
-    if !std::io::stderr().is_terminal() {
-        return;
-    }
-    if MISSING_CONFIG_HINT_EMITTED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-
-    eprintln!("Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one.");
 }
 
 /// Generate a fully-commented TOML config template with all settings organized
@@ -2040,6 +2073,95 @@ planning_context_excerpt_lines = 75
             .expect("override max_rounds should win");
         assert_eq!(config.max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_default_config_template
+    // -----------------------------------------------------------------------
+
+    // -----------------------------------------------------------------------
+    // Missing-config hint: should_emit_missing_config_hint (pure logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hint_suppressed_when_config_file_found() {
+        assert!(
+            !should_emit_missing_config_hint(true, false, true),
+            "hint should not emit when config file exists"
+        );
+    }
+
+    #[test]
+    fn hint_suppressed_when_ci_set_even_with_terminal() {
+        // This is the key test the reviewer flagged: integration tests cannot
+        // exercise the CI branch because Command::output() pipes stderr
+        // (non-TTY). Here we explicitly pass is_terminal=true to isolate the
+        // CI guard.
+        assert!(
+            !should_emit_missing_config_hint(false, true, true),
+            "hint should not emit when CI is set, even with a real terminal"
+        );
+    }
+
+    #[test]
+    fn hint_suppressed_when_not_terminal() {
+        assert!(
+            !should_emit_missing_config_hint(false, false, false),
+            "hint should not emit when stderr is not a terminal"
+        );
+    }
+
+    #[test]
+    fn hint_emits_when_all_conditions_met() {
+        assert!(
+            should_emit_missing_config_hint(false, false, true),
+            "hint should emit when no config, no CI, and terminal"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Missing-config hint: try_emit (one-time guard semantics)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn one_time_guard_allows_first_call_only() {
+        use std::sync::atomic::AtomicBool;
+
+        let guard = AtomicBool::new(false);
+
+        // First call with eligible conditions: should emit
+        assert!(
+            try_emit_missing_config_hint(false, false, true, &guard),
+            "first eligible call should return true"
+        );
+        // Second call: guard blocks
+        assert!(
+            !try_emit_missing_config_hint(false, false, true, &guard),
+            "second call should be blocked by one-time guard"
+        );
+        // Third call: still blocked
+        assert!(
+            !try_emit_missing_config_hint(false, false, true, &guard),
+            "subsequent calls should remain blocked"
+        );
+    }
+
+    #[test]
+    fn one_time_guard_not_consumed_when_conditions_fail() {
+        use std::sync::atomic::AtomicBool;
+
+        let guard = AtomicBool::new(false);
+
+        // Call with CI set — should not emit AND should not consume the guard
+        assert!(
+            !try_emit_missing_config_hint(false, true, true, &guard),
+            "CI suppression should prevent emission"
+        );
+        // Now call with eligible conditions — guard should still allow
+        assert!(
+            try_emit_missing_config_hint(false, false, true, &guard),
+            "guard should not have been consumed by the failed CI call"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -338,7 +338,14 @@ fn config_init_generated_file_is_valid_toml() {
     // (all lines are commented so it parses as empty valid TOML)
     let status_output = run_cmd(&project_dir, &["status"]);
     let stderr = String::from_utf8_lossy(&status_output.stderr);
-    // Should not contain a TOML parse error
+
+    // Assert the status command itself succeeded — a TOML parse error would
+    // cause a non-zero exit code, not just a substring in stderr.
+    assert!(
+        status_output.status.success(),
+        "status should succeed with generated config: stderr={stderr}"
+    );
+    // Belt-and-suspenders: also check no parse-error message
     assert!(
         !stderr.contains("failed to parse"),
         "generated config should be valid TOML: {stderr}"
@@ -347,11 +354,18 @@ fn config_init_generated_file_is_valid_toml() {
     let _ = fs::remove_dir_all(&project_dir);
 }
 
+/// Verifies the hint is absent when running via `Command::output()` with CI=true.
+///
+/// NOTE: `Command::output()` uses piped stderr (non-TTY), so *both* the
+/// `is_terminal` guard and the `CI` guard suppress the hint here. This test
+/// validates the end-to-end integration path (piped CI = no hint), but it
+/// cannot isolate the CI branch alone. The CI-specific guard is exercised in
+/// the unit test `config::tests::hint_suppressed_when_ci_set_even_with_terminal`,
+/// which injects `is_terminal=true` to isolate the CI check.
 #[test]
-fn missing_config_hint_not_shown_when_ci_set() {
+fn missing_config_hint_not_shown_in_piped_ci_context() {
     let project_dir = create_project_dir("config_hint_ci");
 
-    // Run status with CI=true — the missing-config hint should be suppressed
     let output = Command::new(agent_loop_bin())
         .args(["status"])
         .env("CI", "true")
@@ -362,7 +376,29 @@ fn missing_config_hint_not_shown_when_ci_set() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         !stderr.contains("agent-loop config init"),
-        "missing-config hint should be suppressed in CI: {stderr}"
+        "missing-config hint should be suppressed in piped CI context: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+/// Verifies the hint is also absent when running piped (non-TTY) without CI.
+/// This confirms the `is_terminal` guard works independently of CI.
+#[test]
+fn missing_config_hint_not_shown_when_piped_without_ci() {
+    let project_dir = create_project_dir("config_hint_piped");
+
+    let output = Command::new(agent_loop_bin())
+        .args(["status"])
+        .env_remove("CI")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop should execute");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("agent-loop config init"),
+        "missing-config hint should be suppressed in non-TTY (piped) context: {stderr}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);
