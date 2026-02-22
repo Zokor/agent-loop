@@ -426,15 +426,63 @@ pub(crate) fn decomposition_reviewer_prompt(
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
+    open_findings: &str,
 ) -> String {
+    let findings_section = if open_findings.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nOPEN TASKS FINDINGS (address or resolve each):\n{open_findings}")
+    };
+
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\nIf you approve the breakdown, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}{findings_section}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\nIf you approve the breakdown, write this JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.status_json),
         config.implementer,
         config.reviewer,
         config.run_mode,
         path_text(&paths.tasks_md),
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
+    )
+}
+
+pub(crate) fn decomposition_implementer_signoff_prompt(
+    config: &Config,
+    task: &str,
+    plan: &str,
+    tasks: &str,
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "The reviewer has APPROVED the task breakdown. Review the tasks against the original plan and task.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nAPPROVED TASKS:\n{tasks}\n\nIf you agree with the task breakdown, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to request changes, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        path_text(&paths.status_json),
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
+    )
+}
+
+pub(crate) fn planning_implementer_signoff_prompt(
+    config: &Config,
+    task: &str,
+    plan: &str,
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "The reviewer has APPROVED your plan. Perform a final review before confirming.\n\nORIGINAL TASK:\n{task}\n\nAPPROVED PLAN:\n{plan}\n\nIf you agree with the plan, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to request changes, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        path_text(&paths.status_json),
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
         config.implementer,
         config.reviewer,
         config.run_mode,

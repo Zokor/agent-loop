@@ -2049,7 +2049,11 @@ fn status_command() -> Result<i32, AgentLoopError> {
     // Planning artifacts.
     let planning_progress_path = config.state_dir.join("planning-progress.md");
     let planning_findings_path = config.state_dir.join("planning_findings.json");
-    if planning_progress_path.exists() || planning_findings_path.exists() {
+    let tasks_findings_path = config.state_dir.join("tasks_findings.json");
+    if planning_progress_path.exists()
+        || planning_findings_path.exists()
+        || tasks_findings_path.exists()
+    {
         println!();
         println!("Planning artifacts:");
         if planning_progress_path.exists() {
@@ -2057,6 +2061,9 @@ fn status_command() -> Result<i32, AgentLoopError> {
         }
         if planning_findings_path.exists() {
             println!("  - {}", planning_findings_path.display());
+        }
+        if tasks_findings_path.exists() {
+            println!("  - {}", tasks_findings_path.display());
         }
     }
 

@@ -930,6 +930,80 @@ pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {
 }
 
 // ---------------------------------------------------------------------------
+// Tasks (decomposition) findings (tasks_findings.json)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TasksFindingStatus {
+    Open,
+    Resolved,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TasksFindingEntry {
+    pub id: String,
+    pub description: String,
+    pub status: TasksFindingStatus,
+    pub round_introduced: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_resolved: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TasksFindingsFile {
+    pub findings: Vec<TasksFindingEntry>,
+}
+
+pub fn read_tasks_findings(config: &Config) -> TasksFindingsFile {
+    let raw = read_state_file("tasks_findings.json", config);
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return TasksFindingsFile::default();
+    }
+    serde_json::from_str(trimmed).unwrap_or_default()
+}
+
+pub fn write_tasks_findings(
+    findings: &TasksFindingsFile,
+    config: &Config,
+) -> io::Result<()> {
+    let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
+    write_state_file("tasks_findings.json", &serialized, config)
+}
+
+pub fn clear_tasks_findings(config: &Config) {
+    let path = config.state_dir.join("tasks_findings.json");
+    let _ = fs::remove_file(path);
+}
+
+pub fn open_tasks_findings_for_prompt(findings: &TasksFindingsFile) -> String {
+    let open: Vec<&TasksFindingEntry> = findings
+        .findings
+        .iter()
+        .filter(|f| f.status == TasksFindingStatus::Open)
+        .collect();
+    if open.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Open tasks findings:\n");
+    for f in &open {
+        out.push_str(&format!("- {}: {}\n", f.id, f.description));
+    }
+    out
+}
+
+pub fn next_tasks_finding_id(findings: &TasksFindingsFile) -> String {
+    let max_num = findings
+        .findings
+        .iter()
+        .filter_map(|f| f.id.strip_prefix("T-").and_then(|n| n.parse::<u32>().ok()))
+        .max()
+        .unwrap_or(0);
+    format!("T-{:03}", max_num + 1)
+}
+
+// ---------------------------------------------------------------------------
 // Task lifecycle persistence (task_status.json)
 // ---------------------------------------------------------------------------
 
@@ -3136,5 +3210,134 @@ mod tests {
         assert_eq!(reloaded.tasks[0].wave_index, Some(0));
         assert_eq!(reloaded.tasks[1].wave_index, Some(1));
         assert_eq!(reloaded.tasks[2].wave_index, None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks findings (tasks_findings.json) tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_tasks_findings_returns_empty_when_file_missing() {
+        let project = new_project();
+        let findings = read_tasks_findings(&project.config);
+        assert!(findings.findings.is_empty());
+    }
+
+    #[test]
+    fn write_and_read_tasks_findings_round_trips() {
+        let project = new_project();
+        let findings = TasksFindingsFile {
+            findings: vec![TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Missing dependency declaration".to_string(),
+                status: TasksFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        write_tasks_findings(&findings, &project.config).expect("write should succeed");
+        let reloaded = read_tasks_findings(&project.config);
+        assert_eq!(reloaded.findings.len(), 1);
+        assert_eq!(reloaded.findings[0].id, "T-001");
+        assert_eq!(reloaded.findings[0].status, TasksFindingStatus::Open);
+    }
+
+    #[test]
+    fn clear_tasks_findings_removes_file() {
+        let project = new_project();
+        let findings = TasksFindingsFile {
+            findings: vec![TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "test".to_string(),
+                status: TasksFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        write_tasks_findings(&findings, &project.config).expect("write should succeed");
+        assert!(!read_tasks_findings(&project.config).findings.is_empty());
+
+        clear_tasks_findings(&project.config);
+        assert!(read_tasks_findings(&project.config).findings.is_empty());
+    }
+
+    #[test]
+    fn open_tasks_findings_for_prompt_filters_to_open() {
+        let findings = TasksFindingsFile {
+            findings: vec![
+                TasksFindingEntry {
+                    id: "T-001".to_string(),
+                    description: "resolved issue".to_string(),
+                    status: TasksFindingStatus::Resolved,
+                    round_introduced: 1,
+                    round_resolved: Some(2),
+                },
+                TasksFindingEntry {
+                    id: "T-002".to_string(),
+                    description: "still open".to_string(),
+                    status: TasksFindingStatus::Open,
+                    round_introduced: 2,
+                    round_resolved: None,
+                },
+            ],
+        };
+        let prompt = open_tasks_findings_for_prompt(&findings);
+        assert!(prompt.contains("T-002"));
+        assert!(prompt.contains("still open"));
+        assert!(!prompt.contains("T-001"));
+    }
+
+    #[test]
+    fn open_tasks_findings_for_prompt_empty_when_no_open() {
+        let findings = TasksFindingsFile {
+            findings: vec![TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "resolved".to_string(),
+                status: TasksFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        let prompt = open_tasks_findings_for_prompt(&findings);
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn next_tasks_finding_id_auto_increments() {
+        let findings = TasksFindingsFile {
+            findings: vec![
+                TasksFindingEntry {
+                    id: "T-001".to_string(),
+                    description: "a".to_string(),
+                    status: TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+                TasksFindingEntry {
+                    id: "T-003".to_string(),
+                    description: "b".to_string(),
+                    status: TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+            ],
+        };
+        assert_eq!(next_tasks_finding_id(&findings), "T-004");
+    }
+
+    #[test]
+    fn next_tasks_finding_id_starts_at_001_when_empty() {
+        let findings = TasksFindingsFile::default();
+        assert_eq!(next_tasks_finding_id(&findings), "T-001");
+    }
+
+    #[test]
+    fn tasks_findings_tolerant_read_on_invalid_json() {
+        let project = new_project();
+        // Write invalid JSON
+        write_state_file("tasks_findings.json", "not json", &project.config)
+            .expect("write should succeed");
+        let findings = read_tasks_findings(&project.config);
+        assert!(findings.findings.is_empty());
     }
 }
