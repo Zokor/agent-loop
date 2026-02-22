@@ -1,0 +1,66 @@
+# agent-loop configuration
+# All settings are optional — uncomment and modify as needed.
+# Precedence: CLI flags > environment variables > this file > built-in defaults.
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+# max_rounds = 20
+# planning_max_rounds = 3
+# decomposition_max_rounds = 3
+# timeout = 600
+# auto_commit = true
+# auto_test = false
+# auto_test_cmd = ""
+# compound = true
+# decisions_max_lines = 50
+# diff_max_lines = 500
+# context_line_cap = 200
+# planning_context_excerpt_lines = 100
+# batch_implement = true
+# progressive_context = false
+
+# ── Agents ───────────────────────────────────────────────────────────────────
+# implementer = "claude"
+# reviewer = "codex"
+# planner = "claude"
+# single_agent = false
+
+# ── Model selection ──────────────────────────────────────────────────────────
+# implementer_model = ""
+# reviewer_model = ""
+# planner_model = ""
+# planner_permission_mode = "default"
+
+# ── Claude CLI tuning ────────────────────────────────────────────────────────
+# claude_full_access = false
+# claude_allowed_tools = "Bash,Read,Edit,Write,Grep,Glob,WebFetch"
+# reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
+# claude_session_persistence = true
+# claude_effort_level = ""
+# claude_max_output_tokens = 16000
+# claude_max_thinking_tokens = 10000
+# implementer_effort_level = ""
+# reviewer_effort_level = ""
+
+# ── Codex CLI tuning ────────────────────────────────────────────────────────
+# codex_full_access = false
+# codex_session_persistence = true
+
+# ── Stuck detection ──────────────────────────────────────────────────────────
+# stuck_detection_enabled = false
+# stuck_no_diff_rounds = 3
+# stuck_threshold_minutes = 10
+# stuck_action = "warn"
+
+# ── Wave runtime ─────────────────────────────────────────────────────────────
+# max_parallel = 1
+# wave_lock_stale_seconds = 30
+# wave_shutdown_grace_ms = 30000
+
+# ── Quality commands ─────────────────────────────────────────────────────────
+# Uncomment and customize to define explicit quality checks.
+# [[quality_commands]]
+# command = "cargo clippy -- -D warnings"
+# remediation = "Fix all clippy warnings."
+#
+# [[quality_commands]]
+# command = "cargo test"
