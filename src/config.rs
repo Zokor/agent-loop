@@ -1163,6 +1163,7 @@ decomposition_max_rounds = 4
 timeout = 300
 implementer = "codex"
 reviewer = "claude"
+planner = "claude"
 single_agent = true
 auto_commit = false
 auto_test = true
@@ -1192,6 +1193,7 @@ command = "cargo test"
         assert_eq!(config.timeout, Some(300));
         assert_eq!(config.implementer.as_deref(), Some("codex"));
         assert_eq!(config.reviewer.as_deref(), Some("claude"));
+        assert_eq!(config.planner.as_deref(), Some("claude"));
         assert_eq!(config.single_agent, Some(true));
         assert_eq!(config.auto_commit, Some(false));
         assert_eq!(config.auto_test, Some(true));
@@ -1671,8 +1673,9 @@ batch_implement = true
         write_toml(&dir, "planner = \"codex\"\n");
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
-        assert_eq!(config.planner, Agent::known("codex"));
-        assert_eq!(config.implementer, Agent::known("claude"));
+        assert_eq!(config.planner.name(), "codex");
+        assert_eq!(config.planner.model(), None);
+        assert_eq!(config.implementer.name(), "claude");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1746,6 +1749,24 @@ batch_implement = true
         // Planner defaults to implementer and inherits its model
         assert_eq!(config.planner.name(), "claude");
         assert_eq!(config.planner.model(), Some("claude-sonnet-4-6"));
+        assert_eq!(config.implementer.model(), Some("claude-sonnet-4-6"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_explicit_planner_does_not_inherit_implementer_model() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("IMPLEMENTER_MODEL", "claude-sonnet-4-6");
+
+        let dir = create_temp_project_root("cfg_planner_no_inherit");
+        write_toml(&dir, "planner = \"codex\"\n");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        // Explicit planner should NOT inherit implementer model
+        assert_eq!(config.planner.name(), "codex");
+        assert_eq!(config.planner.model(), None);
+        // Implementer still has its model
         assert_eq!(config.implementer.model(), Some("claude-sonnet-4-6"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2223,11 +2244,15 @@ planning_context_excerpt_lines = 75
     #[test]
     fn load_file_config_accepts_valid_agent_values() {
         let dir = create_temp_project_root("toml_valid_agents");
-        write_toml(&dir, "implementer = \"claude\"\nreviewer = \"codex\"\n");
+        write_toml(
+            &dir,
+            "implementer = \"claude\"\nreviewer = \"codex\"\nplanner = \"codex\"\n",
+        );
         let result = load_file_config(&dir).expect("valid agents should parse");
         assert!(result.file_found);
         assert_eq!(result.config.implementer.as_deref(), Some("claude"));
         assert_eq!(result.config.reviewer.as_deref(), Some("codex"));
+        assert_eq!(result.config.planner.as_deref(), Some("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
