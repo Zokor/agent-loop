@@ -1994,7 +1994,19 @@ fn status_command() -> Result<i32, AgentLoopError> {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        println!("reason: {reason}");
+        // Extract gate-source tag if present (e.g. "[gate:reviewer]")
+        if let Some(gate) = reason
+            .strip_prefix("[gate:")
+            .and_then(|rest| rest.split_once(']'))
+        {
+            println!("gate: {}", gate.0);
+            let rest = gate.1.trim();
+            if !rest.is_empty() {
+                println!("reason: {rest}");
+            }
+        } else {
+            println!("reason: {reason}");
+        }
     }
     println!("timestamp: {}", current_status.timestamp);
 

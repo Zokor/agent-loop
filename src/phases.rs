@@ -432,46 +432,125 @@ fn decomposition_forced_revision_reason(status: Status) -> Option<&'static str> 
 }
 
 // ---------------------------------------------------------------------------
-// Tasks findings reconciliation (mirrors planning findings safety nets)
+// Tasks findings parsing and reconciliation (mirrors planning findings)
 // ---------------------------------------------------------------------------
 
+/// Parse tasks findings JSON block from reviewer output.
+/// Looks for ```json\n[...]\n``` blocks containing findings with "id" and "description".
+fn parse_tasks_findings_from_output(
+    text: &str,
+    round: u32,
+) -> Vec<crate::state::TasksFindingEntry> {
+    use crate::state::{TasksFindingEntry, TasksFindingStatus};
+
+    // Look for JSON array in code blocks
+    let re = regex::Regex::new(r"```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```").ok();
+    let json_text = re
+        .and_then(|r| r.captures(text))
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str());
+
+    let Some(json_str) = json_text else {
+        return Vec::new();
+    };
+
+    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|v| {
+            let id = v.get("id")?.as_str()?.to_string();
+            let description = v.get("description")?.as_str()?.to_string();
+            let status = match v
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref()
+            {
+                Some("resolved") => TasksFindingStatus::Resolved,
+                _ => TasksFindingStatus::Open,
+            };
+            Some(TasksFindingEntry {
+                id,
+                description,
+                status,
+                round_introduced: round,
+                round_resolved: None,
+            })
+        })
+        .collect()
+}
+
+/// Reconcile tasks verdict with findings, applying safety nets:
+/// - NEEDS_REVISION + empty new findings + empty existing → synthesize T-001 from reason
+/// - APPROVED + open findings remaining after merge → force NEEDS_REVISION
 fn reconcile_tasks_verdict(
     status: Status,
     status_reason: Option<&str>,
+    new_findings: Vec<crate::state::TasksFindingEntry>,
     existing: &crate::state::TasksFindingsFile,
+    round: u32,
     config: &Config,
 ) -> (DecompositionStatusDecision, crate::state::TasksFindingsFile) {
-    use crate::state::{TasksFindingEntry, TasksFindingStatus};
+    use crate::state::{TasksFindingEntry, TasksFindingStatus, TasksFindingsFile};
 
-    let open_count = existing
-        .findings
+    // ID-based merge: update existing findings, add new ones, resolve transitions.
+    let mut merged = existing.findings.clone();
+    for new_f in &new_findings {
+        if let Some(existing_entry) = merged.iter_mut().find(|f| f.id == new_f.id) {
+            existing_entry.description = new_f.description.clone();
+            if new_f.status == TasksFindingStatus::Resolved
+                && existing_entry.status == TasksFindingStatus::Open
+            {
+                existing_entry.status = TasksFindingStatus::Resolved;
+                existing_entry.round_resolved = Some(round);
+            } else if new_f.status == TasksFindingStatus::Open
+                && existing_entry.status == TasksFindingStatus::Resolved
+            {
+                // Reopened — reviewer flagged it again.
+                existing_entry.status = TasksFindingStatus::Open;
+                existing_entry.round_resolved = None;
+            }
+        } else {
+            // New finding not previously seen.
+            let mut entry = new_f.clone();
+            if entry.status == TasksFindingStatus::Resolved {
+                entry.round_resolved = Some(round);
+            }
+            merged.push(entry);
+        }
+    }
+
+    let open_after_merge = merged
         .iter()
         .filter(|f| f.status == TasksFindingStatus::Open)
         .count();
 
-    match status {
+    let decision = match status {
         Status::Approved => {
-            if open_count > 0 {
+            if open_after_merge > 0 {
                 let _ = log(
                     "Tasks reconciliation: APPROVED with open findings — forcing NEEDS_REVISION",
                     config,
                 );
-                (DecompositionStatusDecision::NeedsRevision, existing.clone())
+                DecompositionStatusDecision::NeedsRevision
             } else {
-                (DecompositionStatusDecision::Approved, existing.clone())
+                DecompositionStatusDecision::Approved
             }
         }
         Status::NeedsRevision => {
-            let mut findings = existing.clone();
-            if findings.findings.is_empty() {
+            if new_findings.is_empty() && merged.is_empty() {
                 let desc = status_reason
                     .unwrap_or("Reviewer requested revision but did not provide structured findings.");
-                let next_id = crate::state::next_tasks_finding_id(&findings);
-                findings.findings.push(TasksFindingEntry {
+                let next_id = crate::state::next_tasks_finding_id(&TasksFindingsFile {
+                    findings: merged.clone(),
+                });
+                merged.push(TasksFindingEntry {
                     id: next_id,
                     description: desc.to_string(),
                     status: TasksFindingStatus::Open,
-                    round_introduced: 0, // will be set by caller
+                    round_introduced: round,
                     round_resolved: None,
                 });
                 let _ = log(
@@ -479,11 +558,14 @@ fn reconcile_tasks_verdict(
                     config,
                 );
             }
-            (DecompositionStatusDecision::NeedsRevision, findings)
+            DecompositionStatusDecision::NeedsRevision
         }
-        Status::Error => (DecompositionStatusDecision::Error, existing.clone()),
-        _ => (DecompositionStatusDecision::ForceNeedsRevision, existing.clone()),
-    }
+        Status::Error => DecompositionStatusDecision::Error,
+        _ => DecompositionStatusDecision::ForceNeedsRevision,
+    };
+
+    let findings_file = TasksFindingsFile { findings: merged };
+    (decision, findings_file)
 }
 
 /// Policy helpers for uniform signoff gating.
@@ -1448,7 +1530,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 StatusPatch {
                     status: Some(Status::NeedsRevision),
                     round: Some(planning_round),
-                    reason: Some("Forced NEEDS_REVISION: open planning findings remain".to_string()),
+                    reason: Some("[gate:reviewer] Forced NEEDS_REVISION: open planning findings remain".to_string()),
                     ..StatusPatch::default()
                 },
                 config,
@@ -1533,10 +1615,11 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 if planning_implementer_reached_consensus(implementer_status.status) {
                     let _ = log("✅ Both agents agreed on the plan!", config);
                     warn_on_status_write(
-                        "APPROVED",
+                        "CONSENSUS",
                         StatusPatch {
-                            status: Some(Status::Approved),
+                            status: Some(Status::Consensus),
                             round: Some(planning_round),
+                            reason: Some("[gate:implementer-signoff] Dual-agent signoff: reviewer revised, implementer agreed".to_string()),
                             ..StatusPatch::default()
                         },
                         config,
@@ -1623,10 +1706,11 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     if planning_implementer_reached_consensus(signoff_status.status) {
                         let _ = log("✅ Both agents agreed on the plan!", config);
                         warn_on_status_write(
-                            "APPROVED",
+                            "CONSENSUS",
                             StatusPatch {
-                                status: Some(Status::Approved),
+                                status: Some(Status::Consensus),
                                 round: Some(planning_round),
+                                reason: Some("[gate:implementer-signoff] Dual-agent signoff: reviewer approved, implementer agreed".to_string()),
                                 ..StatusPatch::default()
                             },
                             config,
@@ -1936,15 +2020,26 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         }
 
         // --- Tasks findings reconciliation ---
+        // Read the review output and parse structured findings from it.
+        let review_output = read_state_file("review.md", config);
+        let new_task_findings = parse_tasks_findings_from_output(&review_output, round);
+
         let (reconciled_decision, updated_findings) = reconcile_tasks_verdict(
             status.status,
             status.reason.as_deref(),
+            new_task_findings,
             &tasks_findings,
+            round,
             config,
         );
 
-        // Persist updated tasks findings.
-        let _ = crate::state::write_tasks_findings(&updated_findings, config);
+        // Persist updated tasks findings — propagate errors instead of ignoring.
+        if let Err(e) = crate::state::write_tasks_findings(&updated_findings, config) {
+            let _ = log(
+                &format!("⚠️ Failed to persist tasks_findings.json: {e}"),
+                config,
+            );
+        }
 
         // If reconciliation overrode the status (e.g. forced NEEDS_REVISION),
         // update status.json accordingly.
@@ -1956,7 +2051,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 StatusPatch {
                     status: Some(Status::NeedsRevision),
                     round: Some(round),
-                    reason: Some("Forced NEEDS_REVISION: open tasks findings remain".to_string()),
+                    reason: Some("[gate:reviewer] Forced NEEDS_REVISION: open tasks findings remain".to_string()),
                     ..StatusPatch::default()
                 },
                 config,
@@ -3586,13 +3681,16 @@ mod tests {
         let (decision, findings) = reconcile_tasks_verdict(
             Status::NeedsRevision,
             Some("task sizes are wrong"),
+            Vec::new(),
             &existing,
+            2,
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
         assert_eq!(findings.findings.len(), 1);
         assert_eq!(findings.findings[0].id, "T-001");
         assert_eq!(findings.findings[0].description, "task sizes are wrong");
+        assert_eq!(findings.findings[0].round_introduced, 2);
     }
 
     #[test]
@@ -3610,7 +3708,9 @@ mod tests {
         let (decision, _) = reconcile_tasks_verdict(
             Status::Approved,
             None,
+            Vec::new(),
             &existing,
+            2,
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
@@ -3631,7 +3731,9 @@ mod tests {
         let (decision, _) = reconcile_tasks_verdict(
             Status::Approved,
             None,
+            Vec::new(),
             &existing,
+            3,
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::Approved);
@@ -3644,7 +3746,9 @@ mod tests {
         let (decision, _) = reconcile_tasks_verdict(
             Status::Error,
             None,
+            Vec::new(),
             &existing,
+            1,
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::Error);
@@ -3657,10 +3761,109 @@ mod tests {
         let (decision, _) = reconcile_tasks_verdict(
             Status::Consensus,
             None,
+            Vec::new(),
             &existing,
+            1,
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::ForceNeedsRevision);
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_merges_resolved_findings() {
+        // Test that the reviewer can resolve open findings by submitting
+        // them with status "resolved", breaking the deadlock.
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Missing testing task".to_string(),
+                status: crate::state::TasksFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        // Reviewer submits T-001 as resolved
+        let new_findings = vec![crate::state::TasksFindingEntry {
+            id: "T-001".to_string(),
+            description: "Missing testing task".to_string(),
+            status: crate::state::TasksFindingStatus::Resolved,
+            round_introduced: 1,
+            round_resolved: None,
+        }];
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::Approved,
+            None,
+            new_findings,
+            &existing,
+            2,
+            &config,
+        );
+        // With T-001 resolved, APPROVED should pass through
+        assert_eq!(decision, DecompositionStatusDecision::Approved);
+        assert_eq!(findings.findings.len(), 1);
+        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Resolved);
+        assert_eq!(findings.findings[0].round_resolved, Some(2));
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_adds_new_findings_from_reviewer() {
+        // Test that the reviewer can introduce new findings
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile::default();
+        let new_findings = vec![crate::state::TasksFindingEntry {
+            id: "T-001".to_string(),
+            description: "Task 3 is too large".to_string(),
+            status: crate::state::TasksFindingStatus::Open,
+            round_introduced: 1,
+            round_resolved: None,
+        }];
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::NeedsRevision,
+            Some("Issues found"),
+            new_findings,
+            &existing,
+            1,
+            &config,
+        );
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        assert_eq!(findings.findings.len(), 1);
+        assert_eq!(findings.findings[0].id, "T-001");
+        assert_eq!(findings.findings[0].description, "Task 3 is too large");
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_reopens_resolved_finding() {
+        // Test that a previously resolved finding can be reopened
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Missing testing task".to_string(),
+                status: crate::state::TasksFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        let new_findings = vec![crate::state::TasksFindingEntry {
+            id: "T-001".to_string(),
+            description: "Testing task still insufficient".to_string(),
+            status: crate::state::TasksFindingStatus::Open,
+            round_introduced: 1,
+            round_resolved: None,
+        }];
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::NeedsRevision,
+            None,
+            new_findings,
+            &existing,
+            3,
+            &config,
+        );
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Open);
+        assert_eq!(findings.findings[0].round_resolved, None);
+        assert_eq!(findings.findings[0].description, "Testing task still insufficient");
     }
 
     // -----------------------------------------------------------------------
@@ -3701,6 +3904,95 @@ mod tests {
         );
         assert!(prompt.contains("\"status\": \"APPROVED\""));
         assert!(!prompt.contains("\"status\": \"CONSENSUS\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tasks findings parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_tasks_findings_from_output_extracts_findings() {
+        let text = r#"
+Some review text.
+
+## Findings
+```json
+[{"id": "T-001", "description": "Task 3 is too large", "status": "open"},
+ {"id": "T-002", "description": "Missing dependency on task 1", "status": "open"}]
+```
+
+More text.
+"#;
+        let findings = parse_tasks_findings_from_output(text, 2);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].id, "T-001");
+        assert_eq!(findings[0].description, "Task 3 is too large");
+        assert_eq!(findings[0].status, crate::state::TasksFindingStatus::Open);
+        assert_eq!(findings[0].round_introduced, 2);
+        assert_eq!(findings[1].id, "T-002");
+    }
+
+    #[test]
+    fn parse_tasks_findings_from_output_handles_resolved() {
+        let text = r#"
+```json
+[{"id": "T-001", "description": "Previously raised issue", "status": "resolved"}]
+```
+"#;
+        let findings = parse_tasks_findings_from_output(text, 3);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].status, crate::state::TasksFindingStatus::Resolved);
+    }
+
+    #[test]
+    fn parse_tasks_findings_from_output_returns_empty_when_no_block() {
+        let findings = parse_tasks_findings_from_output("no findings here", 1);
+        assert!(findings.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate-source tagging in status reasons
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn gate_source_in_planning_forced_revision_reason() {
+        // Verify the forced NEEDS_REVISION reason includes gate-source tag
+        let reason = "[gate:reviewer] Forced NEEDS_REVISION: open planning findings remain";
+        assert!(reason.starts_with("[gate:"));
+        let gate = reason
+            .strip_prefix("[gate:")
+            .and_then(|rest| rest.split_once(']'))
+            .map(|(g, _)| g);
+        assert_eq!(gate, Some("reviewer"));
+    }
+
+    #[test]
+    fn gate_source_in_dual_agent_signoff_reason() {
+        let reason = "[gate:implementer-signoff] Dual-agent signoff: reviewer approved, implementer agreed";
+        let gate = reason
+            .strip_prefix("[gate:")
+            .and_then(|rest| rest.split_once(']'))
+            .map(|(g, _)| g);
+        assert_eq!(gate, Some("implementer-signoff"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Decomposition reviewer prompt includes findings protocol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decomposition_reviewer_prompt_includes_findings_protocol() {
+        use crate::prompts::{decomposition_reviewer_prompt, phase_paths};
+        let root = create_temp_project_root("phases_decomp_findings_proto");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        let paths = phase_paths(&config);
+        let prompt = decomposition_reviewer_prompt(
+            &config, "plan", "tasks", 1, "2026-01-01T00:00:00.000Z", &paths, "",
+        );
+        // Should request structured findings with T- prefix IDs
+        assert!(prompt.contains("T-001"));
+        assert!(prompt.contains("\"status\": \"open\""));
+        assert!(prompt.contains("\"status\": \"resolved\""));
     }
 
     // -----------------------------------------------------------------------

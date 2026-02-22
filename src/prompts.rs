@@ -435,16 +435,17 @@ pub(crate) fn decomposition_reviewer_prompt(
     };
 
     format!(
-        "{}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}{findings_section}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\nIf you approve the breakdown, write this JSON to {}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        single_agent_reviewer_preamble(config),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        path_text(&paths.tasks_md),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}{findings_section}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\n## Findings\nList specific issues as a JSON block in {review_path} (use IDs like T-001, T-002, ...):\n```json\n[{{\"id\": \"T-001\", \"description\": \"issue description\", \"status\": \"open\"}}]\n```\nUse `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. Use `\"status\": \"open\"` for issues that still need attention. Omit the block entirely if there are no findings at all.\n\nIf you approve the breakdown, write this JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {tasks_path} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        preamble = single_agent_reviewer_preamble(config),
+        review_path = path_text(&paths.review_md),
+        status_path = path_text(&paths.status_json),
+        impl_name = config.implementer,
+        rev_name = config.reviewer,
+        mode = config.run_mode,
+        tasks_path = path_text(&paths.tasks_md),
+        impl_name2 = config.implementer,
+        rev_name2 = config.reviewer,
+        mode2 = config.run_mode,
     )
 }
 
