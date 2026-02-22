@@ -218,3 +218,152 @@ fn status_reads_wave_lock_and_journal_from_agent_loop_dir() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+// -----------------------------------------------------------------------
+// config init integration tests
+// -----------------------------------------------------------------------
+
+#[test]
+fn config_init_creates_toml_file() {
+    let project_dir = create_project_dir("config_init_creates");
+
+    let output = run_cmd(&project_dir, &["config", "init"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "config init should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Generated .agent-loop.toml"),
+        "should print confirmation: {stdout}"
+    );
+
+    let config_path = project_dir.join(".agent-loop.toml");
+    assert!(config_path.is_file(), ".agent-loop.toml should be created");
+
+    let content = fs::read_to_string(&config_path).expect("config should be readable");
+    // Verify key section markers from the template
+    assert!(content.contains("# ── Core"), "template should contain Core section");
+    assert!(
+        content.contains("# ── Agents"),
+        "template should contain Agents section"
+    );
+    assert!(
+        content.contains("# ── Stuck detection"),
+        "template should contain Stuck detection section"
+    );
+    // Verify all value lines are commented out (safe to deploy)
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        panic!("found uncommented value line in generated config: {trimmed}");
+    }
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn config_init_refuses_overwrite_without_force() {
+    let project_dir = create_project_dir("config_init_no_overwrite");
+    let config_path = project_dir.join(".agent-loop.toml");
+    fs::write(&config_path, "# existing config\n").expect("seed config should be written");
+
+    let output = run_cmd(&project_dir, &["config", "init"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "config init should exit 1 when file exists"
+    );
+    assert!(
+        stderr.contains("already exists") && stderr.contains("--force"),
+        "stderr should mention existing file and --force flag: {stderr}"
+    );
+
+    // File should be unchanged
+    let content = fs::read_to_string(&config_path).expect("config should be readable");
+    assert_eq!(content, "# existing config\n", "existing file should be preserved");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn config_init_force_overwrites_existing_file() {
+    let project_dir = create_project_dir("config_init_force");
+    let config_path = project_dir.join(".agent-loop.toml");
+    fs::write(&config_path, "old content").expect("seed config should be written");
+
+    let output = run_cmd(&project_dir, &["config", "init", "--force"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "config init --force should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Generated .agent-loop.toml"),
+        "should print confirmation: {stdout}"
+    );
+
+    let content = fs::read_to_string(&config_path).expect("config should be readable");
+    assert!(
+        !content.contains("old content"),
+        "old content should be replaced"
+    );
+    assert!(
+        content.contains("# ── Core"),
+        "new template should contain Core section"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn config_init_generated_file_is_valid_toml() {
+    let project_dir = create_project_dir("config_init_valid_toml");
+
+    let output = run_cmd(&project_dir, &["config", "init"]);
+    assert!(
+        output.status.success(),
+        "config init should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // After generating, running `status` should work without parse errors
+    // (all lines are commented so it parses as empty valid TOML)
+    let status_output = run_cmd(&project_dir, &["status"]);
+    let stderr = String::from_utf8_lossy(&status_output.stderr);
+    // Should not contain a TOML parse error
+    assert!(
+        !stderr.contains("failed to parse"),
+        "generated config should be valid TOML: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[test]
+fn missing_config_hint_not_shown_when_ci_set() {
+    let project_dir = create_project_dir("config_hint_ci");
+
+    // Run status with CI=true — the missing-config hint should be suppressed
+    let output = Command::new(agent_loop_bin())
+        .args(["status"])
+        .env("CI", "true")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop should execute");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("agent-loop config init"),
+        "missing-config hint should be suppressed in CI: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
