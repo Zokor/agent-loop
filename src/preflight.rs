@@ -56,6 +56,12 @@ fn required_agents(config: &Config) -> Vec<&crate::config::Agent> {
         agents.push(&config.reviewer);
     }
 
+    if config.planner.spec().binary != config.implementer.spec().binary
+        && config.planner.spec().binary != config.reviewer.spec().binary
+    {
+        agents.push(&config.planner);
+    }
+
     agents
 }
 
@@ -168,14 +174,12 @@ fn validate_model_support(config: &mut Config) {
         );
         config.reviewer.clear_model();
     }
-    // Planner uses the implementer agent with a model override; validate against
-    // the implementer's capability.
-    if config.planner_model.is_some() && !config.implementer.spec().supports_model_flag {
+    if config.planner.model().is_some() && !config.planner.spec().supports_model_flag {
         eprintln!(
-            "⚠ Agent '{}' does not support --model. Clearing planner_model.",
-            config.implementer.name(),
+            "⚠ Agent '{}' does not support --model. Clearing planner model.",
+            config.planner.name(),
         );
-        config.planner_model = None;
+        config.planner.clear_model();
     }
 }
 
@@ -459,10 +463,11 @@ mod tests {
             .single_agent(true)
             .build();
 
-        // Replace the implementer with an experimental agent (gemini)
+        // Replace all agents with an experimental agent (gemini)
         let mut config = project.config.clone();
         config.implementer = crate::config::Agent::known("gemini");
         config.reviewer = crate::config::Agent::known("gemini");
+        config.planner = crate::config::Agent::known("gemini");
 
         // Create a fake gemini binary
         project.create_executable("gemini", "#!/bin/sh\necho gemini\n");

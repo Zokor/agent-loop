@@ -1490,15 +1490,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         )
     };
 
-    // Build a planning agent: use implementer with planner_model override if configured.
-    let planner_agent = if config.planner_model.is_some() {
-        config
-            .implementer
-            .clone()
-            .with_model(config.planner_model.clone())
-    } else {
-        config.implementer.clone()
-    };
+    let planner_agent = config.planner.clone();
     let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
     let _ = log("📝 Implementer proposing plan...", config);

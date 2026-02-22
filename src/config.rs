@@ -88,6 +88,8 @@ struct FileConfig {
     implementer: Option<String>,
     /// Which agent reviews: `"claude"` or `"codex"`. Defaults to opposite of implementer.
     reviewer: Option<String>,
+    /// Which agent plans: `"claude"` or `"codex"`. Defaults to implementer.
+    planner: Option<String>,
     /// Use the same agent for both roles.
     single_agent: Option<bool>,
     /// Auto-commit loop-owned changes after each round.
@@ -248,6 +250,7 @@ pub struct Config {
     pub timeout_seconds: u64,
     pub implementer: Agent,
     pub reviewer: Agent,
+    pub planner: Agent,
     pub single_agent: bool,
     pub run_mode: RunMode,
     pub auto_commit: bool,
@@ -285,8 +288,9 @@ pub struct Config {
     pub wave_shutdown_grace_ms: u64,
 
     // ── Model selection ─────────────────────────────────────────────
-    /// Model override for planning phase (separate from implementer/reviewer models
-    /// which live on the `Agent` struct).
+    /// Model override for planning phase. Kept for backward compatibility;
+    /// the model is now applied directly to the `planner` agent during resolution.
+    #[allow(dead_code)]
     pub planner_model: Option<String>,
     /// Planner permission mode: "default" (normal) or "plan" (Claude read-only).
     pub planner_permission_mode: String,
@@ -387,6 +391,13 @@ impl Config {
                 .unwrap_or_else(|| default_reviewer_for(&implementer))
         };
 
+        // --- planner: env > TOML > implementer (resolved after model application) ---
+        let explicit_planner = if single_agent {
+            None
+        } else {
+            env_agent("PLANNER").or_else(|| parse_agent(file.planner.as_deref()))
+        };
+
         // --- model selection: env > TOML > None ---
         let implementer_model = env_trimmed_string("IMPLEMENTER_MODEL").or(file.implementer_model);
         let reviewer_model = env_trimmed_string("REVIEWER_MODEL").or(file.reviewer_model);
@@ -405,6 +416,22 @@ impl Config {
             reviewer
         } else {
             reviewer.with_model(reviewer_model)
+        };
+
+        // Planner defaults to implementer (inheriting its model). planner_model
+        // is only applied when explicitly set so None doesn't clear inherited model.
+        let planner = if single_agent {
+            if planner_model.is_some() {
+                eprintln!("planner_model is ignored when single_agent=true");
+            }
+            implementer.clone()
+        } else {
+            let base = explicit_planner.unwrap_or_else(|| implementer.clone());
+            if let Some(model) = planner_model.clone() {
+                base.with_model(Some(model))
+            } else {
+                base
+            }
         };
 
         // --- numeric: override > env > TOML > default ---
@@ -526,6 +553,7 @@ impl Config {
             timeout_seconds,
             implementer,
             reviewer,
+            planner,
             single_agent,
             auto_commit,
             auto_test,
@@ -584,6 +612,15 @@ fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoo
     {
         return Err(AgentLoopError::Config(format!(
             "invalid reviewer '{}' in {}: not a registered agent",
+            value,
+            path.display(),
+        )));
+    }
+    if let Some(ref value) = config.planner
+        && !crate::agent_registry::is_known_agent(value)
+    {
+        return Err(AgentLoopError::Config(format!(
+            "invalid planner '{}' in {}: not a registered agent",
             value,
             path.display(),
         )));
@@ -872,6 +909,7 @@ pub fn generate_default_config_template() -> String {
 # ── Agents ───────────────────────────────────────────────────────────────────
 # implementer = "claude"
 # reviewer = "codex"
+# planner = "claude"
 # single_agent = false
 
 # ── Model selection ──────────────────────────────────────────────────────────
@@ -941,6 +979,7 @@ mod tests {
             "SINGLE_AGENT",
             "IMPLEMENTER",
             "REVIEWER",
+            "PLANNER",
             "AUTO_COMMIT",
             "AUTO_TEST",
             "AUTO_TEST_CMD",
@@ -1605,6 +1644,109 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
         let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::known("claude"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Planner tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_cli_planner_defaults_to_implementer() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_default");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner, config.implementer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_planner_from_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_toml");
+        write_toml(&dir, "planner = \"codex\"\n");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner, Agent::known("codex"));
+        assert_eq!(config.implementer, Agent::known("claude"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_planner_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_env");
+        write_toml(&dir, "planner = \"claude\"\n");
+        set_env("PLANNER", "codex");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner, Agent::known("codex"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_single_agent_forces_planner_equals_implementer() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_sa");
+        write_toml(
+            &dir,
+            "implementer = \"codex\"\nplanner = \"claude\"\nsingle_agent = true\n",
+        );
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(config.single_agent);
+        assert_eq!(config.planner, config.implementer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_file_config_rejects_invalid_planner() {
+        let dir = create_temp_project_root("toml_invalid_planner");
+        write_toml(&dir, "planner = \"gpt4\"\n");
+        let err = load_file_config(&dir).expect_err("invalid planner should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("invalid planner"), "got: {msg}");
+        assert!(msg.contains("gpt4"), "got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_planner_model_applied_to_planner_agent() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_model");
+        write_toml(&dir, "planner = \"codex\"\nplanner_model = \"o3\"\n");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner.name(), "codex");
+        assert_eq!(config.planner.model(), Some("o3"));
+        // Implementer should be unaffected
+        assert_eq!(config.implementer.name(), "claude");
+        assert_eq!(config.implementer.model(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_default_planner_inherits_implementer_model_when_planner_model_unset() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("IMPLEMENTER_MODEL", "claude-sonnet-4-6");
+
+        let dir = create_temp_project_root("cfg_planner_inherit_model");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        // Planner defaults to implementer and inherits its model
+        assert_eq!(config.planner.name(), "claude");
+        assert_eq!(config.planner.model(), Some("claude-sonnet-4-6"));
+        assert_eq!(config.implementer.model(), Some("claude-sonnet-4-6"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2312,6 +2454,10 @@ planning_context_excerpt_lines = 75
         assert!(
             template.contains("# planner_permission_mode = \"default\""),
             "missing planner_permission_mode default line"
+        );
+        assert!(
+            template.contains("# planner = \"claude\""),
+            "missing planner agent default line"
         );
 
         // All value lines should be commented out

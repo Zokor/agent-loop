@@ -179,7 +179,7 @@ planner_model = "claude-sonnet-4-6"
 planner_permission_mode = "default" # "default" | "plan" (Claude planner only)
 ```
 
-Or via environment variables: `IMPLEMENTER_MODEL`, `REVIEWER_MODEL`, `PLANNER_MODEL`, `PLANNER_PERMISSION_MODE`.
+Or via environment variables: `IMPLEMENTER_MODEL`, `REVIEWER_MODEL`, `PLANNER_MODEL`, `PLANNER_PERMISSION_MODE`. The planner agent itself can be selected with `PLANNER` (defaults to the implementer agent when not specified).
 
 Model flags are agent-specific: Claude uses `--model`, Codex uses `-m`. Agents with `supports_model_flag=false` (experimental agents) will have model overrides cleared with a warning at startup.
 
@@ -302,6 +302,7 @@ timeout = 600
 
 implementer = "claude"   # any registered agent
 reviewer = "codex"       # any registered agent
+planner = "claude"       # defaults to implementer when not specified
 single_agent = false
 
 auto_commit = true
@@ -373,6 +374,7 @@ Core:
 - `TIMEOUT` (default: 600)
 - `IMPLEMENTER` (default: claude)
 - `REVIEWER` (default: opposite of implementer)
+- `PLANNER` (default: same as implementer)
 - `SINGLE_AGENT` (default: 0)
 - `AUTO_COMMIT` (default: 1)
 - `AUTO_TEST` (default: 0)

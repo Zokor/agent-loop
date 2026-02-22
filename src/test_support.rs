@@ -25,6 +25,7 @@ pub struct TestConfigOptions {
     pub decomposition_max_rounds: u32,
     pub timeout_seconds: u64,
     pub implementer: Agent,
+    pub planner: Option<Agent>,
     pub single_agent: bool,
     pub auto_commit: bool,
     pub auto_test: bool,
@@ -68,6 +69,7 @@ impl Default for TestConfigOptions {
             decomposition_max_rounds: DEFAULT_DECOMPOSITION_MAX_ROUNDS,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
             implementer: Agent::known("claude"),
+            planner: None,
             single_agent: false,
             auto_commit: true,
             auto_test: false,
@@ -112,6 +114,19 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         crate::config::default_reviewer_for(&options.implementer)
     };
 
+    let planner = if options.single_agent {
+        options.implementer.clone()
+    } else {
+        let base = options
+            .planner
+            .unwrap_or_else(|| options.implementer.clone());
+        if let Some(model) = options.planner_model.clone() {
+            base.with_model(Some(model))
+        } else {
+            base
+        }
+    };
+
     Config {
         project_dir: root.to_path_buf(),
         state_dir: root.join(".agent-loop").join("state"),
@@ -121,6 +136,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         timeout_seconds: options.timeout_seconds,
         implementer: options.implementer,
         reviewer,
+        planner,
         single_agent: options.single_agent,
         run_mode: if options.single_agent {
             RunMode::SingleAgent
