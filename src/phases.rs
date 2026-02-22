@@ -7,23 +7,23 @@ use crate::{
     agent::run_agent_with_session,
     config::{Agent, Config, StuckAction},
     error::AgentLoopError,
-    stuck::{StuckDetector, StuckSignal},
     git::{git_checkpoint, git_diff_for_review, git_rev_parse_head},
     prompts::{
-        AgentRole, PlanningReviewerParams, compound_prompt, decomposition_initial_prompt,
-        decomposition_implementer_signoff_prompt, decomposition_reviewer_prompt,
-        decomposition_revision_prompt, gather_project_context,
+        AgentRole, PlanningReviewerParams, compound_prompt,
+        decomposition_implementer_signoff_prompt, decomposition_initial_prompt,
+        decomposition_reviewer_prompt, decomposition_revision_prompt, gather_project_context,
         implementation_adversarial_review_prompt, implementation_consensus_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
         planning_implementer_revision_prompt, planning_implementer_signoff_prompt,
-        planning_initial_prompt, planning_reviewer_prompt, state_manifest,
-        system_prompt_for_role,
+        planning_initial_prompt, planning_reviewer_prompt, state_manifest, system_prompt_for_role,
     },
     state::{
         FindingEntry, FindingsFile, LoopStatus, Status, StatusPatch, append_decision,
         is_status_stale, log, read_decisions, read_findings, read_findings_with_warnings,
-        read_state_file, read_status, summarize_task, timestamp, write_findings, write_status,
+        read_state_file, read_status, summarize_task, timestamp, write_findings, write_state_file,
+        write_status,
     },
+    stuck::{StuckDetector, StuckSignal},
 };
 
 const STALE_TIMESTAMP_REASON: &str = "Agent did not write status (stale timestamp detected)";
@@ -376,10 +376,9 @@ fn reconcile_planning_verdict(
         Some("REVISE") => {
             // Safety net: REVISE + empty findings → synthesize P-001
             if new_findings.is_empty() {
-                let desc = review_status
-                    .reason
-                    .as_deref()
-                    .unwrap_or("Reviewer requested revision but did not provide structured findings.");
+                let desc = review_status.reason.as_deref().unwrap_or(
+                    "Reviewer requested revision but did not provide structured findings.",
+                );
                 let next_id = crate::state::next_planning_finding_id(&PlanningFindingsFile {
                     findings: merged.clone(),
                 });
@@ -547,8 +546,9 @@ fn reconcile_tasks_verdict(
             // issue. Without this, a NEEDS_REVISION with only resolved prior findings
             // would silently drop the reviewer's concern.
             if new_findings.is_empty() && open_after_merge == 0 {
-                let desc = status_reason
-                    .unwrap_or("Reviewer requested revision but did not provide structured findings.");
+                let desc = status_reason.unwrap_or(
+                    "Reviewer requested revision but did not provide structured findings.",
+                );
                 let next_id = crate::state::next_tasks_finding_id(&TasksFindingsFile {
                     findings: merged.clone(),
                 });
@@ -643,7 +643,12 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     }
 
     log_fn("🧠 Running compound learning phase...", config);
-    if let Err(err) = run_agent_fn(&config.implementer, AgentRole::Implementer, &compound_prompt(task, plan), config) {
+    if let Err(err) = run_agent_fn(
+        &config.implementer,
+        AgentRole::Implementer,
+        &compound_prompt(task, plan),
+        config,
+    ) {
         log_fn(
             &format!("WARN: compound phase failed (continuing): {err}"),
             config,
@@ -672,8 +677,15 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("implement-{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
-                .map(|_| ())
+            run_agent_with_session(
+                agent,
+                prompt,
+                current_config,
+                sp_ref,
+                Some(&session_key),
+                Some(role),
+            )
+            .map(|_| ())
         },
         &mut |message, current_config| {
             let _ = log(message, current_config);
@@ -739,6 +751,25 @@ fn transition_label(patch: &StatusPatch) -> &'static str {
     }
 }
 
+fn finalize_phase_consensus(
+    config: &Config,
+    round: u32,
+    reason: Option<String>,
+    rating: Option<u32>,
+) -> Result<(), AgentLoopError> {
+    write_status(
+        StatusPatch {
+            status: Some(Status::Consensus),
+            round: Some(round),
+            reason,
+            rating,
+            ..StatusPatch::default()
+        },
+        config,
+    )?;
+    Ok(())
+}
+
 fn status_for_error(err: &AgentLoopError) -> Status {
     if matches!(err, AgentLoopError::Interrupted(_)) {
         Status::Interrupted
@@ -768,14 +799,28 @@ fn status_error_reason(status: &LoopStatus) -> String {
         .unwrap_or_else(|| "status.json is in ERROR state".to_string())
 }
 
-fn run_agent_or_record_error(
+fn planner_plan_mode_active(config: &Config, agent: &Agent, role: AgentRole) -> bool {
+    role == AgentRole::Planner
+        && agent.name() == "claude"
+        && config.planner_permission_mode == "plan"
+}
+
+fn extract_plan_from_output_markers(output: &str) -> Option<String> {
+    let re = regex::Regex::new(r"(?is)<plan>\s*(.*?)\s*</plan>").ok()?;
+    re.captures(output)
+        .and_then(|caps| caps.get(1))
+        .map(|m| m.as_str().trim().to_string())
+        .filter(|text| !text.is_empty())
+}
+
+fn run_agent_with_output_or_record_error(
     config: &Config,
     agent: &Agent,
     prompt: &str,
     round: Option<u32>,
     role: AgentRole,
     workflow: &str,
-) -> bool {
+) -> Option<String> {
     let sp = system_prompt_for_role(role, config);
     let sp_ref = if sp.is_empty() {
         None
@@ -788,8 +833,15 @@ fn run_agent_or_record_error(
         AgentRole::Planner => "planner",
     };
     let session_key = format!("{}-{}-{}", workflow, role_str, agent.name());
-    match run_agent_with_session(agent, prompt, config, sp_ref, Some(&session_key), Some(role)) {
-        Ok(_) => true,
+    match run_agent_with_session(
+        agent,
+        prompt,
+        config,
+        sp_ref,
+        Some(&session_key),
+        Some(role),
+    ) {
+        Ok(output) => Some(output),
         Err(AgentLoopError::Interrupted(reason)) => {
             let _ = write_status(
                 StatusPatch {
@@ -800,13 +852,24 @@ fn run_agent_or_record_error(
                 },
                 config,
             );
-            false
+            None
         }
         Err(err) => {
             write_error_status(config, round, err.to_string());
-            false
+            None
         }
     }
+}
+
+fn run_agent_or_record_error(
+    config: &Config,
+    agent: &Agent,
+    prompt: &str,
+    round: Option<u32>,
+    role: AgentRole,
+    workflow: &str,
+) -> bool {
+    run_agent_with_output_or_record_error(config, agent, prompt, round, role, workflow).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,7 +1474,10 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let task = read_state_file("task.md", config);
     let paths = phase_paths(config);
     let (project_context, decisions) = if config.progressive_context {
-        let _ = log("📋 Progressive context mode — agents will explore on-demand", config);
+        let _ = log(
+            "📋 Progressive context mode — agents will explore on-demand",
+            config,
+        );
         (state_manifest(config), String::new())
     } else {
         (
@@ -1426,21 +1492,59 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
     // Build a planning agent: use implementer with planner_model override if configured.
     let planner_agent = if config.planner_model.is_some() {
-        config.implementer.clone().with_model(config.planner_model.clone())
+        config
+            .implementer
+            .clone()
+            .with_model(config.planner_model.clone())
     } else {
         config.implementer.clone()
     };
+    let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
     let _ = log("📝 Implementer proposing plan...", config);
-    if !run_agent_or_record_error(
+    let planner_output = match run_agent_with_output_or_record_error(
         config,
         &planner_agent,
-        &planning_initial_prompt(&task, &project_context, &decisions, &paths),
+        &planning_initial_prompt(
+            &task,
+            &project_context,
+            &decisions,
+            &paths,
+            planner_plan_mode,
+        ),
         Some(0),
         AgentRole::Planner,
         "plan",
     ) {
-        return false;
+        Some(output) => output,
+        None => return false,
+    };
+
+    if planner_plan_mode {
+        if let Some(plan_text) = extract_plan_from_output_markers(&planner_output) {
+            if let Err(err) = write_state_file("plan.md", &plan_text, config) {
+                write_error_status(
+                    config,
+                    Some(0),
+                    format!("Failed to persist plan from planner output: {err}"),
+                );
+                return false;
+            }
+        } else {
+            let fallback_plan = read_state_file("plan.md", config);
+            if fallback_plan.trim().is_empty() {
+                write_error_status(
+                    config,
+                    Some(0),
+                    "Planner plan-mode output missing <plan>...</plan> block and no plan.md was produced.".to_string(),
+                );
+                return false;
+            }
+            let _ = log(
+                "⚠ Planner plan-mode output missing <plan> markers; using plan.md fallback",
+                config,
+            );
+        }
     }
 
     let mut planning_round = 0;
@@ -1511,8 +1615,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         // Read the review output (reviewer writes to review.md or plan.md).
         let review_output = read_state_file("review.md", config);
         let verdict = parse_planning_verdict(&review_output);
-        let new_findings =
-            parse_planning_findings_from_output(&review_output, planning_round);
+        let new_findings = parse_planning_findings_from_output(&review_output, planning_round);
 
         let (reconciled_action, updated_findings) = reconcile_planning_verdict(
             verdict,
@@ -1536,7 +1639,10 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 StatusPatch {
                     status: Some(Status::NeedsRevision),
                     round: Some(planning_round),
-                    reason: Some("[gate:reviewer] Forced NEEDS_REVISION: open planning findings remain".to_string()),
+                    reason: Some(
+                        "[gate:reviewer] Forced NEEDS_REVISION: open planning findings remain"
+                            .to_string(),
+                    ),
                     ..StatusPatch::default()
                 },
                 config,
@@ -1582,7 +1688,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                         &paths,
                     ),
                     Some(planning_round),
-                    AgentRole::Planner,
+                    AgentRole::Implementer,
                     "plan",
                 ) {
                     return false;
@@ -1620,16 +1726,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
                 if planning_implementer_reached_consensus(implementer_status.status) {
                     let _ = log("✅ Both agents agreed on the plan!", config);
-                    warn_on_status_write(
-                        "CONSENSUS",
-                        StatusPatch {
-                            status: Some(Status::Consensus),
-                            round: Some(planning_round),
-                            reason: Some("[gate:implementer-signoff] Dual-agent signoff: reviewer revised, implementer agreed".to_string()),
-                            ..StatusPatch::default()
-                        },
-                        config,
-                    );
                     reached_consensus = true;
                     break;
                 }
@@ -1673,7 +1769,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                             &paths,
                         ),
                         Some(planning_round),
-                        AgentRole::Planner,
+                        AgentRole::Implementer,
                         "plan",
                     ) {
                         return false;
@@ -1711,16 +1807,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
                     if planning_implementer_reached_consensus(signoff_status.status) {
                         let _ = log("✅ Both agents agreed on the plan!", config);
-                        warn_on_status_write(
-                            "CONSENSUS",
-                            StatusPatch {
-                                status: Some(Status::Consensus),
-                                round: Some(planning_round),
-                                reason: Some("[gate:implementer-signoff] Dual-agent signoff: reviewer approved, implementer agreed".to_string()),
-                                ..StatusPatch::default()
-                            },
-                            config,
-                        );
                         reached_consensus = true;
                         break;
                     }
@@ -1739,25 +1825,17 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     let _ = log(
                         &format!(
                             "📝 Implementer disputed approved plan: {}",
-                            signoff_status
-                                .reason
-                                .as_deref()
-                                .unwrap_or("see plan.md")
+                            signoff_status.reason.as_deref().unwrap_or("see plan.md")
                         ),
                         config,
                     );
                 } else {
                     // Single-agent: system converts APPROVED -> CONSENSUS.
                     let _ = log("✅ Reviewer approved the plan!", config);
-                    warn_on_status_write(
-                        "CONSENSUS",
-                        StatusPatch {
-                            status: Some(Status::Consensus),
-                            round: Some(planning_round),
-                            ..StatusPatch::default()
-                        },
-                        config,
-                    );
+                    if let Err(err) = finalize_phase_consensus(config, planning_round, None, None) {
+                        write_error_status(config, Some(planning_round), err.to_string());
+                        return false;
+                    }
                     reached_consensus = true;
                     break;
                 }
@@ -1982,8 +2060,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         // Read open tasks findings for the reviewer prompt.
         let tasks_findings = crate::state::read_tasks_findings(config);
-        let open_findings_text =
-            crate::state::open_tasks_findings_for_prompt(&tasks_findings);
+        let open_findings_text = crate::state::open_tasks_findings_for_prompt(&tasks_findings);
 
         let reviewer_prompt_timestamp = timestamp();
 
@@ -2057,7 +2134,10 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 StatusPatch {
                     status: Some(Status::NeedsRevision),
                     round: Some(round),
-                    reason: Some("[gate:reviewer] Forced NEEDS_REVISION: open tasks findings remain".to_string()),
+                    reason: Some(
+                        "[gate:reviewer] Forced NEEDS_REVISION: open tasks findings remain"
+                            .to_string(),
+                    ),
                     ..StatusPatch::default()
                 },
                 config,
@@ -2069,7 +2149,10 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             DecompositionStatusDecision::Approved => {
                 if requires_dual_agent_signoff(config) {
                     // Dual-agent: require implementer signoff before finalizing.
-                    let _ = log("🔍 Implementer reviewing approved task breakdown...", config);
+                    let _ = log(
+                        "🔍 Implementer reviewing approved task breakdown...",
+                        config,
+                    );
                     let signoff_tasks = read_state_file("tasks.md", config);
                     let signoff_timestamp = timestamp();
                     if !run_agent_or_record_error(
@@ -2113,7 +2196,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     }
 
                     if signoff_status.status == Status::Error {
-                        write_error_status(config, Some(round), status_error_reason(&signoff_status));
+                        write_error_status(
+                            config,
+                            Some(round),
+                            status_error_reason(&signoff_status),
+                        );
                         return false;
                     }
 
@@ -2127,22 +2214,20 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     let _ = log(
                         &format!(
                             "📝 Implementer disputed task breakdown: {}",
-                            signoff_status.reason.as_deref().unwrap_or("see status.json")
+                            signoff_status
+                                .reason
+                                .as_deref()
+                                .unwrap_or("see status.json")
                         ),
                         config,
                     );
                 } else {
                     // Single-agent: system converts APPROVED -> CONSENSUS (no self-review).
                     let _ = log("✅ Task breakdown approved!", config);
-                    warn_on_status_write(
-                        "CONSENSUS",
-                        StatusPatch {
-                            status: Some(Status::Consensus),
-                            round: Some(round),
-                            ..StatusPatch::default()
-                        },
-                        config,
-                    );
+                    if let Err(err) = finalize_phase_consensus(config, round, None, None) {
+                        write_error_status(config, Some(round), err.to_string());
+                        return false;
+                    }
                     let final_status = read_status(config);
                     print_planning_complete_summary(&final_status, &task);
                     return true;
@@ -2412,7 +2497,9 @@ where
                 StuckSignal::NoDiffProgress { consecutive_rounds } => {
                     format!("No diff progress for {consecutive_rounds} consecutive rounds")
                 }
-                StuckSignal::Oscillating => "Oscillating diff pattern detected (A → B → A)".to_string(),
+                StuckSignal::Oscillating => {
+                    "Oscillating diff pattern detected (A → B → A)".to_string()
+                }
                 StuckSignal::TimeThresholdExceeded { elapsed_minutes } => {
                     format!("Wall-clock threshold exceeded ({elapsed_minutes} minutes)")
                 }
@@ -2421,7 +2508,10 @@ where
 
             match config.stuck_action {
                 StuckAction::Abort => {
-                    log_fn(&format!("🛑 Stuck detected — aborting: {signal_msg}"), config);
+                    log_fn(
+                        &format!("🛑 Stuck detected — aborting: {signal_msg}"),
+                        config,
+                    );
                     write_status_fn(
                         StatusPatch {
                             status: Some(Status::Stuck),
@@ -2435,7 +2525,10 @@ where
                     return false;
                 }
                 StuckAction::Warn => {
-                    log_fn(&format!("⚠ Stuck detected — continuing: {signal_msg}"), config);
+                    log_fn(
+                        &format!("⚠ Stuck detected — continuing: {signal_msg}"),
+                        config,
+                    );
                     record_struggle_signal(&task, &signal_msg, round, config);
                 }
                 StuckAction::Retry => {
@@ -2913,7 +3006,10 @@ where
                     // === BRANCH 3a: Single-agent non-5/5 — auto-consensus ===
                     // Same model self-reviewing adds latency without signal.
                     // After findings reconciliation, system converts APPROVED -> CONSENSUS.
-                    log_fn("🎉 Single-agent approved — auto-consensus (non-5/5)", config);
+                    log_fn(
+                        "🎉 Single-agent approved — auto-consensus (non-5/5)",
+                        config,
+                    );
                     write_status_fn(
                         StatusPatch {
                             status: Some(Status::Consensus),
@@ -3134,8 +3230,15 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("implement-{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
-                .map(|_| ())
+            run_agent_with_session(
+                agent,
+                prompt,
+                current_config,
+                sp_ref,
+                Some(&session_key),
+                Some(role),
+            )
+            .map(|_| ())
         },
         |message, current_config, current_baseline| {
             git_checkpoint(message, current_config, current_baseline);
@@ -3183,8 +3286,15 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
                 AgentRole::Planner => "planner",
             };
             let session_key = format!("implement-{}-{}", role_str, agent.name());
-            run_agent_with_session(agent, prompt, current_config, sp_ref, Some(&session_key), Some(role))
-                .map(|_| ())
+            run_agent_with_session(
+                agent,
+                prompt,
+                current_config,
+                sp_ref,
+                Some(&session_key),
+                Some(role),
+            )
+            .map(|_| ())
         },
         |message, current_config, current_baseline| {
             git_checkpoint(message, current_config, current_baseline);
@@ -3440,10 +3550,7 @@ mod tests {
 
     #[test]
     fn parse_planning_verdict_extracts_revise() {
-        assert_eq!(
-            parse_planning_verdict("VERDICT:  REVISE"),
-            Some("REVISE")
-        );
+        assert_eq!(parse_planning_verdict("VERDICT:  REVISE"), Some("REVISE"));
     }
 
     #[test]
@@ -3457,10 +3564,7 @@ mod tests {
             parse_planning_verdict("verdict: approved"),
             Some("APPROVED")
         );
-        assert_eq!(
-            parse_planning_verdict("Verdict: revise"),
-            Some("REVISE")
-        );
+        assert_eq!(parse_planning_verdict("Verdict: revise"), Some("REVISE"));
     }
 
     #[test]
@@ -3700,6 +3804,27 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_tasks_verdict_needs_revision_without_reason_synthesizes_default_message() {
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile::default();
+        let (decision, findings) = reconcile_tasks_verdict(
+            Status::NeedsRevision,
+            None,
+            Vec::new(),
+            &existing,
+            2,
+            &config,
+        );
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        assert_eq!(findings.findings.len(), 1);
+        assert_eq!(findings.findings[0].id, "T-001");
+        assert_eq!(
+            findings.findings[0].description,
+            "Reviewer requested revision but did not provide structured findings."
+        );
+    }
+
+    #[test]
     fn reconcile_tasks_verdict_approved_with_open_findings_forces_needs_revision() {
         let config = test_config();
         let existing = crate::state::TasksFindingsFile {
@@ -3711,15 +3836,38 @@ mod tests {
                 round_resolved: None,
             }],
         };
-        let (decision, _) = reconcile_tasks_verdict(
-            Status::Approved,
-            None,
-            Vec::new(),
-            &existing,
-            2,
-            &config,
-        );
+        let (decision, _) =
+            reconcile_tasks_verdict(Status::Approved, None, Vec::new(), &existing, 2, &config);
         assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+    }
+
+    #[test]
+    fn reconcile_tasks_verdict_approved_with_new_open_finding_forces_needs_revision() {
+        let config = test_config();
+        let existing = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "T-001".to_string(),
+                description: "Old issue".to_string(),
+                status: crate::state::TasksFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        let new_findings = vec![crate::state::TasksFindingEntry {
+            id: "T-001".to_string(),
+            description: "Issue reopened by reviewer".to_string(),
+            status: crate::state::TasksFindingStatus::Open,
+            round_introduced: 3,
+            round_resolved: None,
+        }];
+        let (decision, findings) =
+            reconcile_tasks_verdict(Status::Approved, None, new_findings, &existing, 3, &config);
+        assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
+        assert_eq!(findings.findings.len(), 1);
+        assert_eq!(
+            findings.findings[0].status,
+            crate::state::TasksFindingStatus::Open
+        );
     }
 
     #[test]
@@ -3734,14 +3882,8 @@ mod tests {
                 round_resolved: Some(2),
             }],
         };
-        let (decision, _) = reconcile_tasks_verdict(
-            Status::Approved,
-            None,
-            Vec::new(),
-            &existing,
-            3,
-            &config,
-        );
+        let (decision, _) =
+            reconcile_tasks_verdict(Status::Approved, None, Vec::new(), &existing, 3, &config);
         assert_eq!(decision, DecompositionStatusDecision::Approved);
     }
 
@@ -3749,14 +3891,8 @@ mod tests {
     fn reconcile_tasks_verdict_error_passes_through() {
         let config = test_config();
         let existing = crate::state::TasksFindingsFile::default();
-        let (decision, _) = reconcile_tasks_verdict(
-            Status::Error,
-            None,
-            Vec::new(),
-            &existing,
-            1,
-            &config,
-        );
+        let (decision, _) =
+            reconcile_tasks_verdict(Status::Error, None, Vec::new(), &existing, 1, &config);
         assert_eq!(decision, DecompositionStatusDecision::Error);
     }
 
@@ -3764,14 +3900,8 @@ mod tests {
     fn reconcile_tasks_verdict_unexpected_status_forces_revision() {
         let config = test_config();
         let existing = crate::state::TasksFindingsFile::default();
-        let (decision, _) = reconcile_tasks_verdict(
-            Status::Consensus,
-            None,
-            Vec::new(),
-            &existing,
-            1,
-            &config,
-        );
+        let (decision, _) =
+            reconcile_tasks_verdict(Status::Consensus, None, Vec::new(), &existing, 1, &config);
         assert_eq!(decision, DecompositionStatusDecision::ForceNeedsRevision);
     }
 
@@ -3797,18 +3927,15 @@ mod tests {
             round_introduced: 1,
             round_resolved: None,
         }];
-        let (decision, findings) = reconcile_tasks_verdict(
-            Status::Approved,
-            None,
-            new_findings,
-            &existing,
-            2,
-            &config,
-        );
+        let (decision, findings) =
+            reconcile_tasks_verdict(Status::Approved, None, new_findings, &existing, 2, &config);
         // With T-001 resolved, APPROVED should pass through
         assert_eq!(decision, DecompositionStatusDecision::Approved);
         assert_eq!(findings.findings.len(), 1);
-        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Resolved);
+        assert_eq!(
+            findings.findings[0].status,
+            crate::state::TasksFindingStatus::Resolved
+        );
         assert_eq!(findings.findings[0].round_resolved, Some(2));
     }
 
@@ -3867,9 +3994,15 @@ mod tests {
             &config,
         );
         assert_eq!(decision, DecompositionStatusDecision::NeedsRevision);
-        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Open);
+        assert_eq!(
+            findings.findings[0].status,
+            crate::state::TasksFindingStatus::Open
+        );
         assert_eq!(findings.findings[0].round_resolved, None);
-        assert_eq!(findings.findings[0].description, "Testing task still insufficient");
+        assert_eq!(
+            findings.findings[0].description,
+            "Testing task still insufficient"
+        );
     }
 
     #[test]
@@ -3902,11 +4035,20 @@ mod tests {
         assert_eq!(findings.findings.len(), 2);
         // Original resolved finding preserved
         assert_eq!(findings.findings[0].id, "T-001");
-        assert_eq!(findings.findings[0].status, crate::state::TasksFindingStatus::Resolved);
+        assert_eq!(
+            findings.findings[0].status,
+            crate::state::TasksFindingStatus::Resolved
+        );
         // Synthesized finding from reason text
         assert_eq!(findings.findings[1].id, "T-002");
-        assert_eq!(findings.findings[1].description, "new problem with task ordering");
-        assert_eq!(findings.findings[1].status, crate::state::TasksFindingStatus::Open);
+        assert_eq!(
+            findings.findings[1].description,
+            "new problem with task ordering"
+        );
+        assert_eq!(
+            findings.findings[1].status,
+            crate::state::TasksFindingStatus::Open
+        );
         assert_eq!(findings.findings[1].round_introduced, 3);
     }
 
@@ -3973,7 +4115,13 @@ mod tests {
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
         let prompt = decomposition_reviewer_prompt(
-            &config, "plan", "tasks", 1, "2026-01-01T00:00:00.000Z", &paths, "",
+            &config,
+            "plan",
+            "tasks",
+            1,
+            "2026-01-01T00:00:00.000Z",
+            &paths,
+            "",
         );
         assert!(prompt.contains("\"status\": \"APPROVED\""));
         assert!(!prompt.contains("\"status\": \"CONSENSUS\""));
@@ -4014,13 +4162,80 @@ More text.
 "#;
         let findings = parse_tasks_findings_from_output(text, 3);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].status, crate::state::TasksFindingStatus::Resolved);
+        assert_eq!(
+            findings[0].status,
+            crate::state::TasksFindingStatus::Resolved
+        );
     }
 
     #[test]
     fn parse_tasks_findings_from_output_returns_empty_when_no_block() {
         let findings = parse_tasks_findings_from_output("no findings here", 1);
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn extract_plan_from_output_markers_extracts_plan_body() {
+        let output = "Intro\n<plan>\n# Plan\n- Step A\n- Step B\n</plan>\nFooter";
+        let plan = extract_plan_from_output_markers(output);
+        assert_eq!(plan.as_deref(), Some("# Plan\n- Step A\n- Step B"));
+    }
+
+    #[test]
+    fn extract_plan_from_output_markers_returns_none_without_markers() {
+        let output = "# Plan\n- Step A\n- Step B";
+        assert!(extract_plan_from_output_markers(output).is_none());
+    }
+
+    #[test]
+    fn planner_plan_mode_active_requires_claude_planner_role_and_plan_setting() {
+        let mut config = test_config();
+        config.planner_permission_mode = "plan".to_string();
+        let claude = crate::config::Agent::known("claude");
+        let codex = crate::config::Agent::known("codex");
+
+        assert!(planner_plan_mode_active(
+            &config,
+            &claude,
+            AgentRole::Planner
+        ));
+        assert!(!planner_plan_mode_active(
+            &config,
+            &claude,
+            AgentRole::Implementer
+        ));
+        assert!(!planner_plan_mode_active(
+            &config,
+            &codex,
+            AgentRole::Planner
+        ));
+    }
+
+    #[test]
+    fn finalize_phase_consensus_writes_consensus_status() {
+        let root = create_temp_project_root("phases_finalize_consensus");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        std::fs::create_dir_all(&config.state_dir).expect("state dir should be created");
+        crate::state::write_status(
+            crate::state::StatusPatch {
+                status: Some(Status::Approved),
+                round: Some(1),
+                reason: Some("seed".to_string()),
+                rating: Some(2),
+                ..crate::state::StatusPatch::default()
+            },
+            &config,
+        )
+        .expect("seed status should be written");
+
+        finalize_phase_consensus(&config, 3, Some("finalized".to_string()), Some(4))
+            .expect("finalize_phase_consensus should succeed");
+
+        let status = crate::state::read_status(&config);
+        assert_eq!(status.status, Status::Consensus);
+        assert_eq!(status.round, 3);
+        assert_eq!(status.reason.as_deref(), Some("finalized"));
+        assert_eq!(status.rating, Some(4));
     }
 
     // -----------------------------------------------------------------------
@@ -4041,7 +4256,8 @@ More text.
 
     #[test]
     fn gate_source_in_dual_agent_signoff_reason() {
-        let reason = "[gate:implementer-signoff] Dual-agent signoff: reviewer approved, implementer agreed";
+        let reason =
+            "[gate:implementer-signoff] Dual-agent signoff: reviewer approved, implementer agreed";
         let gate = reason
             .strip_prefix("[gate:")
             .and_then(|rest| rest.split_once(']'))
@@ -4060,7 +4276,13 @@ More text.
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
         let prompt = decomposition_reviewer_prompt(
-            &config, "plan", "tasks", 1, "2026-01-01T00:00:00.000Z", &paths, "",
+            &config,
+            "plan",
+            "tasks",
+            1,
+            "2026-01-01T00:00:00.000Z",
+            &paths,
+            "",
         );
         // Should request structured findings with T- prefix IDs
         assert!(prompt.contains("T-001"));
@@ -4113,10 +4335,7 @@ More text.
             &config,
             &baseline,
             |_agent, role, _prompt, _cfg| {
-                agent_calls.push((
-                    format!("{role:?}"),
-                    "called".to_string(),
-                ));
+                agent_calls.push((format!("{role:?}"), "called".to_string()));
                 Ok(())
             },
             |_msg, _cfg, _bf| {},

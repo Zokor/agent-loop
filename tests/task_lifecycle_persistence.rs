@@ -324,3 +324,187 @@ fn implement_rejects_max_parallel_zero() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn implement_batch_mode_falls_back_to_plan_when_tasks_missing() {
+    let project_dir = create_project_dir("batch_fallback_to_plan_missing_tasks");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(&project_dir, "plan.md", "# Plan\n- Step 1\n- Step 2\n");
+    write_state_file(&project_dir, "task.md", "Implement from plan only.\n");
+
+    let output = run_implement_cmd(&project_dir, &[]);
+    assert!(
+        output.status.success(),
+        "implement should succeed via plan fallback: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined_task = read_state_file(&project_dir, "task.md");
+    assert!(
+        combined_task.contains("Implement the approved plan below as one cohesive change set.")
+    );
+    assert!(combined_task.contains("PLAN:"));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_batch_mode_falls_back_to_plan_when_tasks_empty() {
+    let project_dir = create_project_dir("batch_fallback_to_plan_empty_tasks");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(&project_dir, "tasks.md", " \n\t\n");
+    write_state_file(
+        &project_dir,
+        "plan.md",
+        "# Plan\n- Recover from empty tasks\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &[]);
+    assert!(
+        output.status.success(),
+        "implement should succeed via plan fallback when tasks.md is empty: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let combined_task = read_state_file(&project_dir, "task.md");
+    assert!(
+        combined_task.contains("Implement the approved plan below as one cohesive change set.")
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_batch_disabled_requires_tasks_even_with_valid_plan() {
+    let project_dir = create_project_dir("batch_disabled_requires_tasks");
+    create_succeeding_agents(&project_dir);
+    fs::write(
+        project_dir.join(".agent-loop.toml"),
+        "batch_implement = false\n",
+    )
+    .expect("toml should be written");
+
+    write_state_file(
+        &project_dir,
+        "plan.md",
+        "# Plan\n- Should not be used when batch_implement=false\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "implement should fail when tasks.md is missing and batch_implement=false"
+    );
+    assert!(stderr.contains("No tasks found. Run 'agent-loop tasks' first."));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_per_task_flag_requires_tasks_even_with_valid_plan() {
+    let project_dir = create_project_dir("per_task_requires_tasks_even_with_plan");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "plan.md",
+        "# Plan\n- Explicit per-task should still require tasks.md\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &["--per-task"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "implement should fail without tasks.md"
+    );
+    assert!(stderr.contains("No tasks found. Run 'agent-loop tasks' first."));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_wave_requires_tasks_even_with_valid_plan() {
+    let project_dir = create_project_dir("wave_requires_tasks_even_with_plan");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "plan.md",
+        "# Plan\n- Wave mode should still require tasks.md\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &["--wave"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "implement --wave should fail without tasks.md"
+    );
+    assert!(stderr.contains("No tasks found. Run 'agent-loop tasks' first."));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_resume_skips_plan_fallback_path() {
+    let project_dir = create_project_dir("resume_skips_plan_fallback");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "task.md",
+        "Resume task should remain unchanged.\n",
+    );
+    write_state_file(
+        &project_dir,
+        "plan.md",
+        "# Plan\n- This plan exists but must not be used by --resume\n",
+    );
+    write_state_file(&project_dir, "workflow.txt", "implement\n");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"resume task","reason":"resume needed","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    let output = std::process::Command::new(agent_loop_bin())
+        .arg("implement")
+        .arg("--single-agent")
+        .arg("--resume")
+        .env("PATH", test_path(&project_dir))
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("MAX_ROUNDS", "5")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop implement --resume should run");
+
+    assert!(
+        output.status.success(),
+        "implement --resume should succeed without tasks.md fallback: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let task_after = read_state_file(&project_dir, "task.md");
+    assert!(
+        task_after.contains("Resume task should remain unchanged."),
+        "resume path should preserve existing task.md"
+    );
+    assert!(
+        !task_after.contains("Implement the approved plan below as one cohesive change set."),
+        "resume path should not rewrite task.md via plan fallback"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}

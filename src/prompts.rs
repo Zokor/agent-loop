@@ -292,6 +292,7 @@ pub(crate) fn planning_initial_prompt(
     project_context: &str,
     decisions: &str,
     paths: &PhasePaths,
+    planner_plan_mode: bool,
 ) -> String {
     let context_section = if project_context.is_empty() {
         String::new()
@@ -299,10 +300,14 @@ pub(crate) fn planning_initial_prompt(
         format!("\n{project_context}\n")
     };
     let decisions_section = prior_decisions_section(decisions);
+    let output_instruction = if planner_plan_mode {
+        "Output your plan below between <plan> and </plan> markers.".to_string()
+    } else {
+        format!("Write your plan to the file: {}", path_text(&paths.plan_md))
+    };
 
     format!(
-        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nRead the task below and propose a detailed development plan.\n\nTASK:\n{task}{decisions_section}\n\nWrite your plan to the file: {}\n\nYour plan should include:\n- Overview of approach\n- Step-by-step implementation strategy\n- Files to create/modify\n- Key technical decisions\n- Testing strategy",
-        path_text(&paths.plan_md)
+        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nRead the task below and propose a detailed development plan.\n\nTASK:\n{task}{decisions_section}\n\n{output_instruction}\n\nYour plan should include:\n- Overview of approach\n- Step-by-step implementation strategy\n- Files to create/modify\n- Key technical decisions\n- Testing strategy"
     )
 }
 
@@ -952,9 +957,14 @@ mod tests {
             status_json: PathBuf::from("/state/status.json"),
         };
 
-        let with_context =
-            planning_initial_prompt("My task", "PROJECT STRUCTURE:\nsrc/\n  main.rs", "", &paths);
-        let without_context = planning_initial_prompt("My task", "", "", &paths);
+        let with_context = planning_initial_prompt(
+            "My task",
+            "PROJECT STRUCTURE:\nsrc/\n  main.rs",
+            "",
+            &paths,
+            false,
+        );
+        let without_context = planning_initial_prompt("My task", "", "", &paths, false);
 
         assert!(with_context.contains("PROJECT STRUCTURE:\nsrc/\n  main.rs"));
         assert!(!without_context.contains("PROJECT STRUCTURE:"));
@@ -966,9 +976,19 @@ mod tests {
     #[test]
     fn planning_initial_prompt_injects_prior_decisions_when_present() {
         let paths = test_phase_paths();
-        let prompt = planning_initial_prompt("Task", "", "- [PATTERN] Reuse parser logic", &paths);
+        let prompt =
+            planning_initial_prompt("Task", "", "- [PATTERN] Reuse parser logic", &paths, false);
         assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
         assert!(prompt.contains("- [PATTERN] Reuse parser logic"));
+    }
+
+    #[test]
+    fn planning_initial_prompt_plan_mode_uses_plan_markers() {
+        let paths = test_phase_paths();
+        let prompt = planning_initial_prompt("Task", "", "", &paths, true);
+        assert!(prompt.contains("<plan>"));
+        assert!(prompt.contains("</plan>"));
+        assert!(!prompt.contains("Write your plan to the file:"));
     }
 
     fn test_config_for_prompts() -> Config {
@@ -1623,11 +1643,26 @@ mod tests {
 
         let manifest = state_manifest(&config);
 
-        assert!(manifest.contains("AGENTS.md"), "manifest should include AGENTS.md");
-        assert!(manifest.contains("plan.md"), "manifest should include plan.md");
-        assert!(manifest.contains("tasks.md"), "manifest should include tasks.md");
-        assert!(manifest.contains("conversation.md"), "manifest should include conversation.md");
-        assert!(manifest.contains("decisions.md"), "manifest should include decisions.md");
+        assert!(
+            manifest.contains("AGENTS.md"),
+            "manifest should include AGENTS.md"
+        );
+        assert!(
+            manifest.contains("plan.md"),
+            "manifest should include plan.md"
+        );
+        assert!(
+            manifest.contains("tasks.md"),
+            "manifest should include tasks.md"
+        );
+        assert!(
+            manifest.contains("conversation.md"),
+            "manifest should include conversation.md"
+        );
+        assert!(
+            manifest.contains("decisions.md"),
+            "manifest should include decisions.md"
+        );
     }
 
     #[test]
@@ -1649,9 +1684,21 @@ mod tests {
 
         let manifest = state_manifest(&config);
 
-        assert!(!manifest.contains("AGENTS.md"), "absent AGENTS.md should be omitted");
-        assert!(!manifest.contains("plan.md"), "absent plan.md should be omitted");
-        assert!(!manifest.contains("tasks.md"), "absent tasks.md should be omitted");
-        assert!(!manifest.contains("conversation.md"), "absent conversation.md should be omitted");
+        assert!(
+            !manifest.contains("AGENTS.md"),
+            "absent AGENTS.md should be omitted"
+        );
+        assert!(
+            !manifest.contains("plan.md"),
+            "absent plan.md should be omitted"
+        );
+        assert!(
+            !manifest.contains("tasks.md"),
+            "absent tasks.md should be omitted"
+        );
+        assert!(
+            !manifest.contains("conversation.md"),
+            "absent conversation.md should be omitted"
+        );
     }
 }

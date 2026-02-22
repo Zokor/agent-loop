@@ -58,6 +58,105 @@ exit 0
     create_mock_agent(project_dir, "codex", script);
 }
 
+#[cfg(unix)]
+fn create_implementation_agents(project_dir: &Path) {
+    let script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+STATE_DIR="$(pwd)/.agent-loop/state"
+mkdir -p "$STATE_DIR"
+STATUS_FILE="$STATE_DIR/status.json"
+FINDINGS_FILE="$STATE_DIR/findings.json"
+ALL_ARGS="$*"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+printf '{"round":1,"findings":[]}' > "$FINDINGS_FILE"
+printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}' "$CURRENT_TS" > "$STATUS_FILE"
+exit 0
+"#;
+    create_mock_agent(project_dir, "claude", script);
+    create_mock_agent(project_dir, "codex", script);
+}
+
+#[cfg(unix)]
+fn create_dual_signoff_agents(project_dir: &Path) {
+    let implementer_script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+
+STATE_DIR="$(pwd)/.agent-loop/state"
+mkdir -p "$STATE_DIR"
+ALL_ARGS="$*"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | grep -Eo '[0-9]{4}-[0-9]{2}-[0-9]{2}T[^"]+Z' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "The reviewer has APPROVED your plan"; then
+    : > "$STATE_DIR/plan_signoff_seen"
+    printf '{"status":"CONSENSUS","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "The reviewer has APPROVED the task breakdown"; then
+    : > "$STATE_DIR/tasks_signoff_seen"
+    printf '{"status":"CONSENSUS","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the task below and propose a detailed development plan"; then
+    printf '# Plan\n- Dual-agent signoff path\n' > "$STATE_DIR/plan.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Both agents have agreed on the following development plan"; then
+    printf '### Task 1: Signed Off\nDo the work.\n' > "$STATE_DIR/tasks.md"
+    exit 0
+fi
+
+exit 0
+"#;
+
+    let reviewer_script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+
+STATE_DIR="$(pwd)/.agent-loop/state"
+mkdir -p "$STATE_DIR"
+ALL_ARGS="$*"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | grep -Eo '[0-9]{4}-[0-9]{2}-[0-9]{2}T[^"]+Z' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Review this development plan against the original task"; then
+    printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "The implementer has broken down the agreed plan into discrete tasks"; then
+    printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+exit 0
+"#;
+
+    create_mock_agent(project_dir, "claude", implementer_script);
+    create_mock_agent(project_dir, "codex", reviewer_script);
+}
+
 fn run_cmd(project_dir: &Path, args: &[&str]) -> std::process::Output {
     Command::new(agent_loop_bin())
         .args(args)
@@ -135,7 +234,212 @@ fn implement_errors_without_tasks() {
     let stderr = String::from_utf8_lossy(&output.stderr);
 
     assert!(!output.status.success());
-    assert!(stderr.contains("No tasks found. Run 'agent-loop tasks' first."));
+    assert!(stderr.contains("No tasks found and no plan found."));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_resets_state_dir_before_run_and_preserves_decisions() {
+    let project_dir = create_project_dir("plan_resets_state");
+    create_planning_agents(&project_dir);
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    fs::create_dir_all(&state_dir).expect("state dir should be created");
+    fs::write(state_dir.join("stale.tmp"), "old").expect("stale file should be written");
+    fs::write(state_dir.join("tasks.md"), "stale tasks").expect("stale tasks should be written");
+
+    let decisions_path = project_dir.join(".agent-loop").join("decisions.md");
+    fs::create_dir_all(decisions_path.parent().expect("decisions parent")).expect("parent");
+    fs::write(&decisions_path, "- [PATTERN] preserve me\n").expect("decisions should be written");
+
+    let output = Command::new(agent_loop_bin())
+        .args(["plan", "reset verification", "--single-agent"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop plan should execute");
+
+    assert!(
+        output.status.success(),
+        "plan should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !state_dir.join("stale.tmp").exists(),
+        "stale state file should be removed"
+    );
+    assert!(
+        !state_dir.join("tasks.md").exists(),
+        "stale tasks.md should be removed on fresh plan run"
+    );
+    assert!(
+        state_dir.join("plan.md").exists(),
+        "new plan.md should exist"
+    );
+
+    let decisions = fs::read_to_string(&decisions_path).expect("decisions should still exist");
+    assert!(decisions.contains("preserve me"));
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_falls_back_to_plan_when_tasks_missing() {
+    let project_dir = create_project_dir("implement_fallback_plan");
+    create_implementation_agents(&project_dir);
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    fs::create_dir_all(&state_dir).expect("state dir should be created");
+    fs::write(
+        state_dir.join("plan.md"),
+        "# Plan\n1. Add fallback behavior\n2. Keep per-task strictness\n",
+    )
+    .expect("plan.md should be written");
+    fs::write(state_dir.join("task.md"), "Implement fallback support.\n")
+        .expect("task.md should be written");
+
+    let output = Command::new(agent_loop_bin())
+        .args(["implement", "--single-agent"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("MAX_ROUNDS", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop implement should execute");
+
+    assert!(
+        output.status.success(),
+        "implement should succeed with plan fallback: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let combined_task = fs::read_to_string(state_dir.join("task.md")).expect("task.md");
+    assert!(
+        combined_task.contains("Implement the approved plan below as one cohesive change set."),
+        "fallback combined task should use plan instruction prefix"
+    );
+    assert!(
+        combined_task.contains("PLAN:"),
+        "fallback combined task should include plan context"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn dual_agent_plan_requires_and_executes_implementer_signoff() {
+    let project_dir = create_project_dir("dual_plan_signoff");
+    create_dual_signoff_agents(&project_dir);
+
+    let output = Command::new(agent_loop_bin())
+        .args(["plan", "verify dual signoff"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop plan should execute");
+
+    assert!(
+        output.status.success(),
+        "dual-agent plan should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    assert!(
+        state_dir.join("plan_signoff_seen").exists(),
+        "implementer plan signoff prompt should be executed"
+    );
+    let status_raw = fs::read_to_string(state_dir.join("status.json")).expect("status.json");
+    let status: serde_json::Value =
+        serde_json::from_str(&status_raw).expect("status.json should be valid JSON");
+    assert_eq!(
+        status["status"].as_str(),
+        Some("CONSENSUS"),
+        "final plan status should be CONSENSUS in dual-agent flow: {status_raw}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn dual_agent_tasks_requires_and_executes_implementer_signoff() {
+    let project_dir = create_project_dir("dual_tasks_signoff");
+    create_dual_signoff_agents(&project_dir);
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    fs::create_dir_all(&state_dir).expect("state dir should be created");
+    fs::write(
+        state_dir.join("plan.md"),
+        "# Plan\n- Task decomposition should require signoff\n",
+    )
+    .expect("plan.md should be seeded");
+
+    let output = Command::new(agent_loop_bin())
+        .args(["tasks"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .current_dir(&project_dir)
+        .output()
+        .expect("agent-loop tasks should execute");
+
+    assert!(
+        output.status.success(),
+        "dual-agent tasks should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        state_dir.join("tasks_signoff_seen").exists(),
+        "implementer decomposition signoff prompt should be executed"
+    );
+    let status_raw = fs::read_to_string(state_dir.join("status.json")).expect("status.json");
+    let status: serde_json::Value =
+        serde_json::from_str(&status_raw).expect("status.json should be valid JSON");
+    assert_eq!(
+        status["status"].as_str(),
+        Some("CONSENSUS"),
+        "final tasks status should be CONSENSUS in dual-agent flow: {status_raw}"
+    );
+    assert!(
+        state_dir.join("tasks.md").exists(),
+        "tasks.md should be produced"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }
@@ -245,7 +549,10 @@ fn config_init_creates_toml_file() {
 
     let content = fs::read_to_string(&config_path).expect("config should be readable");
     // Verify key section markers from the template
-    assert!(content.contains("# ── Core"), "template should contain Core section");
+    assert!(
+        content.contains("# ── Core"),
+        "template should contain Core section"
+    );
     assert!(
         content.contains("# ── Agents"),
         "template should contain Agents section"
@@ -286,7 +593,10 @@ fn config_init_refuses_overwrite_without_force() {
 
     // File should be unchanged
     let content = fs::read_to_string(&config_path).expect("config should be readable");
-    assert_eq!(content, "# existing config\n", "existing file should be preserved");
+    assert_eq!(
+        content, "# existing config\n",
+        "existing file should be preserved"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }

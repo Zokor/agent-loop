@@ -79,7 +79,12 @@ pub(crate) fn resolve_command(
     // Permission / sandbox policy — added after system prompt so that sandbox
     // flags never accidentally become the target of prepend logic above.
     if agent.name() == "claude" {
-        if config.claude_full_access {
+        let planner_plan_mode =
+            role == Some(AgentRole::Planner) && config.planner_permission_mode == "plan";
+        if planner_plan_mode {
+            args.push("--permission-mode".to_string());
+            args.push("plan".to_string());
+        } else if config.claude_full_access {
             args.push("--dangerously-skip-permissions".to_string());
         } else {
             args.push("--allowedTools".to_string());
@@ -785,8 +790,14 @@ fn run_agent_inner(
         );
     }
 
-    let (command, args) =
-        resolve_command(agent, prompt, config, system_prompt, session_id.as_deref(), role);
+    let (command, args) = resolve_command(
+        agent,
+        prompt,
+        config,
+        system_prompt,
+        session_id.as_deref(),
+        role,
+    );
     let mut cmd = Command::new(command);
     cmd.args(args)
         .current_dir(&config.project_dir)
@@ -972,8 +983,7 @@ fn run_agent_inner(
     // strips structural information.  This scans error/system JSON events and
     // non-JSON (stderr) lines only — assistant content is excluded to avoid
     // false-positives when the agent merely discusses sessions.
-    let raw_has_resume_error =
-        session_id.is_some() && has_session_resume_error(&combined_output);
+    let raw_has_resume_error = session_id.is_some() && has_session_resume_error(&combined_output);
 
     let normalized_output = normalize_agent_output(agent, combined_output);
     if let Err(err) = append_response_block(agent, &normalized_output, config) {
@@ -1060,7 +1070,14 @@ mod tests {
     #[test]
     fn resolve_command_builds_claude_with_allowed_tools_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None, None);
+        let (command, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
         assert_eq!(command, "claude");
         assert!(args.contains(&"--allowedTools".to_string()));
         assert!(args.contains(&crate::config::DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string()));
@@ -1152,10 +1169,68 @@ mod tests {
     fn resolve_command_builds_claude_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.claude_full_access = true;
-        let (command, args) = resolve_command(&Agent::known("claude"), "hello", &project.config, None, None, None);
+        let (command, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
         assert_eq!(command, "claude");
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_claude_planner_plan_mode_uses_permission_mode_plan() {
+        let mut project = new_project(5);
+        project.config.planner_permission_mode = "plan".to_string();
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Planner),
+        );
+        assert!(args.contains(&"--permission-mode".to_string()));
+        assert!(args.contains(&"plan".to_string()));
+        assert!(!args.contains(&"--allowedTools".to_string()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_planner_plan_mode_overrides_claude_full_access() {
+        let mut project = new_project(5);
+        project.config.claude_full_access = true;
+        project.config.planner_permission_mode = "plan".to_string();
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Planner),
+        );
+        assert!(args.contains(&"--permission-mode".to_string()));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_planner_permission_mode_does_not_affect_non_planner_role() {
+        let mut project = new_project(5);
+        project.config.planner_permission_mode = "plan".to_string();
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Implementer),
+        );
+        assert!(args.contains(&"--allowedTools".to_string()));
+        assert!(!args.contains(&"--permission-mode".to_string()));
     }
 
     #[test]
@@ -1254,7 +1329,14 @@ mod tests {
     #[test]
     fn resolve_command_builds_codex_with_full_auto_by_default() {
         let project = new_project(5);
-        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None, None);
+        let (command, args) = resolve_command(
+            &Agent::known("codex"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
         assert_eq!(command, "codex");
         assert!(args.contains(&"--full-auto".to_string()));
         assert!(args.contains(&"--json".to_string()));
@@ -1266,7 +1348,14 @@ mod tests {
     fn resolve_command_builds_codex_with_full_access_when_enabled() {
         let mut project = new_project(5);
         project.config.codex_full_access = true;
-        let (command, args) = resolve_command(&Agent::known("codex"), "hello", &project.config, None, None, None);
+        let (command, args) = resolve_command(
+            &Agent::known("codex"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
         assert_eq!(command, "codex");
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(!args.contains(&"--full-auto".to_string()));

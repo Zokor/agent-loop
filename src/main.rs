@@ -352,7 +352,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement all tasks from .agent-loop/state/tasks.md in one loop\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -530,6 +530,25 @@ fn build_batch_implementation_task(raw_tasks: &str) -> String {
     )
 }
 
+fn build_plan_implementation_task(original_task: &str, plan: &str) -> String {
+    let original_task = original_task.trim();
+    let plan = plan.trim();
+    if original_task.is_empty() {
+        return format!(
+            "Implement the approved plan below as one cohesive change set.\n\
+             Treat dependencies across steps holistically and ensure all plan outcomes are satisfied.\n\n\
+             PLAN:\n{plan}"
+        );
+    }
+
+    format!(
+        "Implement the approved plan below as one cohesive change set.\n\
+         Treat dependencies across steps holistically and ensure all plan outcomes are satisfied.\n\n\
+         ORIGINAL TASK:\n{original_task}\n\n\
+         PLAN:\n{plan}"
+    )
+}
+
 fn read_current_status(project_dir: &Path, single_agent: bool) -> Option<LoopStatus> {
     let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false).ok()?;
     if !config.state_dir.join("status.json").is_file() {
@@ -674,6 +693,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
         Vec::new()
     };
 
+    reset_state_dir(&config.project_dir)?;
     state::init(
         task.as_str(),
         &config,
@@ -1150,10 +1170,38 @@ fn implement_all_tasks_batch(
 ) -> Result<i32, AgentLoopError> {
     println!("Running batch implementation for all tasks in a single loop.");
     let title = batch_metrics_title(parsed_tasks.len());
+    let combined_task = build_batch_implementation_task(raw_tasks);
+    run_batch_implementation_with_title(args, config, project_dir, &title, combined_task)
+}
+
+fn implement_plan_batch(
+    args: &ImplementArgs,
+    config: &Config,
+    project_dir: &Path,
+    plan: &str,
+) -> Result<i32, AgentLoopError> {
+    println!("No tasks found; falling back to plan.md for batch implementation.");
+    let original_task = state::read_state_file("task.md", config);
+    let combined_task = build_plan_implementation_task(&original_task, plan);
+    run_batch_implementation_with_title(
+        args,
+        config,
+        project_dir,
+        "Batch implementation (plan fallback)",
+        combined_task,
+    )
+}
+
+fn run_batch_implementation_with_title(
+    args: &ImplementArgs,
+    config: &Config,
+    project_dir: &Path,
+    title: &str,
+    combined_task: String,
+) -> Result<i32, AgentLoopError> {
     let started_at = state::timestamp();
     let timer = Instant::now();
     let usage_before = agent::usage_snapshot();
-    let combined_task = build_batch_implementation_task(raw_tasks);
     let run_result = run_command_with_max_rounds(
         RunArgs {
             task: Some(combined_task),
@@ -1181,7 +1229,7 @@ fn implement_all_tasks_batch(
     };
 
     persist_batch_task_state(
-        &title,
+        title,
         status,
         last_error,
         started_at,
@@ -1202,14 +1250,14 @@ fn implement_all_tasks_wave(
 ) -> Result<i32, AgentLoopError> {
     use std::sync::mpsc;
 
-    let deps: Vec<Vec<usize>> = parsed_tasks.iter().map(|t| t.dependencies.clone()).collect();
+    let deps: Vec<Vec<usize>> = parsed_tasks
+        .iter()
+        .map(|t| t.dependencies.clone())
+        .collect();
     let schedule = wave::compute_wave_schedule(parsed_tasks.len(), &deps)
         .map_err(|e| AgentLoopError::Wave(e.to_string()))?;
 
-    let effective_max_parallel = args
-        .max_parallel
-        .unwrap_or(config.max_parallel)
-        .max(1) as usize;
+    let effective_max_parallel = args.max_parallel.unwrap_or(config.max_parallel).max(1) as usize;
 
     // Durable runtime artifacts live in .agent-loop/ (parent of state/) so that
     // `reset` (which removes state/) does not delete them.
@@ -1316,7 +1364,10 @@ fn implement_all_tasks_wave(
         for &task_idx in wave_tasks {
             // Already done — skip.
             if task_results[task_idx] == Some(true) {
-                println!("✅ '{}' — already done, skipping", parsed_tasks[task_idx].title);
+                println!(
+                    "✅ '{}' — already done, skipping",
+                    parsed_tasks[task_idx].title
+                );
                 continue;
             }
 
@@ -1329,10 +1380,7 @@ fn implement_all_tasks_wave(
                 runnable.push(task_idx);
             } else {
                 let reason = format!("dependency failed: {}", failed_deps.join(", "));
-                println!(
-                    "⏭ Skipping '{}' — {}",
-                    parsed_tasks[task_idx].title, reason
-                );
+                println!("⏭ Skipping '{}' — {}", parsed_tasks[task_idx].title, reason);
                 task_results[task_idx] = Some(false);
                 wave_statuses[task_idx].status = TaskRunStatus::Skipped;
                 wave_statuses[task_idx].skip_reason = Some(reason);
@@ -1395,9 +1443,9 @@ fn implement_all_tasks_wave(
 
         // Collect results and launch more as slots free up.
         while in_flight > 0 {
-            let (task_idx, succeeded) = rx.recv().map_err(|e| {
-                AgentLoopError::Wave(format!("wave task channel error: {e}"))
-            })?;
+            let (task_idx, succeeded) = rx
+                .recv()
+                .map_err(|e| AgentLoopError::Wave(format!("wave task channel error: {e}")))?;
             in_flight -= 1;
             task_results[task_idx] = Some(succeeded);
 
@@ -1527,9 +1575,18 @@ fn implement_all_tasks_wave(
 
     // Derive summary counts from wave_statuses (authoritative) so that tasks
     // skipped due to dependency failures are counted as skipped, not failed.
-    let total_passed = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Done).count();
-    let total_failed = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Failed).count();
-    let total_skipped = wave_statuses.iter().filter(|s| s.status == TaskRunStatus::Skipped).count();
+    let total_passed = wave_statuses
+        .iter()
+        .filter(|s| s.status == TaskRunStatus::Done)
+        .count();
+    let total_failed = wave_statuses
+        .iter()
+        .filter(|s| s.status == TaskRunStatus::Failed)
+        .count();
+    let total_skipped = wave_statuses
+        .iter()
+        .filter(|s| s.status == TaskRunStatus::Skipped)
+        .count();
 
     // Journal: RunEnd event.
     let _ = wave_runtime::append_journal_event(
@@ -1572,7 +1629,6 @@ fn launch_wave_task(
     _args: &ImplementArgs,
     tx: &std::sync::mpsc::Sender<(usize, bool)>,
 ) {
-
     let task_title = parsed_tasks[task_idx].title.clone();
     let task_content = parsed_tasks[task_idx].content.clone();
     let task_state_dir = config.state_dir.join(format!("task-{}", task_idx + 1));
@@ -1592,10 +1648,7 @@ fn launch_wave_task(
 }
 
 /// Run a single implementation task with an explicit config (used by wave orchestrator).
-fn run_command_with_config(
-    task: String,
-    config: &Config,
-) -> Result<i32, AgentLoopError> {
+fn run_command_with_config(task: String, config: &Config) -> Result<i32, AgentLoopError> {
     let baseline_vec = if git::is_git_repo(config) {
         git::list_changed_files(config)?
     } else {
@@ -1840,32 +1893,23 @@ fn implement_all_tasks_per_task(
 
 fn implement_all_tasks_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
     let tasks_file = project_dir
         .join(".agent-loop")
         .join("state")
         .join("tasks.md");
-    if !tasks_file.is_file() {
-        return Err(AgentLoopError::State(
-            "No tasks found. Run 'agent-loop tasks' first.".to_string(),
-        ));
-    }
-    let raw_tasks = fs::read_to_string(&tasks_file).map_err(|err| {
-        AgentLoopError::Config(format!("Failed to read '{}': {err}", tasks_file.display()))
-    })?;
-    let parsed_tasks = parse_tasks_file(&raw_tasks, &tasks_file)?;
-    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+    let raw_tasks = match fs::read_to_string(&tasks_file) {
+        Ok(content) => Some(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            return Err(AgentLoopError::Config(format!(
+                "Failed to read '{}': {err}",
+                tasks_file.display()
+            )));
+        }
+    };
 
-    println!(
-        "Found {} tasks in {}",
-        parsed_tasks.len(),
-        tasks_file.display()
-    );
-
-    if args.wave {
-        return implement_all_tasks_wave(&args, &parsed_tasks, &config, &project_dir);
-    }
-
-    let use_per_task_mode = args.per_task || !config.batch_implement;
+    let use_per_task_mode = args.wave || args.per_task || !config.batch_implement;
     if per_task_only_flags_present(&args) && !use_per_task_mode {
         return Err(AgentLoopError::Config(
             "Per-task lifecycle flags require per-task mode. Use '--per-task' or set 'batch_implement = false'."
@@ -1874,10 +1918,42 @@ fn implement_all_tasks_command(args: ImplementArgs) -> Result<i32, AgentLoopErro
     }
 
     if use_per_task_mode {
+        let raw_tasks = raw_tasks.as_deref().ok_or_else(|| {
+            AgentLoopError::State("No tasks found. Run 'agent-loop tasks' first.".to_string())
+        })?;
+        let parsed_tasks = parse_tasks_file(raw_tasks, &tasks_file)?;
+
+        println!(
+            "Found {} tasks in {}",
+            parsed_tasks.len(),
+            tasks_file.display()
+        );
+        if args.wave {
+            return implement_all_tasks_wave(&args, &parsed_tasks, &config, &project_dir);
+        }
         return implement_all_tasks_per_task(&args, &parsed_tasks, &config, &project_dir);
     }
 
-    implement_all_tasks_batch(&args, &parsed_tasks, &config, &project_dir, &raw_tasks)
+    if let Some(raw_tasks) = raw_tasks.as_deref()
+        && !raw_tasks.trim().is_empty()
+    {
+        let parsed_tasks = parse_tasks_file(raw_tasks, &tasks_file)?;
+        println!(
+            "Found {} tasks in {}",
+            parsed_tasks.len(),
+            tasks_file.display()
+        );
+        return implement_all_tasks_batch(&args, &parsed_tasks, &config, &project_dir, raw_tasks);
+    }
+
+    let raw_plan = state::read_state_file("plan.md", &config);
+    if !raw_plan.trim().is_empty() {
+        return implement_plan_batch(&args, &config, &project_dir, &raw_plan);
+    }
+
+    Err(AgentLoopError::State(
+        "No tasks found and no plan found. Run 'agent-loop plan' first, or generate tasks with 'agent-loop tasks'.".to_string(),
+    ))
 }
 
 fn persist_task_state(
@@ -1923,9 +1999,17 @@ fn terminalize_interrupted_tasks(statuses: &mut [TaskStatusEntry]) {
     }
 }
 
+fn reset_state_dir(project_dir: &Path) -> Result<(), AgentLoopError> {
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    if state_dir.exists() {
+        fs::remove_dir_all(&state_dir)?;
+    }
+    fs::create_dir_all(&state_dir)?;
+    Ok(())
+}
+
 fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
 
     if args.wave_lock {
         // Lock lives in .agent-loop/ (parent of state/) to survive reset.
@@ -1939,10 +2023,7 @@ fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
         return Ok(0);
     }
 
-    if state_dir.exists() {
-        fs::remove_dir_all(&state_dir)?;
-    }
-    fs::create_dir_all(&state_dir)?;
+    reset_state_dir(&project_dir)?;
     println!("State cleared. decisions.md preserved.");
     Ok(0)
 }
@@ -2087,27 +2168,76 @@ fn status_command() -> Result<i32, AgentLoopError> {
         println!("Recent wave events:");
         for event in &recent {
             match event {
-                wave_runtime::WaveProgressEvent::RunStart { timestamp, total_tasks, total_waves, max_parallel } => {
-                    println!("  [{timestamp}] RunStart: {total_tasks} tasks, {total_waves} waves, parallel={max_parallel}");
+                wave_runtime::WaveProgressEvent::RunStart {
+                    timestamp,
+                    total_tasks,
+                    total_waves,
+                    max_parallel,
+                } => {
+                    println!(
+                        "  [{timestamp}] RunStart: {total_tasks} tasks, {total_waves} waves, parallel={max_parallel}"
+                    );
                 }
-                wave_runtime::WaveProgressEvent::WaveStart { timestamp, wave_index, task_count } => {
-                    println!("  [{timestamp}] WaveStart: wave {}, {} tasks", wave_index + 1, task_count);
+                wave_runtime::WaveProgressEvent::WaveStart {
+                    timestamp,
+                    wave_index,
+                    task_count,
+                } => {
+                    println!(
+                        "  [{timestamp}] WaveStart: wave {}, {} tasks",
+                        wave_index + 1,
+                        task_count
+                    );
                 }
-                wave_runtime::WaveProgressEvent::TaskEnd { timestamp, task_index, title, success, .. } => {
+                wave_runtime::WaveProgressEvent::TaskEnd {
+                    timestamp,
+                    task_index,
+                    title,
+                    success,
+                    ..
+                } => {
                     let icon = if *success { "ok" } else { "FAIL" };
-                    println!("  [{timestamp}] TaskEnd: task {} '{}' — {icon}", task_index + 1, title);
+                    println!(
+                        "  [{timestamp}] TaskEnd: task {} '{}' — {icon}",
+                        task_index + 1,
+                        title
+                    );
                 }
-                wave_runtime::WaveProgressEvent::WaveEnd { timestamp, wave_index, passed, failed } => {
-                    println!("  [{timestamp}] WaveEnd: wave {} — {passed} passed, {failed} failed", wave_index + 1);
+                wave_runtime::WaveProgressEvent::WaveEnd {
+                    timestamp,
+                    wave_index,
+                    passed,
+                    failed,
+                } => {
+                    println!(
+                        "  [{timestamp}] WaveEnd: wave {} — {passed} passed, {failed} failed",
+                        wave_index + 1
+                    );
                 }
-                wave_runtime::WaveProgressEvent::RunEnd { timestamp, total_passed, total_failed, total_skipped } => {
-                    println!("  [{timestamp}] RunEnd: {total_passed} passed, {total_failed} failed, {total_skipped} skipped");
+                wave_runtime::WaveProgressEvent::RunEnd {
+                    timestamp,
+                    total_passed,
+                    total_failed,
+                    total_skipped,
+                } => {
+                    println!(
+                        "  [{timestamp}] RunEnd: {total_passed} passed, {total_failed} failed, {total_skipped} skipped"
+                    );
                 }
                 wave_runtime::WaveProgressEvent::RunInterrupted { timestamp, reason } => {
                     println!("  [{timestamp}] RunInterrupted: {reason}");
                 }
-                wave_runtime::WaveProgressEvent::TaskStart { timestamp, task_index, title, .. } => {
-                    println!("  [{timestamp}] TaskStart: task {} '{}'", task_index + 1, title);
+                wave_runtime::WaveProgressEvent::TaskStart {
+                    timestamp,
+                    task_index,
+                    title,
+                    ..
+                } => {
+                    println!(
+                        "  [{timestamp}] TaskStart: task {} '{}'",
+                        task_index + 1,
+                        title
+                    );
                 }
             }
         }
@@ -2141,10 +2271,7 @@ fn config_init_to_dir(args: &ConfigInitArgs, project_dir: &Path) -> Result<i32, 
 
     let template = config::generate_default_config_template();
     fs::write(&config_path, template).map_err(|err| {
-        AgentLoopError::Config(format!(
-            "failed to write {}: {err}",
-            config_path.display()
-        ))
+        AgentLoopError::Config(format!("failed to write {}: {err}", config_path.display()))
     })?;
 
     println!("Generated .agent-loop.toml with defaults.");
@@ -2200,10 +2327,7 @@ mod tests {
     #[test]
     fn parse_removed_resume_command_is_error() {
         let result = Cli::try_parse_from(["agent-loop", "resume"]);
-        assert!(
-            result.is_err(),
-            "removed 'resume' command should not parse"
-        );
+        assert!(result.is_err(), "removed 'resume' command should not parse");
     }
 
     #[test]
@@ -2255,7 +2379,10 @@ mod tests {
             .expect("--wave --resume should parse");
         if let Some(Commands::Implement(args)) = cli.command {
             let result = args.validate();
-            assert!(result.is_ok(), "--wave --resume should not be rejected by validate");
+            assert!(
+                result.is_ok(),
+                "--wave --resume should not be rejected by validate"
+            );
         } else {
             panic!("expected Implement command");
         }
@@ -2407,7 +2534,10 @@ mod tests {
         let config_path = dir.path().join(".agent-loop.toml");
         assert!(config_path.exists());
         let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("# ── Agents"), "template should contain Agents section");
+        assert!(
+            content.contains("# ── Agents"),
+            "template should contain Agents section"
+        );
     }
 
     #[test]
@@ -2436,7 +2566,10 @@ mod tests {
         assert_eq!(result.unwrap(), 0);
 
         let content = fs::read_to_string(&config_path).unwrap();
-        assert!(content.contains("# ── Agents"), "template should overwrite old content");
+        assert!(
+            content.contains("# ── Agents"),
+            "template should overwrite old content"
+        );
         assert!(!content.contains("old content"));
     }
 

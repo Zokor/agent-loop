@@ -38,7 +38,9 @@ impl FromStr for StuckAction {
             "abort" => Ok(Self::Abort),
             "warn" => Ok(Self::Warn),
             "retry" => Ok(Self::Retry),
-            _ => Err(format!("invalid stuck action '{s}': expected abort, warn, or retry")),
+            _ => Err(format!(
+                "invalid stuck action '{s}': expected abort, warn, or retry"
+            )),
         }
     }
 }
@@ -137,6 +139,8 @@ struct FileConfig {
     reviewer_model: Option<String>,
     /// Model override for the planning phase.
     planner_model: Option<String>,
+    /// Planner permission mode: "default" or "plan".
+    planner_permission_mode: Option<String>,
 
     // ── Claude CLI tuning ──────────────────────────────────────────
     /// Bypass allowedTools and use `--dangerously-skip-permissions`.
@@ -284,6 +288,8 @@ pub struct Config {
     /// Model override for planning phase (separate from implementer/reviewer models
     /// which live on the `Agent` struct).
     pub planner_model: Option<String>,
+    /// Planner permission mode: "default" (normal) or "plan" (Claude read-only).
+    pub planner_permission_mode: String,
 
     // ── Claude CLI tuning ──────────────────────────────────────────
     /// When true, use `--dangerously-skip-permissions` instead of `--allowedTools`.
@@ -382,10 +388,13 @@ impl Config {
         };
 
         // --- model selection: env > TOML > None ---
-        let implementer_model =
-            env_trimmed_string("IMPLEMENTER_MODEL").or(file.implementer_model);
+        let implementer_model = env_trimmed_string("IMPLEMENTER_MODEL").or(file.implementer_model);
         let reviewer_model = env_trimmed_string("REVIEWER_MODEL").or(file.reviewer_model);
         let planner_model = env_trimmed_string("PLANNER_MODEL").or(file.planner_model);
+        let planner_permission_mode = env_trimmed_string("PLANNER_PERMISSION_MODE")
+            .or(file.planner_permission_mode)
+            .unwrap_or_else(|| "default".to_string())
+            .to_ascii_lowercase();
 
         // Apply models to agents.
         let implementer = implementer.with_model(implementer_model);
@@ -538,6 +547,7 @@ impl Config {
             wave_lock_stale_seconds,
             wave_shutdown_grace_ms,
             planner_model,
+            planner_permission_mode,
             claude_full_access,
             claude_allowed_tools,
             reviewer_allowed_tools,
@@ -764,6 +774,13 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         "reviewer_effort_level",
     )?;
 
+    if !matches!(config.planner_permission_mode.as_str(), "default" | "plan") {
+        return Err(AgentLoopError::Config(format!(
+            "planner_permission_mode must be one of [\"default\", \"plan\"], got \"{}\"",
+            config.planner_permission_mode
+        )));
+    }
+
     if let Some(max) = config.claude_max_output_tokens
         && (max == 0 || max > 64000)
     {
@@ -824,9 +841,7 @@ fn emit_config_warnings(_config: &Config, config_file_found: bool) {
         std::io::IsTerminal::is_terminal(&std::io::stderr()),
         &MISSING_CONFIG_HINT_EMITTED,
     ) {
-        eprintln!(
-            "Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one."
-        );
+        eprintln!("Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one.");
     }
 }
 
@@ -863,6 +878,7 @@ pub fn generate_default_config_template() -> String {
 # implementer_model = ""
 # reviewer_model = ""
 # planner_model = ""
+# planner_permission_mode = "default"
 
 # ── Claude CLI tuning ────────────────────────────────────────────────────────
 # claude_full_access = false
@@ -953,6 +969,7 @@ mod tests {
             "IMPLEMENTER_MODEL",
             "REVIEWER_MODEL",
             "PLANNER_MODEL",
+            "PLANNER_PERMISSION_MODE",
             // Claude CLI tuning
             "CLAUDE_FULL_ACCESS",
             "CLAUDE_ALLOWED_TOOLS",
@@ -1053,14 +1070,26 @@ mod tests {
 
     #[test]
     fn resolve_reviewer_matches_single_agent_mode() {
-        assert_eq!(resolve_reviewer(&Agent::known("claude"), true), Agent::known("claude"));
-        assert_eq!(resolve_reviewer(&Agent::known("codex"), true), Agent::known("codex"));
+        assert_eq!(
+            resolve_reviewer(&Agent::known("claude"), true),
+            Agent::known("claude")
+        );
+        assert_eq!(
+            resolve_reviewer(&Agent::known("codex"), true),
+            Agent::known("codex")
+        );
     }
 
     #[test]
     fn resolve_reviewer_uses_opposite_agent_in_dual_mode() {
-        assert_eq!(resolve_reviewer(&Agent::known("claude"), false), Agent::known("codex"));
-        assert_eq!(resolve_reviewer(&Agent::known("codex"), false), Agent::known("claude"));
+        assert_eq!(
+            resolve_reviewer(&Agent::known("claude"), false),
+            Agent::known("codex")
+        );
+        assert_eq!(
+            resolve_reviewer(&Agent::known("codex"), false),
+            Agent::known("claude")
+        );
     }
 
     #[test]
@@ -1707,6 +1736,48 @@ batch_implement = true
     }
 
     #[test]
+    fn from_cli_planner_permission_mode_defaults_to_default() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_perm_default");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner_permission_mode, "default");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_planner_permission_mode_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_planner_perm_env_overrides_toml");
+        write_toml(&dir, "planner_permission_mode = \"default\"\n");
+        set_env("PLANNER_PERMISSION_MODE", "plan");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(config.planner_permission_mode, "plan");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_cli_rejects_invalid_planner_permission_mode() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_invalid_planner_perm");
+        write_toml(&dir, "planner_permission_mode = \"invalid\"\n");
+
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("invalid planner_permission_mode should fail");
+        assert!(
+            err.to_string()
+                .contains("planner_permission_mode must be one of")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_file_config_parses_quality_commands_with_and_without_remediation() {
         let dir = create_temp_project_root("toml_quality_commands");
         write_toml(
@@ -2237,6 +2308,10 @@ planning_context_excerpt_lines = 75
         assert!(
             template.contains(DEFAULT_REVIEWER_ALLOWED_TOOLS),
             "missing DEFAULT_REVIEWER_ALLOWED_TOOLS"
+        );
+        assert!(
+            template.contains("# planner_permission_mode = \"default\""),
+            "missing planner_permission_mode default line"
         );
 
         // All value lines should be commented out

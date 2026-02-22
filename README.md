@@ -70,14 +70,18 @@ agent-loop implement --file <task.md>
 agent-loop implement --resume
 ```
 
-`agent-loop implement` (without flags) reads `.agent-loop/state/tasks.md` and executes all tasks in one implementation/review loop.
+`agent-loop implement` (without flags) runs in batch mode:
+- Uses `.agent-loop/state/tasks.md` when present and non-empty.
+- Falls back to `.agent-loop/state/plan.md` when `tasks.md` is missing or empty.
+
 Use `agent-loop implement --per-task` for legacy one-task-at-a-time execution.
 Use `agent-loop implement --wave` for dependency-aware parallel execution (see Wave Mode below).
+When `batch_implement = false` (or `--per-task` / `--wave` is used), `tasks.md` is mandatory and plan fallback is disabled.
 
-If no tasks file exists, it errors with:
+If both `tasks.md` and `plan.md` are unavailable in plain batch mode, it errors with:
 
 ```text
-No tasks found. Run 'agent-loop tasks' first.
+No tasks found and no plan found. Run 'agent-loop plan' first, or generate tasks with 'agent-loop tasks'.
 ```
 
 ### `reset`
@@ -109,16 +113,22 @@ agent-loop help
 plan  ->  tasks  ->  implement
 ```
 
-Implementation rounds use reviewer approval + implementer self-review before consensus:
+Consensus/signoff model:
 
 ```text
-implement round
-  -> reviewer review
-  -> if approved: implementer self-review
-     -> CONSENSUS or DISPUTED
-```
+Plan/tasks single-agent:
+  reviewer APPROVED -> system finalizes CONSENSUS
 
-In dual-agent mode, a reviewer 5/5 triggers adversarial review first, then still runs implementer self-review (no dual-agent auto-consensus shortcut).
+Plan/tasks dual-agent:
+  reviewer APPROVED -> implementer signoff (CONSENSUS or DISPUTED)
+
+Implement single-agent:
+  reviewer APPROVED -> system finalizes CONSENSUS
+  (5/5 remains auto-consensus)
+
+Implement dual-agent:
+  reviewer APPROVED -> implementer signoff (CONSENSUS or DISPUTED)
+```
 
 ## Wave Mode
 
@@ -166,9 +176,10 @@ Override the model used by each agent role:
 implementer_model = "claude-sonnet-4-6"
 reviewer_model = "o3"
 planner_model = "claude-sonnet-4-6"
+planner_permission_mode = "default" # "default" | "plan" (Claude planner only)
 ```
 
-Or via environment variables: `IMPLEMENTER_MODEL`, `REVIEWER_MODEL`, `PLANNER_MODEL`.
+Or via environment variables: `IMPLEMENTER_MODEL`, `REVIEWER_MODEL`, `PLANNER_MODEL`, `PLANNER_PERMISSION_MODE`.
 
 Model flags are agent-specific: Claude uses `--model`, Codex uses `-m`. Agents with `supports_model_flag=false` (experimental agents) will have model overrides cleared with a warning at startup.
 
@@ -310,6 +321,7 @@ planning_context_excerpt_lines = 100
 implementer_model = "claude-sonnet-4-6"
 reviewer_model = "o3"
 planner_model = "claude-sonnet-4-6"
+planner_permission_mode = "default"
 
 # Reviewer sandbox
 reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
@@ -378,6 +390,7 @@ Model selection:
 - `IMPLEMENTER_MODEL`
 - `REVIEWER_MODEL`
 - `PLANNER_MODEL`
+- `PLANNER_PERMISSION_MODE` (`default` or `plan`)
 
 Progressive context:
 - `PROGRESSIVE_CONTEXT` (default: 0)
