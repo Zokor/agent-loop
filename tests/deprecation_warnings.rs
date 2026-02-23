@@ -1,4 +1,5 @@
-//! Integration tests verifying removed legacy commands produce clap parse errors.
+//! Integration tests verifying removed legacy commands produce clap parse errors
+//! and renamed config keys produce actionable migration errors.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,15 @@ fn run_in_tmp(tmp: &TempDir, args: &[&str]) -> std::process::Output {
         .current_dir(tmp.path())
         .output()
         .expect("agent-loop should execute")
+}
+
+fn run_with_env(tmp: &TempDir, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
+    let mut cmd = Command::new(agent_loop_bin());
+    cmd.args(args).current_dir(tmp.path());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd.output().expect("agent-loop should execute")
 }
 
 #[test]
@@ -113,5 +123,62 @@ fn resume_returns_clap_parse_error() {
     assert!(
         stderr.contains("unrecognized subcommand"),
         "expected clap parse error for 'resume', got: {stderr}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Renamed config key migration errors (MAX_ROUNDS → REVIEW_MAX_ROUNDS)
+// -----------------------------------------------------------------------
+
+/// Setting the legacy `MAX_ROUNDS` env var should produce a rename migration
+/// error telling the user to switch to `REVIEW_MAX_ROUNDS`.
+#[test]
+fn max_rounds_env_var_rejected_with_rename_guidance() {
+    let tmp = TempDir::new("max_rounds_env");
+    let output = run_with_env(&tmp, &["status"], &[("MAX_ROUNDS", "10")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "MAX_ROUNDS env var should cause a failure, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("renamed to `REVIEW_MAX_ROUNDS`"),
+        "expected rename guidance for MAX_ROUNDS env var, got: {stderr}"
+    );
+}
+
+/// A TOML file containing the legacy `max_rounds` key should produce a rename
+/// migration error pointing at `review_max_rounds`.
+#[test]
+fn max_rounds_toml_key_rejected_with_rename_guidance() {
+    let tmp = TempDir::new("max_rounds_toml");
+    fs::write(
+        tmp.path().join(".agent-loop.toml"),
+        "max_rounds = 10\n",
+    )
+    .expect("toml should be written");
+
+    let output = run_in_tmp(&tmp, &["status"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "max_rounds TOML key should cause a failure, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("renamed to `review_max_rounds`"),
+        "expected rename guidance for max_rounds TOML key, got: {stderr}"
+    );
+}
+
+/// `REVIEW_MAX_ROUNDS=0` (unlimited) should be accepted without error.
+/// The `status` command should succeed and not reject the value.
+#[test]
+fn review_max_rounds_zero_accepted_at_cli_level() {
+    let tmp = TempDir::new("review_max_rounds_zero");
+    let output = run_with_env(&tmp, &["status"], &[("REVIEW_MAX_ROUNDS", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "REVIEW_MAX_ROUNDS=0 should be accepted, stderr: {stderr}"
     );
 }
