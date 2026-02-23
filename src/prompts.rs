@@ -137,11 +137,16 @@ fn append_file_excerpt(
         return;
     }
 
-    lines.push(String::new());
-    lines.push(format!("{filename} (first {excerpt_max_lines} lines):"));
+    let file_line_count = content.lines().count();
+    let remaining = line_cap.saturating_sub(lines.len().saturating_add(2));
+    let max_excerpt = remaining.min(excerpt_max_lines).min(file_line_count);
 
-    let remaining = line_cap.saturating_sub(lines.len());
-    let max_excerpt = remaining.min(excerpt_max_lines);
+    lines.push(String::new());
+    if max_excerpt >= file_line_count {
+        lines.push(format!("{filename}:"));
+    } else {
+        lines.push(format!("{filename} (first {max_excerpt} lines):"));
+    }
 
     for line in content.lines().take(max_excerpt) {
         lines.push(line.to_string());
@@ -316,6 +321,8 @@ pub(crate) struct PlanningReviewerParams<'a> {
     pub config: &'a Config,
     pub task: &'a str,
     pub plan: &'a str,
+    pub project_context: &'a str,
+    pub decisions: &'a str,
     pub round: u32,
     pub prompt_timestamp: &'a str,
     pub paths: &'a PhasePaths,
@@ -328,6 +335,8 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
         config,
         task,
         plan,
+        project_context,
+        decisions,
         round,
         prompt_timestamp,
         paths,
@@ -348,9 +357,133 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
         format!("\n\nOPEN PLANNING FINDINGS (address or resolve each):\n{open_findings}")
     };
 
+    let context_section = if project_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPROJECT CONTEXT:\n{project_context}")
+    };
+
+    let decisions_section = if decisions.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPRIOR DECISIONS & LEARNINGS:\n{decisions}")
+    };
+
     format!(
-        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nReview this development plan against the original task.\n\nTASK:\n{task}\n\nPROPOSED PLAN:\n{plan}{concerns_section}{findings_section}\n\nStructure your review using these sections:\n\n## Completeness\nDoes the plan fully address all requirements in the task?\n\n## Feasibility\nIs the plan technically feasible? Are the proposed approaches sound?\n\n## Risks\nWhat risks, gaps, or potential issues exist?\n\n## Findings\nList specific issues as a JSON block (use IDs like P-001, P-002, ...):\n```json\n[{{\"id\": \"P-001\", \"description\": \"issue description\", \"status\": \"open\"}}]\n```\nUse `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. Use `\"status\": \"open\"` for issues that still need attention. Omit the block entirely if there are no findings at all.\n\n## Verdict\nEnd your review with exactly one of:\n  VERDICT: APPROVED\n  VERDICT: REVISE\n\nIf you approve the plan, write this exact JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        "{preamble}You are the REVIEWER in a collaborative development loop.\n\n\
+        Review this development plan against the original task.\n\n\
+        TASK:\n{task}\n\n\
+        PROPOSED PLAN:\n{plan}{context_section}{decisions_section}{concerns_section}{findings_section}\n\n\
+        Structure your review using these sections:\n\n\
+        ## Completeness\n\
+        Does the plan fully address all requirements in the task?\n\n\
+        ## Accuracy — Codebase Verification (CRITICAL)\n\
+        Use your available tools (Read, Grep, Glob) to verify plan claims against the actual codebase.\n\
+        Do NOT trust the plan at face value. For each major plan element, spot-check the source:\n\
+        - Verify referenced file paths exist and contain what the plan assumes\n\
+        - Verify routes/endpoints return the expected content type (HTML vs JSON vs redirect vs binary)\n\
+        - Verify database seeders/migrations have correct call chains and dependency order\n\
+        - Verify auth flows match actual validation rules (required fields, middleware)\n\
+        - Verify API payloads match controller/request validation requirements\n\
+        - Verify waiver/exclusion lists are complete (no missing endpoints)\n\n\
+        Flag any plan statement that contradicts what you find in the codebase.\n\n\
+        ## Feasibility\n\
+        Is the plan technically feasible? Are the proposed approaches sound?\n\n\
+        ## Risks\n\
+        What risks, gaps, or potential issues exist?\n\n\
+        ## Findings\n\
+        List specific issues as a JSON block (use IDs like P-001, P-002, ...):\n\
+        ```json\n\
+        [{{\"id\": \"P-001\", \"description\": \"issue description\", \"status\": \"open\", \"file_refs\": [\"src/file.rs:42\"]}}]\n\
+        ```\n\
+        Include file_refs citing the source file(s) that evidence each issue.\n\
+        Only id, description, and status are persisted across rounds; file_refs serve as inline evidence.\n\
+        Use `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. \
+        Use `\"status\": \"open\"` for issues that still need attention. \
+        Omit the block entirely if there are no findings at all.\n\n\
+        Write your complete review (all sections above) to {review_path}.\n\n\
+        ## Verdict\n\
+        End your review with exactly one of:\n  \
+        VERDICT: APPROVED\n  \
+        VERDICT: REVISE\n\n\
+        If you approve the plan, write this exact JSON to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
         preamble = single_agent_reviewer_preamble(config),
+        review_path = path_text(&paths.review_md),
+        status_path = path_text(&paths.status_json),
+        impl_name = config.implementer,
+        rev_name = config.reviewer,
+        mode = config.run_mode,
+        plan_path = path_text(&paths.plan_md),
+        status_path2 = path_text(&paths.status_json),
+        impl_name2 = config.implementer,
+        rev_name2 = config.reviewer,
+        mode2 = config.run_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn planning_adversarial_review_prompt(
+    config: &Config,
+    task: &str,
+    plan: &str,
+    first_review: &str,
+    project_context: &str,
+    decisions: &str,
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    let context_section = if project_context.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPROJECT CONTEXT:\n{project_context}")
+    };
+
+    let decisions_section = if decisions.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nPRIOR DECISIONS & LEARNINGS:\n{decisions}")
+    };
+
+    format!(
+        "{preamble}You are a SECOND REVIEWER performing an adversarial review of a development plan.\n\
+        A first reviewer has already approved this plan. Your job is to find what they missed.\n\n\
+        TASK:\n{task}\n\n\
+        PROPOSED PLAN:\n{plan}\n\n\
+        FIRST REVIEWER'S ASSESSMENT:\n{first_review}{context_section}{decisions_section}\n\n\
+        ADVERSARIAL REVIEW INSTRUCTIONS:\n\
+        Use your available tools (Read, Grep, Glob) to deeply verify the plan against the codebase.\n\
+        Focus on what the first reviewer did NOT check:\n\
+        - Route/endpoint content types (HTML page vs JSON vs redirect vs binary/image)\n\
+        - Seeder/migration call chains and dependency ordering\n\
+        - Auth flow requirements (required payload fields, middleware chains)\n\
+        - Missing endpoints, waivers, or edge cases\n\
+        - Inconsistencies between plan steps (e.g., seeder strategy contradicting itself)\n\
+        - Build/asset pipeline steps assumed but not specified\n\n\
+        IMPORTANT GUARDRAIL: If you find no meaningful issues after thorough analysis, then \
+        APPROVED is the correct verdict. Do not manufacture issues or nitpick.\n\n\
+        ## Findings\n\
+        Use IDs like PA-001, PA-002 (PA = Planning Adversarial):\n\
+        ```json\n\
+        [{{\"id\": \"PA-001\", \"description\": \"issue description\", \"status\": \"open\", \"file_refs\": [\"src/file.rs:42\"]}}]\n\
+        ```\n\
+        Include file_refs citing the source file(s) that evidence each issue.\n\
+        Only id, description, and status are persisted across rounds; file_refs serve as inline evidence.\n\
+        Omit the block entirely if there are no findings at all.\n\n\
+        Write your complete review to {review_path}.\n\n\
+        ## Verdict\n\
+        End your review with exactly one of:\n  \
+        VERDICT: APPROVED\n  \
+        VERDICT: REVISE\n\n\
+        If you approve the plan, write this exact JSON to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        preamble = single_agent_reviewer_preamble(config),
+        review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
         impl_name = config.implementer,
         rev_name = config.reviewer,
@@ -729,12 +862,12 @@ pub(crate) fn implementation_adversarial_review_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{DEFAULT_CONTEXT_LINE_CAP, DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES};
     use crate::test_support::unique_temp_path;
     use std::fs;
 
-    const LINE_CAP: usize = DEFAULT_CONTEXT_LINE_CAP as usize;
-    const EXCERPT_MAX_LINES: usize = DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES as usize;
+    /// Generous defaults for tests — mirrors the 0-means-unlimited semantics.
+    const LINE_CAP: usize = usize::MAX;
+    const EXCERPT_MAX_LINES: usize = usize::MAX;
 
     fn make_temp_dir() -> PathBuf {
         let dir = unique_temp_path("prompts_test");
@@ -806,21 +939,22 @@ mod tests {
     }
 
     #[test]
-    fn gather_project_context_caps_at_200_lines() {
+    fn gather_project_context_caps_at_explicit_line_cap() {
         let dir = make_temp_dir();
         let _guard = TempDir(dir.clone());
 
-        // Create 250 files at the root level to exceed the 200 line budget.
+        // Create 250 files at the root level to exceed an explicit 200 line budget.
         for i in 0..250 {
             fs::write(dir.join(format!("file_{i:04}.txt")), "").unwrap();
         }
 
-        let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
+        let cap = 200;
+        let output = gather_project_context(&dir, cap, EXCERPT_MAX_LINES);
         let line_count = output.lines().count();
 
         assert!(
-            line_count <= LINE_CAP,
-            "output should be capped at {LINE_CAP} lines, got {line_count}"
+            line_count <= cap,
+            "output should be capped at {cap} lines, got {line_count}"
         );
     }
 
@@ -829,11 +963,27 @@ mod tests {
         let dir = make_temp_dir();
         let _guard = TempDir(dir.clone());
 
-        // Create a README.md with 150 lines (only first 100 should appear).
+        // Create a README.md with 150 lines — unlimited excerpt includes all.
         let readme_lines: Vec<String> = (1..=150).map(|i| format!("readme line {i}")).collect();
         fs::write(dir.join("README.md"), readme_lines.join("\n")).unwrap();
 
         let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
+
+        assert!(output.contains("README.md:"));
+        assert!(output.contains("readme line 1"));
+        assert!(output.contains("readme line 150"));
+    }
+
+    #[test]
+    fn gather_project_context_includes_readme_excerpt_with_explicit_cap() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        // Create a README.md with 150 lines (only first 100 should appear with explicit cap).
+        let readme_lines: Vec<String> = (1..=150).map(|i| format!("readme line {i}")).collect();
+        fs::write(dir.join("README.md"), readme_lines.join("\n")).unwrap();
+
+        let output = gather_project_context(&dir, LINE_CAP, 100);
 
         assert!(output.contains("README.md (first 100 lines):"));
         assert!(output.contains("readme line 1"));
@@ -850,7 +1000,7 @@ mod tests {
 
         let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
-        assert!(output.contains("CLAUDE.md (first 100 lines):"));
+        assert!(output.contains("CLAUDE.md:"));
         assert!(output.contains("agent conventions here"));
         assert!(output.contains("second line"));
     }
@@ -867,11 +1017,11 @@ mod tests {
         fs::write(dir.join("AGENTS.md"), "agents line").unwrap();
 
         let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
-        assert!(output.contains("README.md (first 100 lines):"));
-        assert!(output.contains("CLAUDE.md (first 100 lines):"));
-        assert!(output.contains("ARCHITECTURE.md (first 100 lines):"));
-        assert!(output.contains("CONVENTIONS.md (first 100 lines):"));
-        assert!(output.contains("AGENTS.md (first 100 lines):"));
+        assert!(output.contains("README.md:"));
+        assert!(output.contains("CLAUDE.md:"));
+        assert!(output.contains("ARCHITECTURE.md:"));
+        assert!(output.contains("CONVENTIONS.md:"));
+        assert!(output.contains("AGENTS.md:"));
     }
 
     #[test]
@@ -882,7 +1032,7 @@ mod tests {
         fs::write(dir.join("README.md"), "readme line").unwrap();
         let output = gather_project_context(&dir, LINE_CAP, EXCERPT_MAX_LINES);
 
-        assert!(output.contains("README.md (first 100 lines):"));
+        assert!(output.contains("README.md:"));
         assert!(!output.contains("ARCHITECTURE.md"));
         assert!(!output.contains("CONVENTIONS.md"));
         assert!(!output.contains("AGENTS.md"));
@@ -1019,6 +1169,8 @@ mod tests {
             config: &config,
             task: "Build feature X",
             plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1040,6 +1192,8 @@ mod tests {
             config: &config,
             task: "Build feature X",
             plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1061,6 +1215,8 @@ mod tests {
             config: &config,
             task: "Build feature X",
             plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1071,6 +1227,137 @@ mod tests {
         assert!(
             !prompt.contains("IMPLEMENTER'S CONCERNS:"),
             "prompt should not include the concerns section when dispute reason is whitespace-only"
+        );
+    }
+
+    #[test]
+    fn planning_reviewer_prompt_includes_context_and_decisions() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            project_context: "PROJECT STRUCTURE:\nsrc/main.rs",
+            decisions: "- [PATTERN] Use repository pattern",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
+
+        assert!(
+            prompt.contains("PROJECT CONTEXT:\nPROJECT STRUCTURE:\nsrc/main.rs"),
+            "reviewer prompt should include project context"
+        );
+        assert!(
+            prompt.contains("PRIOR DECISIONS & LEARNINGS:\n- [PATTERN] Use repository pattern"),
+            "reviewer prompt should include decisions"
+        );
+    }
+
+    #[test]
+    fn planning_reviewer_prompt_omits_context_when_empty() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
+
+        assert!(
+            !prompt.contains("PROJECT CONTEXT:"),
+            "reviewer prompt should omit empty context"
+        );
+        assert!(
+            !prompt.contains("PRIOR DECISIONS"),
+            "reviewer prompt should omit empty decisions"
+        );
+    }
+
+    #[test]
+    fn planning_reviewer_prompt_includes_review_md_write_instruction() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
+
+        assert!(
+            prompt.contains("Write your complete review"),
+            "reviewer prompt should instruct writing to review.md"
+        );
+        assert!(
+            prompt.contains("review.md"),
+            "reviewer prompt should reference review.md path"
+        );
+    }
+
+    #[test]
+    fn planning_reviewer_prompt_requires_file_refs_in_findings() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
+
+        assert!(
+            prompt.contains("file_refs"),
+            "reviewer prompt should require file_refs in findings"
+        );
+    }
+
+    #[test]
+    fn planning_reviewer_prompt_includes_codebase_verification_section() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
+            config: &config,
+            task: "Build feature X",
+            plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
+            round: 1,
+            prompt_timestamp: "2026-02-15T00:00:00.000Z",
+            paths: &paths,
+            dispute_reason: None,
+            open_findings: "",
+        });
+
+        assert!(
+            prompt.contains("Codebase Verification"),
+            "reviewer prompt should contain codebase verification section"
+        );
+        assert!(
+            prompt.contains("Do NOT trust the plan at face value"),
+            "reviewer prompt should instruct not trusting plan at face value"
         );
     }
 
@@ -1356,6 +1643,8 @@ mod tests {
             config: &config,
             task: "Build feature X",
             plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1366,6 +1655,10 @@ mod tests {
         assert!(
             prompt.contains("## Completeness"),
             "missing Completeness section"
+        );
+        assert!(
+            prompt.contains("## Accuracy"),
+            "missing Accuracy section"
         );
         assert!(
             prompt.contains("## Feasibility"),
@@ -1413,6 +1706,8 @@ mod tests {
             config: &config,
             task: "Build feature X",
             plan: "1. Implement it",
+            project_context: "",
+            decisions: "",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1607,6 +1902,178 @@ mod tests {
         assert!(
             prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
             "missing timestamp in JSON status"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // planning_adversarial_review_prompt
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn planning_adversarial_prompt_contains_task_plan_and_first_review() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Build feature X",
+            "1. Implement it\n2. Test it",
+            "First review: plan looks solid",
+            "",
+            "",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("Build feature X"),
+            "planning adversarial prompt should contain the task"
+        );
+        assert!(
+            prompt.contains("1. Implement it\n2. Test it"),
+            "planning adversarial prompt should contain the plan"
+        );
+        assert!(
+            prompt.contains("First review: plan looks solid"),
+            "planning adversarial prompt should contain the first review"
+        );
+    }
+
+    #[test]
+    fn planning_adversarial_prompt_contains_guardrail_and_framing() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "First review",
+            "",
+            "",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("find what they missed"),
+            "planning adversarial prompt should contain adversarial framing"
+        );
+        assert!(
+            prompt.contains("Do not manufacture issues"),
+            "planning adversarial prompt should contain guardrail text"
+        );
+        assert!(
+            prompt.contains("PA-001"),
+            "planning adversarial prompt should use PA-xxx finding IDs"
+        );
+    }
+
+    #[test]
+    fn planning_adversarial_prompt_includes_context_when_provided() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "First review",
+            "PROJECT STRUCTURE:\nsrc/main.rs",
+            "- [PATTERN] Use repository pattern",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("PROJECT CONTEXT:\nPROJECT STRUCTURE:\nsrc/main.rs"),
+            "planning adversarial prompt should include project context"
+        );
+        assert!(
+            prompt.contains("PRIOR DECISIONS & LEARNINGS:\n- [PATTERN] Use repository pattern"),
+            "planning adversarial prompt should include decisions"
+        );
+    }
+
+    #[test]
+    fn planning_adversarial_prompt_omits_context_when_empty() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "First review",
+            "",
+            "",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            !prompt.contains("PROJECT CONTEXT:"),
+            "planning adversarial prompt should omit empty context"
+        );
+        assert!(
+            !prompt.contains("PRIOR DECISIONS"),
+            "planning adversarial prompt should omit empty decisions"
+        );
+    }
+
+    #[test]
+    fn planning_adversarial_prompt_includes_json_status_templates() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "First review",
+            "",
+            "",
+            2,
+            "2026-02-15T12:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("\"status\": \"APPROVED\""),
+            "missing APPROVED JSON status"
+        );
+        assert!(
+            prompt.contains("\"status\": \"NEEDS_REVISION\""),
+            "missing NEEDS_REVISION JSON status"
+        );
+        assert!(
+            prompt.contains("\"round\": 2"),
+            "missing round in JSON status"
+        );
+        assert!(
+            prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
+            "missing timestamp in JSON status"
+        );
+    }
+
+    #[test]
+    fn planning_adversarial_prompt_requires_file_refs_in_findings() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = planning_adversarial_review_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "First review",
+            "",
+            "",
+            1,
+            "2026-02-15T00:00:00.000Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("file_refs"),
+            "planning adversarial prompt should require file_refs in findings"
         );
     }
 

@@ -250,6 +250,54 @@ claude_session_persistence = true
 codex_session_persistence = true
 ```
 
+## Review Process
+
+agent-loop uses structured review at every phase. Reviewers are instructed to use
+their available tools (Read, Grep, Glob) to verify claims against the actual codebase.
+
+### Plan Review
+
+After the planner creates a plan, the reviewer validates it:
+
+1. **Primary review** — Evaluates completeness, accuracy, feasibility, and risks.
+   The reviewer must use codebase tools to spot-check plan claims:
+   - Verify referenced file paths exist and contain what the plan assumes
+   - Verify routes/endpoints return expected content types (HTML vs JSON vs redirect vs binary)
+   - Verify database seeders/migrations have correct call chains and dependency order
+   - Verify auth flows match actual validation rules (required fields, middleware)
+   - Verify API payloads match controller/request validation requirements
+   - Verify waiver/exclusion lists are complete
+
+2. **Adversarial review** (dual-agent only) — After the first reviewer approves, the
+   implementer agent performs an adversarial pass focused on what the first reviewer
+   missed. Uses `PA-xxx` finding IDs. Skipped in single-agent mode or when
+   `planning_adversarial_review = false`.
+
+Findings are tracked in `planning_findings.json` with IDs (`P-001`, `PA-001`, ...).
+Reviewers must cite `file_refs` in their review to evidence each issue.
+Consensus requires all findings to be resolved.
+
+### Task Decomposition Review
+
+After plan consensus, the decomposition reviewer validates the task breakdown:
+- Task scope and deliverables clarity
+- Task size reasonableness
+- Dependencies correctly identified and ordered
+- Missing tasks
+- Testing/verification steps included
+
+### Implementation Review
+
+After each implementation round, the reviewer evaluates:
+- **Correctness** — code matches plan, no bugs or edge cases
+- **Tests** — present, sufficient, covering key scenarios
+- **Style** — clean, maintainable, follows project conventions
+- **Security** — vulnerabilities, error handling adequacy
+
+Implementation findings use `F-xxx` IDs with severity levels (HIGH/MEDIUM/LOW)
+and a quality rating (1-5). A perfect 5/5 triggers an additional adversarial review
+to catch what the first reviewer missed.
+
 ## Decisions And Compound
 
 `agent-loop` persists reusable learnings in:
@@ -315,8 +363,8 @@ decisions_max_lines = 50
 max_parallel = 1
 batch_implement = true
 diff_max_lines = 500
-context_line_cap = 200
-planning_context_excerpt_lines = 100
+context_line_cap = 0                    # 0 = unlimited (default); set to limit prompt size
+planning_context_excerpt_lines = 0      # 0 = unlimited (default); set to limit per-file excerpts
 
 # Model selection
 implementer_model = "claude-sonnet-4-6"
@@ -329,6 +377,7 @@ reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
 
 # Progressive context
 progressive_context = false
+planning_adversarial_review = true      # adversarial second review of plans (dual-agent only)
 
 # Session persistence
 claude_session_persistence = true
@@ -384,6 +433,7 @@ Core:
 - `DIFF_MAX_LINES`
 - `CONTEXT_LINE_CAP`
 - `PLANNING_CONTEXT_EXCERPT_LINES`
+- `PLANNING_ADVERSARIAL_REVIEW` (default: 1)
 - `BATCH_IMPLEMENT` (default: 1)
 - `MAX_PARALLEL` (default: 1)
 - `VERBOSE`

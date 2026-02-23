@@ -14,8 +14,9 @@ use crate::{
         decomposition_reviewer_prompt, decomposition_revision_prompt, gather_project_context,
         implementation_adversarial_review_prompt, implementation_consensus_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
-        planning_implementer_revision_prompt, planning_implementer_signoff_prompt,
-        planning_initial_prompt, planning_reviewer_prompt, state_manifest, system_prompt_for_role,
+        planning_adversarial_review_prompt, planning_implementer_revision_prompt,
+        planning_implementer_signoff_prompt, planning_initial_prompt, planning_reviewer_prompt,
+        state_manifest, system_prompt_for_role,
     },
     state::{
         FindingEntry, FindingsFile, LoopStatus, Status, StatusPatch, append_decision,
@@ -579,6 +580,15 @@ fn requires_dual_agent_signoff(config: &Config) -> bool {
     !config.single_agent
 }
 
+/// Check whether adversarial planning review should run.
+/// Requires: dual-agent mode, toggle enabled, and different agents for
+/// implementer vs reviewer (same agent = same model = no independence benefit).
+fn planning_adversarial_enabled(config: &Config) -> bool {
+    !config.single_agent
+        && config.planning_adversarial_review
+        && config.implementer.name() != config.reviewer.name()
+}
+
 fn round_limit_reached(round: u32, max_rounds: u32) -> bool {
     round >= max_rounds
 }
@@ -870,6 +880,113 @@ fn run_agent_or_record_error(
     workflow: &str,
 ) -> bool {
     run_agent_with_output_or_record_error(config, agent, prompt, round, role, workflow).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Planning revision helper
+// ---------------------------------------------------------------------------
+
+/// Outcome from running the implementer revision step during planning.
+enum PlanningRevisionOutcome {
+    /// Agent call failed — caller should return false.
+    AgentFailed,
+    /// Implementer accepted the revised plan.
+    Consensus,
+    /// Implementer continues to next round (possibly with concerns).
+    Continue { dispute_reason: Option<String> },
+}
+
+/// Run the implementer revision step: let the planner review a revised plan,
+/// handle stale/error statuses, and determine the outcome.
+fn run_planning_implementer_revision(
+    config: &Config,
+    planner_agent: &Agent,
+    task: &str,
+    reviewer_reason: &str,
+    round: u32,
+    paths: &crate::prompts::PhasePaths,
+) -> PlanningRevisionOutcome {
+    let _ = log("🔍 Implementer reviewing revised plan...", config);
+    let revised_plan = read_state_file("plan.md", config);
+    let implementer_prompt_timestamp = timestamp();
+    if !run_agent_or_record_error(
+        config,
+        planner_agent,
+        &planning_implementer_revision_prompt(
+            config,
+            task,
+            &revised_plan,
+            reviewer_reason,
+            round,
+            &implementer_prompt_timestamp,
+            paths,
+        ),
+        Some(round),
+        AgentRole::Implementer,
+        "plan",
+    ) {
+        return PlanningRevisionOutcome::AgentFailed;
+    }
+
+    let mut implementer_status = read_status(config);
+    if implementer_status.status != Status::Error
+        && is_status_stale(&implementer_prompt_timestamp, &implementer_status)
+    {
+        let _ = log(
+            "⚠️ Stale status detected after planning implementer revision — writing NeedsRevision fallback",
+            config,
+        );
+        warn_on_status_write(
+            "NEEDS_REVISION",
+            StatusPatch {
+                status: Some(Status::NeedsRevision),
+                round: Some(round),
+                reason: Some(STALE_TIMESTAMP_REASON.to_string()),
+                ..StatusPatch::default()
+            },
+            config,
+        );
+        implementer_status = read_status(config);
+    }
+
+    if implementer_status.status == Status::Error {
+        write_error_status(
+            config,
+            Some(round),
+            status_error_reason(&implementer_status),
+        );
+        return PlanningRevisionOutcome::AgentFailed;
+    }
+
+    if planning_implementer_reached_consensus(implementer_status.status) {
+        let _ = log("✅ Both agents agreed on the plan!", config);
+        return PlanningRevisionOutcome::Consensus;
+    }
+
+    let dispute = if implementer_status.status == Status::Disputed {
+        implementer_status
+            .reason
+            .as_deref()
+            .filter(|r| !r.trim().is_empty())
+            .map(ToOwned::to_owned)
+    } else {
+        None
+    };
+
+    let _ = log(
+        &format!(
+            "📝 Implementer has concerns: {}",
+            implementer_status
+                .reason
+                .as_deref()
+                .unwrap_or("see plan.md")
+        ),
+        config,
+    );
+
+    PlanningRevisionOutcome::Continue {
+        dispute_reason: dispute,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,15 +1677,21 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         let open_findings_text =
             crate::state::open_planning_findings_for_prompt(&planning_findings);
 
+        // Clear review.md before each reviewer round to prevent stale content
+        // from a previous round bleeding into verdict/findings parsing.
+        let _ = write_state_file("review.md", "", config);
+
         let _ = log("🔍 Reviewer evaluating plan...", config);
         let reviewer_prompt_timestamp = timestamp();
-        if !run_agent_or_record_error(
+        let reviewer_output = match run_agent_with_output_or_record_error(
             config,
             &config.reviewer,
             &planning_reviewer_prompt(&PlanningReviewerParams {
                 config,
                 task: &task,
                 plan: &plan,
+                project_context: &project_context,
+                decisions: &decisions,
                 round: planning_round,
                 prompt_timestamp: &reviewer_prompt_timestamp,
                 paths: &paths,
@@ -1579,7 +1702,14 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             AgentRole::Reviewer,
             "plan",
         ) {
-            return false;
+            Some(output) => output,
+            None => return false,
+        };
+
+        // Fallback: if agent didn't write to review.md, persist its captured output
+        let review_file = read_state_file("review.md", config);
+        if review_file.trim().is_empty() && !reviewer_output.trim().is_empty() {
+            let _ = write_state_file("review.md", &reviewer_output, config);
         }
 
         let mut review_status = read_status(config);
@@ -1661,90 +1791,126 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     config,
                 );
 
-                let _ = log("🔍 Implementer reviewing revised plan...", config);
-                let revised_plan = read_state_file("plan.md", config);
-                let implementer_prompt_timestamp = timestamp();
-                if !run_agent_or_record_error(
+                match run_planning_implementer_revision(
                     config,
                     &planner_agent,
-                    &planning_implementer_revision_prompt(
-                        config,
-                        &task,
-                        &revised_plan,
-                        review_status
-                            .reason
-                            .as_deref()
-                            .unwrap_or("See plan revisions"),
-                        planning_round,
-                        &implementer_prompt_timestamp,
-                        &paths,
-                    ),
-                    Some(planning_round),
-                    AgentRole::Implementer,
-                    "plan",
-                ) {
-                    return false;
-                }
-
-                let mut implementer_status = read_status(config);
-                if implementer_status.status != Status::Error
-                    && is_status_stale(&implementer_prompt_timestamp, &implementer_status)
-                {
-                    let _ = log(
-                        "⚠️ Stale status detected after planning implementer revision — writing NeedsRevision fallback",
-                        config,
-                    );
-                    warn_on_status_write(
-                        "NEEDS_REVISION",
-                        StatusPatch {
-                            status: Some(Status::NeedsRevision),
-                            round: Some(planning_round),
-                            reason: Some(STALE_TIMESTAMP_REASON.to_string()),
-                            ..StatusPatch::default()
-                        },
-                        config,
-                    );
-                    implementer_status = read_status(config);
-                }
-
-                if implementer_status.status == Status::Error {
-                    write_error_status(
-                        config,
-                        Some(planning_round),
-                        status_error_reason(&implementer_status),
-                    );
-                    return false;
-                }
-
-                if planning_implementer_reached_consensus(implementer_status.status) {
-                    let _ = log("✅ Both agents agreed on the plan!", config);
-                    reached_consensus = true;
-                    break;
-                }
-
-                dispute_reason = if implementer_status.status == Status::Disputed {
-                    implementer_status
+                    &task,
+                    review_status
                         .reason
                         .as_deref()
-                        .filter(|r| !r.trim().is_empty())
-                        .map(ToOwned::to_owned)
-                } else {
-                    None
-                };
-
-                let _ = log(
-                    &format!(
-                        "📝 Implementer has concerns: {}",
-                        implementer_status
-                            .reason
-                            .as_deref()
-                            .unwrap_or("see plan.md")
-                    ),
-                    config,
-                );
+                        .unwrap_or("See plan revisions"),
+                    planning_round,
+                    &paths,
+                ) {
+                    PlanningRevisionOutcome::AgentFailed => return false,
+                    PlanningRevisionOutcome::Consensus => {
+                        reached_consensus = true;
+                        break;
+                    }
+                    PlanningRevisionOutcome::Continue { dispute_reason: dr } => {
+                        dispute_reason = dr;
+                    }
+                }
             }
             PlanningReviewerAction::Approved => {
                 if requires_dual_agent_signoff(config) {
+                    // --- Adversarial planning review (dual-agent only) ---
+                    if planning_adversarial_enabled(config) {
+                        let first_review = read_state_file("review.md", config);
+                        let _ = log(
+                            "🔍 Running adversarial second review of plan...",
+                            config,
+                        );
+
+                        let adversarial_output = match run_agent_with_output_or_record_error(
+                            config,
+                            &config.implementer,
+                            &planning_adversarial_review_prompt(
+                                config,
+                                &task,
+                                &read_state_file("plan.md", config),
+                                &first_review,
+                                &project_context,
+                                &decisions,
+                                planning_round,
+                                &timestamp(),
+                                &paths,
+                            ),
+                            Some(planning_round),
+                            AgentRole::Reviewer,
+                            "plan-adversarial",
+                        ) {
+                            Some(output) => output,
+                            None => return false,
+                        };
+
+                        // Parse adversarial verdict and findings
+                        let adversarial_verdict = parse_planning_verdict(&adversarial_output);
+                        let adversarial_findings =
+                            parse_planning_findings_from_output(&adversarial_output, planning_round);
+
+                        let (adversarial_action, adversarial_updated) = reconcile_planning_verdict(
+                            adversarial_verdict,
+                            adversarial_findings,
+                            &updated_findings,
+                            &read_status(config),
+                            planning_round,
+                            config,
+                        );
+
+                        // Persist merged findings
+                        let _ = crate::state::write_planning_findings(&adversarial_updated, config);
+
+                        let adversarial_summary = format!(
+                            "Adversarial: {} (verdict: {})",
+                            if adversarial_action == PlanningReviewerAction::NeedsRevision {
+                                "REVISE"
+                            } else {
+                                "APPROVED"
+                            },
+                            adversarial_verdict.unwrap_or("none"),
+                        );
+                        crate::state::append_planning_progress(
+                            planning_round,
+                            &adversarial_summary,
+                            config,
+                        );
+
+                        if adversarial_action == PlanningReviewerAction::NeedsRevision {
+                            let _ = log(
+                                "📝 Adversarial reviewer found issues — requesting revision",
+                                config,
+                            );
+                            match run_planning_implementer_revision(
+                                config,
+                                &planner_agent,
+                                &task,
+                                "Adversarial review found issues the first reviewer missed",
+                                planning_round,
+                                &paths,
+                            ) {
+                                PlanningRevisionOutcome::AgentFailed => return false,
+                                PlanningRevisionOutcome::Consensus => {
+                                    reached_consensus = true;
+                                    break;
+                                }
+                                PlanningRevisionOutcome::Continue { dispute_reason: dr } => {
+                                    dispute_reason = dr;
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let _ = log("✅ Adversarial reviewer approved the plan", config);
+                    } else if !config.single_agent
+                        && config.implementer.name() == config.reviewer.name()
+                    {
+                        let _ = log(
+                            "⚠️ Adversarial planning review skipped: implementer and reviewer are the same agent",
+                            config,
+                        );
+                    }
+
                     // Dual-agent: require implementer signoff before finalizing.
                     let _ = log("🔍 Implementer reviewing approved plan...", config);
                     let approved_plan = read_state_file("plan.md", config);
@@ -4094,6 +4260,155 @@ mod tests {
             },
         );
         assert!(!requires_dual_agent_signoff(&config));
+    }
+
+    // -----------------------------------------------------------------------
+    // planning_adversarial_enabled guard
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn planning_adversarial_enabled_true_for_dual_agent_different_agents() {
+        let config = test_config(); // dual-agent, adversarial=true, claude/codex
+        assert!(planning_adversarial_enabled(&config));
+    }
+
+    #[test]
+    fn planning_adversarial_enabled_false_for_single_agent() {
+        let root = create_temp_project_root("phases_adv_single");
+        let config = make_test_config(
+            &root,
+            TestConfigOptions {
+                single_agent: true,
+                ..Default::default()
+            },
+        );
+        assert!(!planning_adversarial_enabled(&config));
+    }
+
+    #[test]
+    fn planning_adversarial_enabled_false_when_toggle_off() {
+        let root = create_temp_project_root("phases_adv_toggle_off");
+        let config = make_test_config(
+            &root,
+            TestConfigOptions {
+                planning_adversarial_review: false,
+                ..Default::default()
+            },
+        );
+        assert!(!planning_adversarial_enabled(&config));
+    }
+
+    #[test]
+    fn planning_adversarial_enabled_false_when_same_agent() {
+        use crate::config::Agent;
+        let root = create_temp_project_root("phases_adv_same_agent");
+        let mut config = make_test_config(&root, TestConfigOptions::default());
+        // Force implementer == reviewer (same model = no independence).
+        config.implementer = Agent::known("claude");
+        config.reviewer = Agent::known("claude");
+        assert!(!planning_adversarial_enabled(&config));
+    }
+
+    // -----------------------------------------------------------------------
+    // PA-xxx findings reconciliation with existing P-xxx findings
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn reconcile_planning_verdict_merges_pa_findings_with_existing_p_findings() {
+        use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
+
+        let config = test_config();
+
+        // Existing P-xxx findings from primary reviewer
+        let existing = PlanningFindingsFile {
+            findings: vec![PlanningFindingEntry {
+                id: "P-001".to_string(),
+                description: "Missing error handling".to_string(),
+                status: PlanningFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(1),
+            }],
+        };
+
+        // New PA-xxx findings from adversarial reviewer
+        let adversarial_findings = vec![PlanningFindingEntry {
+            id: "PA-001".to_string(),
+            description: "Route returns SVG not HTML".to_string(),
+            status: PlanningFindingStatus::Open,
+            round_introduced: 1,
+            round_resolved: None,
+        }];
+
+        let review_status = LoopStatus {
+            status: Status::NeedsRevision,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: Some("Adversarial review found issues".to_string()),
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        let (action, merged) = reconcile_planning_verdict(
+            Some("REVISE"),
+            adversarial_findings,
+            &existing,
+            &review_status,
+            1,
+            &config,
+        );
+
+        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
+        // Both P-001 (resolved) and PA-001 (open) should be in merged findings
+        assert_eq!(merged.findings.len(), 2);
+        assert!(merged.findings.iter().any(|f| f.id == "P-001"));
+        assert!(merged.findings.iter().any(|f| f.id == "PA-001"));
+        let pa = merged.findings.iter().find(|f| f.id == "PA-001").unwrap();
+        assert_eq!(pa.status, PlanningFindingStatus::Open);
+    }
+
+    #[test]
+    fn reconcile_planning_verdict_adversarial_approved_with_no_open_findings() {
+        use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
+
+        let config = test_config();
+
+        // All existing findings resolved
+        let existing = PlanningFindingsFile {
+            findings: vec![PlanningFindingEntry {
+                id: "P-001".to_string(),
+                description: "Missing error handling".to_string(),
+                status: PlanningFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(1),
+            }],
+        };
+
+        let review_status = LoopStatus {
+            status: Status::Approved,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "plan".to_string(),
+            reason: None,
+            rating: None,
+            timestamp: String::new(),
+        };
+
+        // Adversarial reviewer found no issues
+        let (action, _) = reconcile_planning_verdict(
+            Some("APPROVED"),
+            vec![],
+            &existing,
+            &review_status,
+            1,
+            &config,
+        );
+
+        assert_eq!(action, PlanningReviewerAction::Approved);
     }
 
     // -----------------------------------------------------------------------

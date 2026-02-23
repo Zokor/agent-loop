@@ -13,9 +13,9 @@ pub const DEFAULT_DECOMPOSITION_MAX_ROUNDS: u32 = 3;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const DEFAULT_DIFF_MAX_LINES: u32 = 500;
 #[allow(dead_code)]
-pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 200;
+pub const DEFAULT_CONTEXT_LINE_CAP: u32 = 0;
 #[allow(dead_code)]
-pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 100;
+pub const DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES: u32 = 0;
 pub const DEFAULT_MAX_PARALLEL: u32 = 1;
 pub const DEFAULT_DECISIONS_MAX_LINES: u32 = 50;
 pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob,WebFetch";
@@ -117,6 +117,9 @@ struct FileConfig {
 
     /// Replace front-loaded project context with on-demand state manifest.
     progressive_context: Option<bool>,
+
+    /// Run an adversarial second review of plans (dual-agent only, default true).
+    planning_adversarial_review: Option<bool>,
 
     // ── Stuck detection ─────────────────────────────────────────────
     /// Enable stuck detection in the implementation loop.
@@ -271,6 +274,10 @@ pub struct Config {
     /// When true, replace front-loaded context with a compact state manifest.
     pub progressive_context: bool,
 
+    // ── Planning adversarial review ──────────────────────────────
+    /// Run an adversarial second review of plans (dual-agent only).
+    pub planning_adversarial_review: bool,
+
     // ── Stuck detection ─────────────────────────────────────────────
     /// Enable stuck detection in the implementation loop.
     pub stuck_detection_enabled: bool,
@@ -324,12 +331,20 @@ impl Config {
     }
 
     pub fn effective_context_line_cap(&self) -> u32 {
-        self.context_line_cap.unwrap_or(DEFAULT_CONTEXT_LINE_CAP)
+        match self.context_line_cap.unwrap_or(DEFAULT_CONTEXT_LINE_CAP) {
+            0 => u32::MAX,
+            v => v,
+        }
     }
 
     pub fn effective_planning_context_excerpt_lines(&self) -> u32 {
-        self.planning_context_excerpt_lines
+        match self
+            .planning_context_excerpt_lines
             .unwrap_or(DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES)
+        {
+            0 => u32::MAX,
+            v => v,
+        }
     }
 
     /// Clone this config with a different state_dir and auto_commit disabled.
@@ -480,6 +495,9 @@ impl Config {
         let progressive_context = env_bool("PROGRESSIVE_CONTEXT")
             .or(file.progressive_context)
             .unwrap_or(false);
+        let planning_adversarial_review = env_bool("PLANNING_ADVERSARIAL_REVIEW")
+            .or(file.planning_adversarial_review)
+            .unwrap_or(true);
 
         // --- stuck detection: env > TOML > default ---
         let stuck_detection_enabled = env_bool("STUCK_DETECTION_ENABLED")
@@ -564,6 +582,7 @@ impl Config {
             batch_implement,
             verbose,
             progressive_context,
+            planning_adversarial_review,
             stuck_detection_enabled,
             stuck_no_diff_rounds,
             stuck_threshold_minutes,
@@ -900,6 +919,7 @@ pub fn generate_default_config_template() -> String {
 # planning_context_excerpt_lines = {planning_context_excerpt_lines}
 # batch_implement = true
 # progressive_context = false
+# planning_adversarial_review = true      # adversarial second review of plans (dual-agent only)
 
 # ── Agents ───────────────────────────────────────────────────────────────────
 # implementer = "claude"
@@ -2018,15 +2038,12 @@ planning_context_excerpt_lines = 75
         assert_eq!(config.diff_max_lines, None);
         assert_eq!(config.context_line_cap, None);
         assert_eq!(config.planning_context_excerpt_lines, None);
-        // Effective helpers still return defaults
+        // Effective helpers return defaults (0 = unlimited → u32::MAX)
         assert_eq!(config.effective_diff_max_lines(), DEFAULT_DIFF_MAX_LINES);
-        assert_eq!(
-            config.effective_context_line_cap(),
-            DEFAULT_CONTEXT_LINE_CAP
-        );
+        assert_eq!(config.effective_context_line_cap(), u32::MAX);
         assert_eq!(
             config.effective_planning_context_excerpt_lines(),
-            DEFAULT_PLANNING_CONTEXT_EXCERPT_LINES
+            u32::MAX
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2480,6 +2497,12 @@ planning_context_excerpt_lines = 75
             "missing planner agent default line"
         );
 
+        // planning_adversarial_review should appear in the template
+        assert!(
+            template.contains("planning_adversarial_review"),
+            "missing planning_adversarial_review in template"
+        );
+
         // All value lines should be commented out
         for line in template.lines() {
             let trimmed = line.trim();
@@ -2489,5 +2512,83 @@ planning_context_excerpt_lines = 75
             }
             panic!("found uncommented value line: {trimmed}");
         }
+    }
+
+    #[test]
+    fn planning_adversarial_review_defaults_to_true() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_adversarial_default");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(
+            config.planning_adversarial_review,
+            "planning_adversarial_review should default to true"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planning_adversarial_review_can_be_disabled_via_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_adversarial_toml");
+        write_toml(&dir, "planning_adversarial_review = false\n");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(
+            !config.planning_adversarial_review,
+            "planning_adversarial_review should be disabled via TOML"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn planning_adversarial_review_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_adversarial_env");
+        write_toml(&dir, "planning_adversarial_review = true\n");
+        set_env("PLANNING_ADVERSARIAL_REVIEW", "0");
+
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(
+            !config.planning_adversarial_review,
+            "env PLANNING_ADVERSARIAL_REVIEW=0 should override TOML"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_context_line_cap_treats_zero_as_unlimited() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_ctx_zero");
+        write_toml(&dir, "context_line_cap = 0\n");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(
+            config.effective_context_line_cap(),
+            u32::MAX,
+            "context_line_cap = 0 should map to u32::MAX"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn effective_planning_context_excerpt_lines_treats_zero_as_unlimited() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_excerpt_zero");
+        write_toml(&dir, "planning_context_excerpt_lines = 0\n");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert_eq!(
+            config.effective_planning_context_excerpt_lines(),
+            u32::MAX,
+            "planning_context_excerpt_lines = 0 should map to u32::MAX"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
