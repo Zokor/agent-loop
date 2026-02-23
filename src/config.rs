@@ -457,15 +457,18 @@ impl Config {
         }
 
         // --- numeric: override > env > TOML > default ---
-        let review_max_rounds = review_max_rounds_override.unwrap_or_else(|| {
-            parse_env("REVIEW_MAX_ROUNDS")
+        // Round-limit env vars use strict parsing: invalid values fail instead
+        // of silently falling back to defaults.
+        let review_max_rounds = match review_max_rounds_override {
+            Some(v) => v,
+            None => strict_parse_env("REVIEW_MAX_ROUNDS")?
                 .or(file.review_max_rounds)
-                .unwrap_or(DEFAULT_REVIEW_MAX_ROUNDS)
-        });
-        let planning_max_rounds = parse_env("PLANNING_MAX_ROUNDS")
+                .unwrap_or(DEFAULT_REVIEW_MAX_ROUNDS),
+        };
+        let planning_max_rounds = strict_parse_env("PLANNING_MAX_ROUNDS")?
             .or(file.planning_max_rounds)
             .unwrap_or(DEFAULT_PLANNING_MAX_ROUNDS);
-        let decomposition_max_rounds = parse_env("DECOMPOSITION_MAX_ROUNDS")
+        let decomposition_max_rounds = strict_parse_env("DECOMPOSITION_MAX_ROUNDS")?
             .or(file.decomposition_max_rounds)
             .unwrap_or(DEFAULT_DECOMPOSITION_MAX_ROUNDS);
         let timeout_seconds = parse_env("TIMEOUT")
@@ -697,6 +700,19 @@ fn load_file_config(project_dir: &Path) -> Result<FileConfigResult, AgentLoopErr
         }
     };
 
+    // Pre-parse check: detect legacy `max_rounds` key before serde
+    // deserialization so that non-u32 values (e.g. -1, "foo") still get the
+    // migration rename error instead of a generic type/parse failure.
+    if let Ok(table) = content.parse::<toml::Table>()
+        && table.contains_key("max_rounds")
+    {
+        return Err(AgentLoopError::Config(format!(
+            "`max_rounds` was renamed to `review_max_rounds` in {}. \
+             Please update your config file.",
+            path.display()
+        )));
+    }
+
     let config = toml::from_str::<FileConfig>(&content).map_err(|err| {
         AgentLoopError::Config(format!("failed to parse {}: {err}", path.display()))
     })?;
@@ -782,6 +798,19 @@ pub fn resolve_run_mode(single_agent: bool) -> RunMode {
 
 fn parse_env<T: FromStr>(key: &str) -> Option<T> {
     env::var(key).ok().and_then(|value| value.parse::<T>().ok())
+}
+
+/// Like `parse_env` but returns an error when the env var is set to a
+/// non-parseable value instead of silently falling back to `None`.
+fn strict_parse_env<T: FromStr>(key: &str) -> Result<Option<T>, AgentLoopError> {
+    match env::var(key) {
+        Err(_) => Ok(None),
+        Ok(value) => value.parse::<T>().map(Some).map_err(|_| {
+            AgentLoopError::Config(format!(
+                "invalid value '{value}' for {key}: expected a non-negative integer"
+            ))
+        }),
+    }
 }
 
 fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
@@ -1417,24 +1446,36 @@ command = "cargo test"
     }
 
     #[test]
-    fn from_cli_uses_safe_defaults_for_invalid_numeric_env_values() {
+    fn from_cli_invalid_round_limit_env_vars_fail_instead_of_defaulting() {
+        // Round-limit env vars use strict parsing and produce config errors
+        // on invalid values (F-001). Non-round-limit env vars like TIMEOUT
+        // still fall back to defaults via parse_env.
         let _guard = env_lock();
         clear_env();
         set_env("REVIEW_MAX_ROUNDS", "not-a-number");
-        set_env("PLANNING_MAX_ROUNDS", "invalid");
-        set_env("DECOMPOSITION_MAX_ROUNDS", "-1");
-        set_env("TIMEOUT", "-1");
 
         let project_dir = create_temp_project_root("cfg_invalid_env");
+        let err = Config::from_cli(project_dir.clone(), false, false)
+            .expect_err("invalid round-limit env should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid value 'not-a-number' for REVIEW_MAX_ROUNDS"),
+            "expected strict parse error, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&project_dir);
+    }
+
+    #[test]
+    fn from_cli_non_round_limit_env_still_falls_back_on_invalid() {
+        // TIMEOUT (non-round-limit) still uses lenient parse_env.
+        let _guard = env_lock();
+        clear_env();
+        set_env("TIMEOUT", "-1");
+
+        let project_dir = create_temp_project_root("cfg_invalid_timeout_env");
         let config =
             Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
-        assert_eq!(config.review_max_rounds, DEFAULT_REVIEW_MAX_ROUNDS);
-        assert_eq!(config.planning_max_rounds, DEFAULT_PLANNING_MAX_ROUNDS);
-        assert_eq!(
-            config.decomposition_max_rounds,
-            DEFAULT_DECOMPOSITION_MAX_ROUNDS
-        );
         assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -2848,6 +2889,130 @@ planning_context_excerpt_lines = 75
         assert!(
             !try_emit_full_access_warning(true, false, true, false, false, true, &guard),
             "second call should be blocked by guard"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // F-001: Invalid round-limit env vars fail with config errors
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn invalid_review_max_rounds_env_fails_with_config_error() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("REVIEW_MAX_ROUNDS", "not-a-number");
+
+        let dir = create_temp_project_root("cfg_invalid_review_env");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("invalid REVIEW_MAX_ROUNDS env should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid value 'not-a-number' for REVIEW_MAX_ROUNDS"),
+            "expected strict parse error, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_planning_max_rounds_env_fails_with_config_error() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("PLANNING_MAX_ROUNDS", "-1");
+
+        let dir = create_temp_project_root("cfg_invalid_planning_env");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("invalid PLANNING_MAX_ROUNDS env should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid value '-1' for PLANNING_MAX_ROUNDS"),
+            "expected strict parse error, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_decomposition_max_rounds_env_fails_with_config_error() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECOMPOSITION_MAX_ROUNDS", "abc");
+
+        let dir = create_temp_project_root("cfg_invalid_decomp_env");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("invalid DECOMPOSITION_MAX_ROUNDS env should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid value 'abc' for DECOMPOSITION_MAX_ROUNDS"),
+            "expected strict parse error, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn valid_round_limit_env_values_still_work() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("REVIEW_MAX_ROUNDS", "10");
+        set_env("PLANNING_MAX_ROUNDS", "5");
+        set_env("DECOMPOSITION_MAX_ROUNDS", "0");
+
+        let dir = create_temp_project_root("cfg_valid_round_env");
+        let config = Config::from_cli(dir.clone(), false, false)
+            .expect("valid round env values should succeed");
+        assert_eq!(config.review_max_rounds, 10);
+        assert_eq!(config.planning_max_rounds, 5);
+        assert_eq!(config.decomposition_max_rounds, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // F-002: Legacy max_rounds TOML rename guidance for non-u32 values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toml_max_rounds_negative_value_gives_rename_guidance() {
+        let dir = create_temp_project_root("toml_old_max_rounds_neg");
+        write_toml(&dir, "max_rounds = -1\n");
+        let err = load_file_config(&dir).expect_err("legacy max_rounds = -1 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("renamed to `review_max_rounds`"),
+            "expected rename guidance even for non-u32 value, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toml_max_rounds_string_value_gives_rename_guidance() {
+        let dir = create_temp_project_root("toml_old_max_rounds_str");
+        write_toml(&dir, "max_rounds = \"foo\"\n");
+        let err = load_file_config(&dir).expect_err("legacy max_rounds = \"foo\" should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("renamed to `review_max_rounds`"),
+            "expected rename guidance even for string value, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Template: constraint comments
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_contains_claude_constraint_comment() {
+        let template = generate_default_config_template();
+        assert!(
+            template.contains("If you need constraints, set claude_full_access = false"),
+            "template should contain Claude constraint comment"
+        );
+    }
+
+    #[test]
+    fn template_contains_codex_constraint_comment() {
+        let template = generate_default_config_template();
+        assert!(
+            template.contains("If you need reduced permissions, set codex_full_access = false"),
+            "template should contain Codex constraint comment"
         );
     }
 }

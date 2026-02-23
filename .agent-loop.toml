@@ -34,6 +34,7 @@
 
 # ── Claude CLI tuning ────────────────────────────────────────────────────────
 # claude_full_access = true
+# If you need constraints, set claude_full_access = false and configure:
 # claude_allowed_tools = "Bash,Read,Edit,Write,Grep,Glob,WebFetch"
 # reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
 # claude_session_persistence = true
@@ -45,6 +46,7 @@
 
 # ── Codex CLI tuning ────────────────────────────────────────────────────────
 # codex_full_access = true
+# If you need reduced permissions, set codex_full_access = false.
 # codex_session_persistence = true
 
 # ── Stuck detection ──────────────────────────────────────────────────────────

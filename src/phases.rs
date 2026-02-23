@@ -602,7 +602,11 @@ fn round_display(round: u32, limit: u32) -> String {
 }
 
 /// Emit a high-watermark warning at round 50, then every 25 rounds.
-fn should_emit_high_watermark(round: u32) -> bool {
+/// Only fires when the loop is running in unlimited mode (`max_rounds == 0`).
+fn should_emit_high_watermark(round: u32, max_rounds: u32) -> bool {
+    if max_rounds > 0 {
+        return false;
+    }
     round == 50 || (round > 50 && (round - 50).is_multiple_of(25))
 }
 
@@ -1678,7 +1682,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             break;
         }
         planning_round += 1;
-        if should_emit_high_watermark(planning_round) {
+        if should_emit_high_watermark(planning_round, config.planning_max_rounds) {
             let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         let _ = log(
@@ -2136,7 +2140,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     let mut round = start_round.saturating_sub(1);
     loop {
         round += 1;
-        if should_emit_high_watermark(round) {
+        if should_emit_high_watermark(round, config.decomposition_max_rounds) {
             let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         let previous_status = read_status(config);
@@ -2586,7 +2590,7 @@ where
     let mut round = start_round.saturating_sub(1);
     loop {
         round += 1;
-        if should_emit_high_watermark(round) {
+        if should_emit_high_watermark(round, config.review_max_rounds) {
             log_fn(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         log_fn(
@@ -4702,5 +4706,58 @@ More text.
         // No third consensus call should happen.
         let role_names: Vec<&str> = agent_calls.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(role_names, vec!["Implementer", "Reviewer"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // F-003: High-watermark warnings only fire in unlimited mode
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn high_watermark_fires_at_thresholds_in_unlimited_mode() {
+        // max_rounds=0 (unlimited): fires at 50, 75, 100
+        assert!(should_emit_high_watermark(50, 0));
+        assert!(should_emit_high_watermark(75, 0));
+        assert!(should_emit_high_watermark(100, 0));
+    }
+
+    #[test]
+    fn high_watermark_does_not_fire_below_threshold_in_unlimited_mode() {
+        assert!(!should_emit_high_watermark(1, 0));
+        assert!(!should_emit_high_watermark(49, 0));
+        assert!(!should_emit_high_watermark(51, 0));
+    }
+
+    #[test]
+    fn high_watermark_suppressed_in_bounded_mode() {
+        // max_rounds>0 (bounded): never fires, even at threshold rounds
+        assert!(!should_emit_high_watermark(50, 100));
+        assert!(!should_emit_high_watermark(75, 100));
+        assert!(!should_emit_high_watermark(100, 200));
+    }
+
+    #[test]
+    fn round_limit_reached_returns_false_for_unlimited() {
+        assert!(!round_limit_reached(999, 0));
+    }
+
+    #[test]
+    fn round_limit_reached_returns_true_at_cap() {
+        assert!(round_limit_reached(10, 10));
+        assert!(round_limit_reached(11, 10));
+    }
+
+    #[test]
+    fn round_limit_reached_returns_false_below_cap() {
+        assert!(!round_limit_reached(9, 10));
+    }
+
+    #[test]
+    fn round_display_formats_unlimited_without_slash() {
+        assert_eq!(round_display(5, 0), "5");
+    }
+
+    #[test]
+    fn round_display_formats_bounded_with_slash() {
+        assert_eq!(round_display(5, 10), "5/10");
     }
 }
