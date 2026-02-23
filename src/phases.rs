@@ -589,22 +589,36 @@ fn planning_adversarial_enabled(config: &Config) -> bool {
         && config.implementer.name() != config.reviewer.name()
 }
 
-fn round_limit_reached(round: u32, max_rounds: u32) -> bool {
-    max_rounds > 0 && round >= max_rounds
+/// Convert a raw round-limit config value into an `Option<u32>`:
+/// `0` means unlimited (`None`), any positive value becomes `Some(limit)`.
+fn normalize_round_limit(limit: u32) -> Option<u32> {
+    match limit {
+        0 => None,
+        n => Some(n),
+    }
 }
 
-fn round_display(round: u32, limit: u32) -> String {
-    if limit == 0 {
-        format!("{round}")
-    } else {
-        format!("{round}/{limit}")
+fn round_limit_reached(round: u32, limit: Option<u32>) -> bool {
+    limit.is_some_and(|cap| round >= cap)
+}
+
+/// Check if rounds are already exhausted before the loop starts.
+/// Uses strict `>` because the start_round itself hasn't executed yet.
+fn rounds_already_exhausted(start_round: u32, limit: Option<u32>) -> bool {
+    limit.is_some_and(|cap| start_round > cap)
+}
+
+fn round_display(round: u32, limit: Option<u32>) -> String {
+    match limit {
+        None => format!("{round}"),
+        Some(cap) => format!("{round}/{cap}"),
     }
 }
 
 /// Emit a high-watermark warning at round 50, then every 25 rounds.
-/// Only fires when the loop is running in unlimited mode (`max_rounds == 0`).
-fn should_emit_high_watermark(round: u32, max_rounds: u32) -> bool {
-    if max_rounds > 0 {
+/// Only fires when the loop is running in unlimited mode (`limit == None`).
+fn should_emit_high_watermark(round: u32, limit: Option<u32>) -> bool {
+    if limit.is_some() {
         return false;
     }
     round == 50 || (round > 50 && (round - 50).is_multiple_of(25))
@@ -1677,18 +1691,20 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let mut reached_consensus = false;
     let mut dispute_reason: Option<String> = None;
 
+    let planning_limit = normalize_round_limit(config.planning_max_rounds);
+
     loop {
-        if round_limit_reached(planning_round, config.planning_max_rounds) {
+        if round_limit_reached(planning_round, planning_limit) {
             break;
         }
         planning_round += 1;
-        if should_emit_high_watermark(planning_round, config.planning_max_rounds) {
+        if should_emit_high_watermark(planning_round, planning_limit) {
             let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         let _ = log(
             &format!(
                 "🔄 Planning consensus round {}",
-                round_display(planning_round, config.planning_max_rounds)
+                round_display(planning_round, planning_limit)
             ),
             config,
         );
@@ -2031,7 +2047,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             }
         }
 
-        if round_limit_reached(planning_round, config.planning_max_rounds) {
+        if round_limit_reached(planning_round, planning_limit) {
             let message = if planning_only {
                 "⚠️ Max planning rounds reached without consensus"
             } else {
@@ -2106,17 +2122,19 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     }
     let start_round = decomposition_start_round(config, resume);
 
+    let decomp_limit = normalize_round_limit(config.decomposition_max_rounds);
+
     if resume {
         let _ = log(
             &format!(
                 "↪ Resuming task decomposition from round {}",
-                round_display(start_round, config.decomposition_max_rounds)
+                round_display(start_round, decomp_limit)
             ),
             config,
         );
     }
 
-    if config.decomposition_max_rounds > 0 && start_round > config.decomposition_max_rounds {
+    if rounds_already_exhausted(start_round, decomp_limit) {
         warn_on_status_write(
             "MAX_ROUNDS",
             StatusPatch {
@@ -2140,7 +2158,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     let mut round = start_round.saturating_sub(1);
     loop {
         round += 1;
-        if should_emit_high_watermark(round, config.decomposition_max_rounds) {
+        if should_emit_high_watermark(round, decomp_limit) {
             let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         let previous_status = read_status(config);
@@ -2185,7 +2203,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             let _ = log(
                 &format!(
                     "📝 Implementer revising task breakdown (round {})...",
-                    round_display(round, config.decomposition_max_rounds)
+                    round_display(round, decomp_limit)
                 ),
                 config,
             );
@@ -2238,7 +2256,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         let _ = log(
             &format!(
                 "🔍 Reviewer validating task breakdown (round {})...",
-                round_display(round, config.decomposition_max_rounds)
+                round_display(round, decomp_limit)
             ),
             config,
         );
@@ -2449,7 +2467,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             config,
         );
 
-        if round_limit_reached(round, config.decomposition_max_rounds) {
+        if round_limit_reached(round, decomp_limit) {
             break;
         }
     }
@@ -2544,17 +2562,19 @@ where
         1
     };
 
+    let review_limit = normalize_round_limit(config.review_max_rounds);
+
     if resume {
         log_fn(
             &format!(
                 "↪ Resuming implementation from round {}",
-                round_display(start_round, config.review_max_rounds)
+                round_display(start_round, review_limit)
             ),
             config,
         );
     }
 
-    if config.review_max_rounds > 0 && start_round > config.review_max_rounds {
+    if rounds_already_exhausted(start_round, review_limit) {
         let task = read_state_file_fn("task.md", config);
         log_fn(
             &format!(
@@ -2590,11 +2610,11 @@ where
     let mut round = start_round.saturating_sub(1);
     loop {
         round += 1;
-        if should_emit_high_watermark(round, config.review_max_rounds) {
+        if should_emit_high_watermark(round, review_limit) {
             log_fn(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
         }
         log_fn(
-            &format!("━━━ Round {} ━━━", round_display(round, config.review_max_rounds)),
+            &format!("━━━ Round {} ━━━", round_display(round, review_limit)),
             config,
         );
         write_status_fn(
@@ -3360,7 +3380,7 @@ where
             }
         }
 
-        if round_limit_reached(round, config.review_max_rounds) {
+        if round_limit_reached(round, review_limit) {
             break;
         }
     }
@@ -4709,55 +4729,86 @@ More text.
     }
 
     // -----------------------------------------------------------------------
-    // F-003: High-watermark warnings only fire in unlimited mode
+    // normalize_round_limit
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_round_limit_zero_is_unlimited() {
+        assert_eq!(normalize_round_limit(0), None);
+    }
+
+    #[test]
+    fn normalize_round_limit_positive_is_bounded() {
+        assert_eq!(normalize_round_limit(10), Some(10));
+        assert_eq!(normalize_round_limit(1), Some(1));
+    }
+
+    #[test]
+    fn rounds_already_exhausted_returns_false_for_unlimited() {
+        assert!(!rounds_already_exhausted(999, None));
+    }
+
+    #[test]
+    fn rounds_already_exhausted_returns_false_at_cap() {
+        // start_round == cap: the round hasn't run yet, so not exhausted
+        assert!(!rounds_already_exhausted(10, Some(10)));
+    }
+
+    #[test]
+    fn rounds_already_exhausted_returns_true_past_cap() {
+        assert!(rounds_already_exhausted(11, Some(10)));
+    }
+
+    // -----------------------------------------------------------------------
+    // High-watermark warnings only fire in unlimited mode
     // -----------------------------------------------------------------------
 
     #[test]
     fn high_watermark_fires_at_thresholds_in_unlimited_mode() {
-        // max_rounds=0 (unlimited): fires at 50, 75, 100
-        assert!(should_emit_high_watermark(50, 0));
-        assert!(should_emit_high_watermark(75, 0));
-        assert!(should_emit_high_watermark(100, 0));
+        // None (unlimited): fires at 50, 75, 100
+        assert!(should_emit_high_watermark(50, None));
+        assert!(should_emit_high_watermark(75, None));
+        assert!(should_emit_high_watermark(100, None));
     }
 
     #[test]
     fn high_watermark_does_not_fire_below_threshold_in_unlimited_mode() {
-        assert!(!should_emit_high_watermark(1, 0));
-        assert!(!should_emit_high_watermark(49, 0));
-        assert!(!should_emit_high_watermark(51, 0));
+        assert!(!should_emit_high_watermark(1, None));
+        assert!(!should_emit_high_watermark(49, None));
+        assert!(!should_emit_high_watermark(51, None));
     }
 
     #[test]
     fn high_watermark_suppressed_in_bounded_mode() {
-        // max_rounds>0 (bounded): never fires, even at threshold rounds
-        assert!(!should_emit_high_watermark(50, 100));
-        assert!(!should_emit_high_watermark(75, 100));
-        assert!(!should_emit_high_watermark(100, 200));
+        // Some(_) (bounded): never fires, even at threshold rounds
+        assert!(!should_emit_high_watermark(50, Some(100)));
+        assert!(!should_emit_high_watermark(75, Some(100)));
+        assert!(!should_emit_high_watermark(100, Some(200)));
     }
 
     #[test]
     fn round_limit_reached_returns_false_for_unlimited() {
-        assert!(!round_limit_reached(999, 0));
+        assert!(!round_limit_reached(999, None));
     }
 
     #[test]
     fn round_limit_reached_returns_true_at_cap() {
-        assert!(round_limit_reached(10, 10));
-        assert!(round_limit_reached(11, 10));
+        assert!(round_limit_reached(10, Some(10)));
+        assert!(round_limit_reached(11, Some(10)));
     }
 
     #[test]
     fn round_limit_reached_returns_false_below_cap() {
-        assert!(!round_limit_reached(9, 10));
+        assert!(!round_limit_reached(9, Some(10)));
     }
 
     #[test]
     fn round_display_formats_unlimited_without_slash() {
-        assert_eq!(round_display(5, 0), "5");
+        assert_eq!(round_display(5, None), "5");
     }
 
     #[test]
     fn round_display_formats_bounded_with_slash() {
-        assert_eq!(round_display(5, 10), "5/10");
+        assert_eq!(round_display(5, Some(10)), "5/10");
     }
 }
