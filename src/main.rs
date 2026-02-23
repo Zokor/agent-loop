@@ -2647,4 +2647,85 @@ mod tests {
             "expected Config error for write failure, got: {result:?}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // environment_help: migration note and default values
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn environment_help_contains_migration_note() {
+        let help = environment_help();
+        assert!(
+            help.contains("MAX_ROUNDS has been renamed to REVIEW_MAX_ROUNDS"),
+            "environment_help() should contain migration note for MAX_ROUNDS rename"
+        );
+    }
+
+    #[test]
+    fn environment_help_shows_unlimited_round_defaults() {
+        let help = environment_help();
+        // All three round-limit defaults should show 0 (unlimited)
+        assert!(
+            help.contains(&format!(
+                "REVIEW_MAX_ROUNDS     (default: {})",
+                DEFAULT_REVIEW_MAX_ROUNDS
+            )),
+            "REVIEW_MAX_ROUNDS default should be 0"
+        );
+        assert!(
+            help.contains(&format!(
+                "PLANNING_MAX_ROUNDS   (default: {})",
+                DEFAULT_PLANNING_MAX_ROUNDS
+            )),
+            "PLANNING_MAX_ROUNDS default should be 0"
+        );
+        assert!(
+            help.contains(&format!(
+                "DECOMPOSITION_MAX_ROUNDS (default: {})",
+                DEFAULT_DECOMPOSITION_MAX_ROUNDS
+            )),
+            "DECOMPOSITION_MAX_ROUNDS default should be 0"
+        );
+    }
+
+    #[test]
+    fn environment_help_shows_full_access_default_on() {
+        let help = environment_help();
+        assert!(
+            help.contains("CLAUDE_FULL_ACCESS    (default: 1)"),
+            "CLAUDE_FULL_ACCESS default should show 1"
+        );
+        assert!(
+            help.contains("CODEX_FULL_ACCESS     (default: 1)"),
+            "CODEX_FULL_ACCESS default should show 1"
+        );
+    }
+
+    #[test]
+    fn environment_help_does_not_list_max_rounds_as_active_setting() {
+        let help = environment_help();
+        // MAX_ROUNDS should only appear in the migration note, not as an active env var setting.
+        // The active setting is REVIEW_MAX_ROUNDS.
+        let lines: Vec<&str> = help.lines().collect();
+        for line in &lines {
+            let trimmed = line.trim();
+            // Skip the migration note line
+            if trimmed.contains("Migration note") {
+                continue;
+            }
+            // No line should list MAX_ROUNDS as a primary env var with a default
+            if trimmed.starts_with("MAX_ROUNDS") && trimmed.contains("(default:") {
+                panic!("MAX_ROUNDS should not appear as an active env var setting: {trimmed}");
+            }
+        }
+    }
+
+    #[test]
+    fn environment_help_contains_round_limit_semantics_note() {
+        let help = environment_help();
+        assert!(
+            help.contains("Round limits: 0 = unlimited"),
+            "environment_help() should document that 0 = unlimited for round limits"
+        );
+    }
 }

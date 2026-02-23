@@ -2742,6 +2742,29 @@ planning_context_excerpt_lines = 75
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn validate_file_config_catches_max_rounds_as_safety_net() {
+        // The pre-parse TOML table scan in load_file_config normally catches
+        // the legacy `max_rounds` key before serde deserializes. This test
+        // exercises the validate_file_config safety net directly, proving the
+        // belt-and-suspenders path produces the same rename guidance even if
+        // the pre-parse is bypassed.
+        let dir = create_temp_project_root("toml_validate_max_rounds");
+        let config = FileConfig {
+            max_rounds: Some(10),
+            ..Default::default()
+        };
+        let path = dir.join(CONFIG_FILE_NAME);
+        let err = validate_file_config(&config, &path)
+            .expect_err("max_rounds should fail validation");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("renamed to `review_max_rounds`"),
+            "expected rename guidance from validate_file_config, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------
     // Full-access defaults
     // -----------------------------------------------------------------------
@@ -3015,5 +3038,71 @@ planning_context_excerpt_lines = 75
             template.contains("If you need reduced permissions, set codex_full_access = false"),
             "template should contain Codex constraint comment"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // TOML rejection of negative values for NEW round-limit keys
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toml_negative_review_max_rounds_rejected() {
+        // TOML `-1` is a valid TOML integer, but serde cannot deserialize it
+        // to Option<u32>. Ensure a clear parse error is produced.
+        let dir = create_temp_project_root("toml_neg_review_mr");
+        write_toml(&dir, "review_max_rounds = -1\n");
+        let err = load_file_config(&dir).expect_err("review_max_rounds = -1 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse"),
+            "expected parse error for negative u32, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toml_negative_planning_max_rounds_rejected() {
+        let dir = create_temp_project_root("toml_neg_planning_mr");
+        write_toml(&dir, "planning_max_rounds = -5\n");
+        let err = load_file_config(&dir).expect_err("planning_max_rounds = -5 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse"),
+            "expected parse error for negative u32, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toml_negative_decomposition_max_rounds_rejected() {
+        let dir = create_temp_project_root("toml_neg_decomp_mr");
+        write_toml(&dir, "decomposition_max_rounds = -10\n");
+        let err = load_file_config(&dir).expect_err("decomposition_max_rounds = -10 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to parse"),
+            "expected parse error for negative u32, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Env: negative numeric values rejected by strict_parse_env
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn from_cli_negative_review_max_rounds_env_fails() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("REVIEW_MAX_ROUNDS", "-5");
+
+        let dir = create_temp_project_root("cfg_neg_review_env");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("REVIEW_MAX_ROUNDS=-5 should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid value '-5' for REVIEW_MAX_ROUNDS"),
+            "expected strict parse error for negative, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

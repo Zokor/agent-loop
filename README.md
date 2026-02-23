@@ -363,7 +363,7 @@ Enable/disable:
 
 ### Struggle signals
 
-On `MAX_ROUNDS`, `ERROR`, and `STUCK` implementation exits, `agent-loop` appends a struggle signal to `decisions.md`:
+On round-limit, error, and stuck implementation exits, `agent-loop` appends a struggle signal to `decisions.md`:
 
 ```text
 - [STRUGGLE] Task: <task_summary> | Issue: <reason> | Round: <n> | Date: <YYYY-MM-DD>

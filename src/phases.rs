@@ -598,6 +598,8 @@ fn normalize_round_limit(limit: u32) -> Option<u32> {
     }
 }
 
+/// Returns `true` when `round` has reached or exceeded the cap.
+/// Always returns `false` in unlimited mode (`limit == None`).
 fn round_limit_reached(round: u32, limit: Option<u32>) -> bool {
     limit.is_some_and(|cap| round >= cap)
 }
@@ -608,6 +610,7 @@ fn rounds_already_exhausted(start_round: u32, limit: Option<u32>) -> bool {
     limit.is_some_and(|cap| start_round > cap)
 }
 
+/// Format a round number for display: `"5"` in unlimited mode, `"5/10"` in bounded mode.
 fn round_display(round: u32, limit: Option<u32>) -> String {
     match limit {
         None => format!("{round}"),
