@@ -1112,6 +1112,7 @@ mod tests {
             "BATCH_IMPLEMENT",
             "VERBOSE",
             "PROGRESSIVE_CONTEXT",
+            "PLANNING_ADVERSARIAL_REVIEW",
             // Stuck detection
             "STUCK_DETECTION_ENABLED",
             "STUCK_NO_DIFF_ROUNDS",
