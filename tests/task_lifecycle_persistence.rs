@@ -141,7 +141,7 @@ fn run_implement_cmd(project_dir: &Path, extra_args: &[&str]) -> std::process::O
         .env("PATH", test_path(project_dir))
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
-        .env("MAX_ROUNDS", "1")
+        .env("REVIEW_MAX_ROUNDS", "1")
         .current_dir(project_dir)
         .output()
         .expect("agent-loop should run")
@@ -484,7 +484,7 @@ fn implement_resume_skips_plan_fallback_path() {
         .env("PATH", test_path(&project_dir))
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
-        .env("MAX_ROUNDS", "5")
+        .env("REVIEW_MAX_ROUNDS", "5")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop implement --resume should run");

@@ -77,7 +77,7 @@ exit 0
             ])
             .env("PATH", &bin_dir)
             .env("TIMEOUT", "300")
-            .env("MAX_ROUNDS", "1")
+            .env("REVIEW_MAX_ROUNDS", "1")
             .env("AUTO_COMMIT", "0")
             .current_dir(&project_dir)
             .stdout(Stdio::null())

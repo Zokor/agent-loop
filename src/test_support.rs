@@ -13,14 +13,14 @@ use std::{
 
 use crate::config::{
     Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
-    DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_MAX_ROUNDS,
-    DEFAULT_PLANNING_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_PLANNING_MAX_ROUNDS,
+    DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS,
     QualityCommand, RunMode,
 };
 
 #[derive(Debug, Clone)]
 pub struct TestConfigOptions {
-    pub max_rounds: u32,
+    pub review_max_rounds: u32,
     pub planning_max_rounds: u32,
     pub decomposition_max_rounds: u32,
     pub timeout_seconds: u64,
@@ -64,7 +64,7 @@ pub struct TestConfigOptions {
 impl Default for TestConfigOptions {
     fn default() -> Self {
         Self {
-            max_rounds: DEFAULT_MAX_ROUNDS,
+            review_max_rounds: DEFAULT_REVIEW_MAX_ROUNDS,
             planning_max_rounds: DEFAULT_PLANNING_MAX_ROUNDS,
             decomposition_max_rounds: DEFAULT_DECOMPOSITION_MAX_ROUNDS,
             timeout_seconds: DEFAULT_TIMEOUT_SECONDS,
@@ -92,7 +92,7 @@ impl Default for TestConfigOptions {
             wave_lock_stale_seconds: 30,
             wave_shutdown_grace_ms: 30_000,
             planner_permission_mode: "default".to_string(),
-            claude_full_access: false,
+            claude_full_access: true,
             claude_allowed_tools: DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string(),
             reviewer_allowed_tools: DEFAULT_REVIEWER_ALLOWED_TOOLS.to_string(),
             claude_session_persistence: true,
@@ -101,7 +101,7 @@ impl Default for TestConfigOptions {
             claude_max_thinking_tokens: None,
             implementer_effort_level: None,
             reviewer_effort_level: None,
-            codex_full_access: false,
+            codex_full_access: true,
             codex_session_persistence: true,
         }
     }
@@ -125,7 +125,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
     Config {
         project_dir: root.to_path_buf(),
         state_dir: root.join(".agent-loop").join("state"),
-        max_rounds: options.max_rounds,
+        review_max_rounds: options.review_max_rounds,
         planning_max_rounds: options.planning_max_rounds,
         decomposition_max_rounds: options.decomposition_max_rounds,
         timeout_seconds: options.timeout_seconds,

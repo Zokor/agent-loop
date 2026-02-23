@@ -197,6 +197,37 @@ reviewer_allowed_tools = "Read,Grep,Glob,WebFetch,Bash"
 REVIEWER_ALLOWED_TOOLS="Read,Grep,Glob" agent-loop implement
 ```
 
+## Permission Mode Defaults
+
+By default, `agent-loop` runs agents in full-access mode for maximum autonomy:
+
+- **Claude**: uses `--dangerously-skip-permissions` (bypasses tool allowlists)
+- **Codex**: uses `--dangerously-bypass-approvals-and-sandbox` (bypasses approval prompts and sandbox)
+
+> **Security warning**: Full-access mode bypasses permission safeguards. Only use in trusted repositories and environments. Agents can read, write, and execute arbitrary code without confirmation prompts.
+
+### How to constrain permissions
+
+To restrict Claude to specific tools:
+
+```toml
+claude_full_access = false
+claude_allowed_tools = "Bash,Read,Edit,Write,Grep,Glob,WebFetch"
+reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
+```
+
+To restrict Codex to its standard approval flow:
+
+```toml
+codex_full_access = false
+```
+
+Or via environment variables:
+
+```bash
+CLAUDE_FULL_ACCESS=0 CODEX_FULL_ACCESS=0 agent-loop implement
+```
+
 ## Progressive Context
 
 When enabled, replaces front-loaded project context (README, decisions, history) with a compact state manifest listing available context files with absolute paths. Agents can read files on-demand.
@@ -343,9 +374,10 @@ On `MAX_ROUNDS`, `ERROR`, and `STUCK` implementation exits, `agent-loop` appends
 Use `.agent-loop.toml` in project root.
 
 ```toml
-max_rounds = 20
-planning_max_rounds = 3
-decomposition_max_rounds = 3
+# Round limits: 0 = unlimited (timeout and stuck detection remain active).
+review_max_rounds = 0
+planning_max_rounds = 0
+decomposition_max_rounds = 0
 timeout = 600
 
 implementer = "claude"   # any registered agent
@@ -417,9 +449,9 @@ Priority:
 ## Environment Variables
 
 Core:
-- `MAX_ROUNDS` (default: 20)
-- `PLANNING_MAX_ROUNDS` (default: 3)
-- `DECOMPOSITION_MAX_ROUNDS` (default: 3)
+- `REVIEW_MAX_ROUNDS` (default: 0, unlimited)
+- `PLANNING_MAX_ROUNDS` (default: 0, unlimited)
+- `DECOMPOSITION_MAX_ROUNDS` (default: 0, unlimited)
 - `TIMEOUT` (default: 600)
 - `IMPLEMENTER` (default: claude)
 - `REVIEWER` (default: opposite of implementer)
@@ -448,7 +480,7 @@ Progressive context:
 - `PROGRESSIVE_CONTEXT` (default: 0)
 
 Claude CLI tuning:
-- `CLAUDE_FULL_ACCESS` (default: 0)
+- `CLAUDE_FULL_ACCESS` (default: 1)
 - `CLAUDE_ALLOWED_TOOLS` (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)
 - `REVIEWER_ALLOWED_TOOLS` (default: Read,Grep,Glob,WebFetch)
 - `CLAUDE_SESSION_PERSISTENCE` (default: 1)
@@ -459,7 +491,7 @@ Claude CLI tuning:
 - `REVIEWER_EFFORT_LEVEL`
 
 Codex CLI tuning:
-- `CODEX_FULL_ACCESS` (default: 0)
+- `CODEX_FULL_ACCESS` (default: 1)
 - `CODEX_SESSION_PERSISTENCE` (default: 1)
 
 Stuck detection:
@@ -509,3 +541,28 @@ When building planning context, `agent-loop` reads these files if present (withi
 5. `AGENTS.md`
 
 In progressive context mode (`PROGRESSIVE_CONTEXT=1`), these are listed as file pointers in a manifest instead of being embedded inline.
+
+## Migration Notes
+
+### `max_rounds` renamed to `review_max_rounds`
+
+The `max_rounds` config key and `MAX_ROUNDS` environment variable have been renamed to `review_max_rounds` / `REVIEW_MAX_ROUNDS`. Using the old names produces an actionable error:
+
+```text
+`max_rounds` was renamed to `review_max_rounds` in .agent-loop.toml. Please update your config file.
+`MAX_ROUNDS` was renamed to `REVIEW_MAX_ROUNDS`. Please update your environment variable.
+```
+
+### Round limits default to unlimited
+
+`review_max_rounds`, `planning_max_rounds`, and `decomposition_max_rounds` now default to `0` (unlimited). Timeout and stuck detection remain active as safety guardrails. Set a positive value to cap rounds:
+
+```toml
+review_max_rounds = 20
+planning_max_rounds = 5
+decomposition_max_rounds = 5
+```
+
+### Full-access mode is now default
+
+`claude_full_access` and `codex_full_access` now default to `true`. See [Permission Mode Defaults](#permission-mode-defaults) for details and how to constrain.

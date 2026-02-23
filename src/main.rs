@@ -25,8 +25,8 @@ use std::{
 
 use clap::{Args, CommandFactory, Parser, Subcommand, error::ErrorKind};
 use config::{
-    Config, DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_ROUNDS, DEFAULT_PLANNING_MAX_ROUNDS,
-    DEFAULT_TIMEOUT_SECONDS,
+    Config, DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_PLANNING_MAX_ROUNDS,
+    DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS,
 };
 use error::AgentLoopError;
 use state::{
@@ -352,7 +352,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nEnvironment variables:\n  MAX_ROUNDS            (default: {DEFAULT_MAX_ROUNDS})   Max implementation/review rounds\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 0)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 0)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nRound limits: 0 = unlimited (timeout and stuck detection remain active).\n\nEnvironment variables:\n  REVIEW_MAX_ROUNDS     (default: {DEFAULT_REVIEW_MAX_ROUNDS})   Max implementation/review rounds (0 = unlimited)\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds (0 = unlimited)\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds (0 = unlimited)\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 1)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 1)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\nMigration note: MAX_ROUNDS has been renamed to REVIEW_MAX_ROUNDS.\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -605,20 +605,20 @@ fn phase_success_to_exit_code(success: bool) -> i32 {
 
 /// Internal helper used by `implement --task`, `implement --file`, and
 /// `implement` task-list execution attempts.
-fn run_command_with_max_rounds(
+fn run_command_with_review_max_rounds(
     args: RunArgs,
-    max_rounds_override: Option<u32>,
+    review_max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
     if args.resume {
         return Err(AgentLoopError::Config(
-            "run_command_with_max_rounds must not be called with resume=true. \
+            "run_command_with_review_max_rounds must not be called with resume=true. \
              Use 'implement --resume' instead."
                 .to_string(),
         ));
     }
     if args.planning_only {
         return Err(AgentLoopError::Config(
-            "run_command_with_max_rounds must not be called with planning_only=true. \
+            "run_command_with_review_max_rounds must not be called with planning_only=true. \
              Use 'plan' subcommand instead."
                 .to_string(),
         ));
@@ -629,7 +629,7 @@ fn run_command_with_max_rounds(
         project_dir,
         args.single_agent,
         false,
-        max_rounds_override,
+        review_max_rounds_override,
     )?;
     preflight::run_preflight(&mut config)?;
 
@@ -677,9 +677,9 @@ fn run_command_with_max_rounds(
 /// Resume helper used by `implement` task retries.
 fn resume_for_tasks(
     single_agent: bool,
-    max_rounds_override: Option<u32>,
+    review_max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
-    implementation_resume_with_max_rounds(single_agent, max_rounds_override)
+    implementation_resume_with_review_max_rounds(single_agent, review_max_rounds_override)
 }
 
 fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
@@ -987,9 +987,9 @@ fn persist_batch_task_state(
     Ok(())
 }
 
-fn implementation_resume_with_max_rounds(
+fn implementation_resume_with_review_max_rounds(
     single_agent: bool,
-    max_rounds_override: Option<u32>,
+    review_max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
     let state_dir = project_dir.join(".agent-loop").join("state");
@@ -997,7 +997,7 @@ fn implementation_resume_with_max_rounds(
     let task = read_resume_task_from_state_dir(&state_dir)?;
 
     let mut config =
-        Config::from_cli_with_overrides(project_dir, single_agent, false, max_rounds_override)?;
+        Config::from_cli_with_overrides(project_dir, single_agent, false, review_max_rounds_override)?;
     preflight::run_preflight(&mut config)?;
     let workflow = state::read_workflow(&config);
     if workflow != Some(state::WorkflowKind::Implement) {
@@ -1036,12 +1036,12 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
     args.validate()?;
 
     if args.resume {
-        return implementation_resume_with_max_rounds(args.single_agent, None);
+        return implementation_resume_with_review_max_rounds(args.single_agent, None);
     }
 
     if args.task.is_some() || args.file.is_some() {
         let task = resolve_task_for_implement(&args)?;
-        return run_command_with_max_rounds(
+        return run_command_with_review_max_rounds(
             RunArgs {
                 task: Some(task),
                 file: None,
@@ -1202,7 +1202,7 @@ fn run_batch_implementation_with_title(
     let started_at = state::timestamp();
     let timer = Instant::now();
     let usage_before = agent::usage_snapshot();
-    let run_result = run_command_with_max_rounds(
+    let run_result = run_command_with_review_max_rounds(
         RunArgs {
             task: Some(combined_task),
             file: None,
@@ -1674,7 +1674,7 @@ fn implement_all_tasks_per_task(
     project_dir: &Path,
 ) -> Result<i32, AgentLoopError> {
     println!("Running per-task implementation mode.");
-    let base_max_rounds = config.max_rounds;
+    let base_review_max_rounds = config.review_max_rounds;
 
     // Resolve effective max_parallel: CLI > config > default(1).
     let effective_max_parallel = args.max_parallel.unwrap_or(config.max_parallel);
@@ -1769,10 +1769,10 @@ fn implement_all_tasks_per_task(
         // Determine initial retry count from persisted state.
         let mut retry = persisted_retries;
         let is_resume_initial = entry_status == TaskRunStatus::Running;
-        let mut current_max_rounds = if is_resume_initial {
-            base_max_rounds.saturating_add(args.round_step.saturating_mul(retry))
+        let mut current_review_max_rounds = if is_resume_initial {
+            base_review_max_rounds.saturating_add(args.round_step.saturating_mul(retry))
         } else {
-            base_max_rounds
+            base_review_max_rounds
         };
         let mut accumulated_usage = agent::UsageSnapshot::default();
 
@@ -1783,21 +1783,21 @@ fn implement_all_tasks_per_task(
             let is_resume = !first_attempt || is_resume_initial;
             if !first_attempt {
                 println!(
-                    "Retrying with MAX_ROUNDS={} (retry {}/{})",
-                    current_max_rounds, retry, args.max_retries
+                    "Retrying with REVIEW_MAX_ROUNDS={} (retry {}/{})",
+                    current_review_max_rounds, retry, args.max_retries
                 );
             } else if is_resume_initial {
                 println!(
-                    "Resuming with MAX_ROUNDS={} (retry {}/{})",
-                    current_max_rounds, retry, args.max_retries
+                    "Resuming with REVIEW_MAX_ROUNDS={} (retry {}/{})",
+                    current_review_max_rounds, retry, args.max_retries
                 );
             } else {
-                println!("Running with MAX_ROUNDS={current_max_rounds}");
+                println!("Running with REVIEW_MAX_ROUNDS={current_review_max_rounds}");
             }
 
             let usage_before_attempt = agent::usage_snapshot();
             let exit_code = if is_resume {
-                resume_for_tasks(args.single_agent, Some(current_max_rounds))?
+                resume_for_tasks(args.single_agent, Some(current_review_max_rounds))?
             } else {
                 let run_args = RunArgs {
                     task: Some(task.content.clone()),
@@ -1806,7 +1806,7 @@ fn implement_all_tasks_per_task(
                     planning_only: false,
                     single_agent: args.single_agent,
                 };
-                run_command_with_max_rounds(run_args, Some(current_max_rounds))?
+                run_command_with_review_max_rounds(run_args, Some(current_review_max_rounds))?
             };
             let usage_after_attempt = agent::usage_snapshot();
             accumulated_usage = accumulated_usage
@@ -1841,7 +1841,7 @@ fn implement_all_tasks_per_task(
 
             retry += 1;
             first_attempt = false;
-            current_max_rounds = current_max_rounds.saturating_add(args.round_step);
+            current_review_max_rounds = current_review_max_rounds.saturating_add(args.round_step);
 
             // Persist updated retry count.
             task_statuses[index].retries = retry;

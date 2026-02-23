@@ -34,8 +34,8 @@ const DECOMPOSITION_MAX_ROUNDS_REASON: &str =
     "Task breakdown did not reach consensus within the decomposition round limit.";
 const PLANNING_CONSENSUS_REQUIRED_REASON: &str =
     "Planning-only mode requires consensus before task decomposition.";
-const IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON: &str =
-    "MAX_ROUNDS is set to 0; no implementation rounds will run.";
+const IMPLEMENTATION_HIGH_WATERMARK_LOG: &str =
+    "⚠ High round count in unlimited mode — timeout and stuck detection remain active safeguards";
 const CHECKPOINT_SUMMARY_MAX_LEN: usize = 80;
 const IMPLEMENTATION_CHECKPOINT_FALLBACK: &str = "implementation updates";
 const QUALITY_CHECK_TIMEOUT_SECS: u64 = 120;
@@ -590,7 +590,20 @@ fn planning_adversarial_enabled(config: &Config) -> bool {
 }
 
 fn round_limit_reached(round: u32, max_rounds: u32) -> bool {
-    round >= max_rounds
+    max_rounds > 0 && round >= max_rounds
+}
+
+fn round_display(round: u32, limit: u32) -> String {
+    if limit == 0 {
+        format!("{round}")
+    } else {
+        format!("{round}/{limit}")
+    }
+}
+
+/// Emit a high-watermark warning at round 50, then every 25 rounds.
+fn should_emit_high_watermark(round: u32) -> bool {
+    round == 50 || (round > 50 && (round - 50).is_multiple_of(25))
 }
 
 fn planning_next_step_command() -> &'static str {
@@ -1660,12 +1673,18 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let mut reached_consensus = false;
     let mut dispute_reason: Option<String> = None;
 
-    while planning_round < config.planning_max_rounds {
+    loop {
+        if round_limit_reached(planning_round, config.planning_max_rounds) {
+            break;
+        }
         planning_round += 1;
+        if should_emit_high_watermark(planning_round) {
+            let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
+        }
         let _ = log(
             &format!(
-                "🔄 Planning consensus round {planning_round}/{}",
-                config.planning_max_rounds
+                "🔄 Planning consensus round {}",
+                round_display(planning_round, config.planning_max_rounds)
             ),
             config,
         );
@@ -2086,14 +2105,14 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     if resume {
         let _ = log(
             &format!(
-                "↪ Resuming task decomposition from round {start_round}/{}",
-                config.decomposition_max_rounds
+                "↪ Resuming task decomposition from round {}",
+                round_display(start_round, config.decomposition_max_rounds)
             ),
             config,
         );
     }
 
-    if start_round > config.decomposition_max_rounds {
+    if config.decomposition_max_rounds > 0 && start_round > config.decomposition_max_rounds {
         warn_on_status_write(
             "MAX_ROUNDS",
             StatusPatch {
@@ -2114,7 +2133,12 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         return false;
     }
 
-    for round in start_round..=config.decomposition_max_rounds {
+    let mut round = start_round.saturating_sub(1);
+    loop {
+        round += 1;
+        if should_emit_high_watermark(round) {
+            let _ = log(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
+        }
         let previous_status = read_status(config);
         if previous_status.status == Status::Error {
             write_error_status(config, Some(round), status_error_reason(&previous_status));
@@ -2156,8 +2180,8 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             let current_tasks = read_state_file("tasks.md", config);
             let _ = log(
                 &format!(
-                    "📝 Implementer revising task breakdown (round {round}/{})...",
-                    config.decomposition_max_rounds
+                    "📝 Implementer revising task breakdown (round {})...",
+                    round_display(round, config.decomposition_max_rounds)
                 ),
                 config,
             );
@@ -2209,8 +2233,8 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         let _ = log(
             &format!(
-                "🔍 Reviewer validating task breakdown (round {round}/{})...",
-                config.decomposition_max_rounds
+                "🔍 Reviewer validating task breakdown (round {})...",
+                round_display(round, config.decomposition_max_rounds)
             ),
             config,
         );
@@ -2420,6 +2444,10 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             ),
             config,
         );
+
+        if round_limit_reached(round, config.decomposition_max_rounds) {
+            break;
+        }
     }
 
     warn_on_status_write(
@@ -2501,26 +2529,6 @@ where
         read_decisions(config)
     };
 
-    if config.max_rounds == 0 {
-        let task = read_state_file_fn("task.md", config);
-        log_fn(
-            &format!("\n⏰ {}", IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON),
-            config,
-        );
-        write_status_fn(
-            StatusPatch {
-                status: Some(Status::MaxRounds),
-                round: Some(0),
-                reason: Some(IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON.to_string()),
-                ..StatusPatch::default()
-            },
-            config,
-        );
-        git_checkpoint_fn("max-rounds-reached", config, baseline_files);
-        record_struggle_signal(&task, IMPLEMENTATION_ZERO_MAX_ROUNDS_REASON, 0, config);
-        return false;
-    }
-
     let start_round = if resume {
         let previous = read_status_fn(config);
         if previous.status == Status::Consensus {
@@ -2535,26 +2543,26 @@ where
     if resume {
         log_fn(
             &format!(
-                "↪ Resuming implementation from round {start_round}/{}",
-                config.max_rounds
+                "↪ Resuming implementation from round {}",
+                round_display(start_round, config.review_max_rounds)
             ),
             config,
         );
     }
 
-    if start_round > config.max_rounds {
+    if config.review_max_rounds > 0 && start_round > config.review_max_rounds {
         let task = read_state_file_fn("task.md", config);
         log_fn(
             &format!(
                 "\n⏰ Max rounds ({}) reached without consensus",
-                config.max_rounds
+                config.review_max_rounds
             ),
             config,
         );
         write_status_fn(
             StatusPatch {
                 status: Some(Status::MaxRounds),
-                round: Some(config.max_rounds),
+                round: Some(config.review_max_rounds),
                 ..StatusPatch::default()
             },
             config,
@@ -2563,7 +2571,7 @@ where
         record_struggle_signal(
             &task,
             "max rounds already exhausted before resume",
-            config.max_rounds,
+            config.review_max_rounds,
             config,
         );
         return false;
@@ -2575,9 +2583,14 @@ where
         config.stuck_threshold_minutes,
     );
 
-    for round in start_round..=config.max_rounds {
+    let mut round = start_round.saturating_sub(1);
+    loop {
+        round += 1;
+        if should_emit_high_watermark(round) {
+            log_fn(IMPLEMENTATION_HIGH_WATERMARK_LOG, config);
+        }
         log_fn(
-            &format!("━━━ Round {round}/{} ━━━", config.max_rounds),
+            &format!("━━━ Round {} ━━━", round_display(round, config.review_max_rounds)),
             config,
         );
         write_status_fn(
@@ -3343,31 +3356,33 @@ where
             }
         }
 
-        if round == config.max_rounds {
-            let issue = read_status_fn(config)
-                .reason
-                .unwrap_or_else(|| "max rounds reached without consensus".to_string());
-            log_fn(
-                &format!(
-                    "\n⏰ Max rounds ({}) reached without consensus",
-                    config.max_rounds
-                ),
-                config,
-            );
-            write_status_fn(
-                StatusPatch {
-                    status: Some(Status::MaxRounds),
-                    round: Some(round),
-                    ..StatusPatch::default()
-                },
-                config,
-            );
-            git_checkpoint_fn("max-rounds-reached", config, baseline_files);
-            record_struggle_signal(&task, &issue, round, config);
-            return false;
+        if round_limit_reached(round, config.review_max_rounds) {
+            break;
         }
     }
 
+    // round_limit_reached broke out of the loop
+    let task = read_state_file_fn("task.md", config);
+    let issue = read_status_fn(config)
+        .reason
+        .unwrap_or_else(|| "max rounds reached without consensus".to_string());
+    log_fn(
+        &format!(
+            "\n⏰ Max rounds ({}) reached without consensus",
+            config.review_max_rounds
+        ),
+        config,
+    );
+    write_status_fn(
+        StatusPatch {
+            status: Some(Status::MaxRounds),
+            round: Some(round),
+            ..StatusPatch::default()
+        },
+        config,
+    );
+    git_checkpoint_fn("max-rounds-reached", config, baseline_files);
+    record_struggle_signal(&task, &issue, round, config);
     false
 }
 
@@ -4611,7 +4626,7 @@ More text.
             &root,
             TestConfigOptions {
                 single_agent: true,
-                max_rounds: 1,
+                review_max_rounds: 1,
                 compound: false,
                 ..Default::default()
             },

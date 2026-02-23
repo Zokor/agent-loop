@@ -3,9 +3,10 @@
 # Precedence: CLI flags > environment variables > this file > built-in defaults.
 
 # ── Core ─────────────────────────────────────────────────────────────────────
-# max_rounds = 20
-# planning_max_rounds = 3
-# decomposition_max_rounds = 3
+# Round limits: 0 = unlimited (timeout and stuck detection remain active).
+# review_max_rounds = 0
+# planning_max_rounds = 0
+# decomposition_max_rounds = 0
 # timeout = 600
 # auto_commit = true
 # auto_test = false
@@ -32,7 +33,7 @@
 # planner_permission_mode = "default"
 
 # ── Claude CLI tuning ────────────────────────────────────────────────────────
-# claude_full_access = false
+# claude_full_access = true
 # claude_allowed_tools = "Bash,Read,Edit,Write,Grep,Glob,WebFetch"
 # reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
 # claude_session_persistence = true
@@ -43,7 +44,7 @@
 # reviewer_effort_level = ""
 
 # ── Codex CLI tuning ────────────────────────────────────────────────────────
-# codex_full_access = false
+# codex_full_access = true
 # codex_session_persistence = true
 
 # ── Stuck detection ──────────────────────────────────────────────────────────

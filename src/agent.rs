@@ -1068,8 +1068,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_builds_claude_with_allowed_tools_by_default() {
+    fn resolve_command_builds_claude_with_full_access_by_default() {
         let project = new_project(5);
+        let (command, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(command, "claude");
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_builds_claude_with_allowed_tools_when_full_access_disabled() {
+        let mut project = new_project(5);
+        project.config.claude_full_access = false;
         let (command, args) = resolve_command(
             &Agent::known("claude"),
             "hello",
@@ -1085,8 +1102,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_reviewer_role_uses_read_only_tools() {
-        let project = new_project(5);
+    fn resolve_command_reviewer_role_uses_read_only_tools_when_full_access_disabled() {
+        let mut project = new_project(5);
+        project.config.claude_full_access = false;
         let (_, args) = resolve_command(
             &Agent::known("claude"),
             "hello",
@@ -1102,8 +1120,25 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_implementer_role_uses_full_tools() {
+    fn resolve_command_reviewer_uses_full_access_when_enabled() {
         let project = new_project(5);
+        let (_, args) = resolve_command(
+            &Agent::known("claude"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Reviewer),
+        );
+        // With full_access=true (default), reviewer also uses dangerously flag
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(!args.contains(&"--allowedTools".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_implementer_role_uses_full_tools_when_full_access_disabled() {
+        let mut project = new_project(5);
+        project.config.claude_full_access = false;
         let (_, args) = resolve_command(
             &Agent::known("claude"),
             "hello",
@@ -1119,6 +1154,7 @@ mod tests {
     #[test]
     fn resolve_command_reviewer_custom_allowed_tools() {
         let mut project = new_project(5);
+        project.config.claude_full_access = false;
         project.config.reviewer_allowed_tools = "Read,Grep".to_string();
         let (_, args) = resolve_command(
             &Agent::known("claude"),
@@ -1132,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_codex_unchanged_for_reviewer_role() {
+    fn resolve_command_codex_reviewer_uses_full_access_by_default() {
         let project = new_project(5);
         let (_, args) = resolve_command(
             &Agent::known("codex"),
@@ -1142,7 +1178,24 @@ mod tests {
             None,
             Some(AgentRole::Reviewer),
         );
-        // Codex should get --full-auto regardless of role
+        // Codex with full_access=true (default) uses dangerously flag
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(!args.contains(&"--full-auto".to_string()));
+    }
+
+    #[test]
+    fn resolve_command_codex_reviewer_uses_full_auto_when_full_access_disabled() {
+        let mut project = new_project(5);
+        project.config.codex_full_access = false;
+        let (_, args) = resolve_command(
+            &Agent::known("codex"),
+            "hello",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Reviewer),
+        );
+        // Codex should get --full-auto regardless of role when full_access=false
         assert!(args.contains(&"--full-auto".to_string()));
         // No --allowedTools for Codex
         assert!(!args.contains(&"--allowedTools".to_string()));
@@ -1163,23 +1216,6 @@ mod tests {
         // Experimental agents don't get --allowedTools or --full-auto
         assert!(!args.contains(&"--allowedTools".to_string()));
         assert!(!args.contains(&"--full-auto".to_string()));
-    }
-
-    #[test]
-    fn resolve_command_builds_claude_with_full_access_when_enabled() {
-        let mut project = new_project(5);
-        project.config.claude_full_access = true;
-        let (command, args) = resolve_command(
-            &Agent::known("claude"),
-            "hello",
-            &project.config,
-            None,
-            None,
-            None,
-        );
-        assert_eq!(command, "claude");
-        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(!args.contains(&"--allowedTools".to_string()));
     }
 
     #[test]
@@ -1229,7 +1265,8 @@ mod tests {
             None,
             Some(AgentRole::Implementer),
         );
-        assert!(args.contains(&"--allowedTools".to_string()));
+        // Implementer with full_access=true (default) uses dangerously flag, not plan mode
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(!args.contains(&"--permission-mode".to_string()));
     }
 
@@ -1327,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_builds_codex_with_full_auto_by_default() {
+    fn resolve_command_builds_codex_with_full_access_by_default() {
         let project = new_project(5);
         let (command, args) = resolve_command(
             &Agent::known("codex"),
@@ -1338,16 +1375,16 @@ mod tests {
             None,
         );
         assert_eq!(command, "codex");
-        assert!(args.contains(&"--full-auto".to_string()));
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
         assert!(args.contains(&"--json".to_string()));
         assert!(args.contains(&"never".to_string()));
-        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(!args.contains(&"--full-auto".to_string()));
     }
 
     #[test]
-    fn resolve_command_builds_codex_with_full_access_when_enabled() {
+    fn resolve_command_builds_codex_with_full_auto_when_full_access_disabled() {
         let mut project = new_project(5);
-        project.config.codex_full_access = true;
+        project.config.codex_full_access = false;
         let (command, args) = resolve_command(
             &Agent::known("codex"),
             "hello",
@@ -1357,9 +1394,10 @@ mod tests {
             None,
         );
         assert_eq!(command, "codex");
-        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
-        assert!(!args.contains(&"--full-auto".to_string()));
+        assert!(args.contains(&"--full-auto".to_string()));
+        assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
     }
+
 
     #[test]
     #[cfg(unix)]

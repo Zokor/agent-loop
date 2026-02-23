@@ -7,9 +7,9 @@ use serde::Deserialize;
 
 use crate::error::AgentLoopError;
 
-pub const DEFAULT_MAX_ROUNDS: u32 = 20;
-pub const DEFAULT_PLANNING_MAX_ROUNDS: u32 = 3;
-pub const DEFAULT_DECOMPOSITION_MAX_ROUNDS: u32 = 3;
+pub const DEFAULT_REVIEW_MAX_ROUNDS: u32 = 0;
+pub const DEFAULT_PLANNING_MAX_ROUNDS: u32 = 0;
+pub const DEFAULT_DECOMPOSITION_MAX_ROUNDS: u32 = 0;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const DEFAULT_DIFF_MAX_LINES: u32 = 500;
 #[allow(dead_code)]
@@ -76,7 +76,9 @@ pub struct QualityCommand {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
-    /// Maximum implementation/review rounds before stopping.
+    /// Maximum implementation/review rounds before stopping (0 = unlimited).
+    review_max_rounds: Option<u32>,
+    /// Deprecated — renamed to `review_max_rounds`. Kept for migration error.
     max_rounds: Option<u32>,
     /// Maximum planning consensus rounds.
     planning_max_rounds: Option<u32>,
@@ -247,7 +249,7 @@ impl fmt::Display for RunMode {
 pub struct Config {
     pub project_dir: PathBuf,
     pub state_dir: PathBuf,
-    pub max_rounds: u32,
+    pub review_max_rounds: u32,
     pub planning_max_rounds: u32,
     pub decomposition_max_rounds: u32,
     pub timeout_seconds: u64,
@@ -366,13 +368,13 @@ impl Config {
 
     /// Build config with optional overrides applied **before** validation.
     ///
-    /// `max_rounds_override` takes highest precedence (above env vars and TOML)
+    /// `review_max_rounds_override` takes highest precedence (above env vars and TOML)
     /// and is validated together with the rest of the config.
     pub fn from_cli_with_overrides(
         project_dir: PathBuf,
         single_agent_flag: bool,
         verbose_flag: bool,
-        max_rounds_override: Option<u32>,
+        review_max_rounds_override: Option<u32>,
     ) -> Result<Self, AgentLoopError> {
         let FileConfigResult {
             config: file,
@@ -445,11 +447,20 @@ impl Config {
             }
         };
 
+        // --- migration error: old MAX_ROUNDS env var ---
+        if env::var("MAX_ROUNDS").is_ok() {
+            return Err(AgentLoopError::Config(
+                "`MAX_ROUNDS` was renamed to `REVIEW_MAX_ROUNDS`. \
+                 Please update your environment variable."
+                    .to_string(),
+            ));
+        }
+
         // --- numeric: override > env > TOML > default ---
-        let max_rounds = max_rounds_override.unwrap_or_else(|| {
-            parse_env("MAX_ROUNDS")
-                .or(file.max_rounds)
-                .unwrap_or(DEFAULT_MAX_ROUNDS)
+        let review_max_rounds = review_max_rounds_override.unwrap_or_else(|| {
+            parse_env("REVIEW_MAX_ROUNDS")
+                .or(file.review_max_rounds)
+                .unwrap_or(DEFAULT_REVIEW_MAX_ROUNDS)
         });
         let planning_max_rounds = parse_env("PLANNING_MAX_ROUNDS")
             .or(file.planning_max_rounds)
@@ -526,9 +537,11 @@ impl Config {
         let verbose = verbose_flag || env_bool("VERBOSE").unwrap_or(false);
 
         // --- Claude CLI tuning: env > TOML > default ---
+        let claude_full_access_explicit =
+            env_bool("CLAUDE_FULL_ACCESS").is_some() || file.claude_full_access.is_some();
         let claude_full_access = env_bool("CLAUDE_FULL_ACCESS")
             .or(file.claude_full_access)
-            .unwrap_or(false);
+            .unwrap_or(true);
         let claude_allowed_tools = env_trimmed_string("CLAUDE_ALLOWED_TOOLS")
             .or(file.claude_allowed_tools)
             .unwrap_or_else(|| DEFAULT_CLAUDE_ALLOWED_TOOLS.to_string());
@@ -550,9 +563,11 @@ impl Config {
             env_trimmed_string("REVIEWER_EFFORT_LEVEL").or(file.reviewer_effort_level);
 
         // --- Codex CLI tuning: env > TOML > default ---
+        let codex_full_access_explicit =
+            env_bool("CODEX_FULL_ACCESS").is_some() || file.codex_full_access.is_some();
         let codex_full_access = env_bool("CODEX_FULL_ACCESS")
             .or(file.codex_full_access)
-            .unwrap_or(false);
+            .unwrap_or(true);
         let codex_session_persistence = env_bool("CODEX_SESSION_PERSISTENCE")
             .or(file.codex_session_persistence)
             .unwrap_or(true);
@@ -561,7 +576,7 @@ impl Config {
             state_dir: project_dir.join(".agent-loop").join("state"),
             run_mode: resolve_run_mode(single_agent),
             project_dir,
-            max_rounds,
+            review_max_rounds,
             planning_max_rounds,
             decomposition_max_rounds,
             timeout_seconds,
@@ -604,7 +619,12 @@ impl Config {
         };
 
         validate_config_bounds(&config)?;
-        emit_config_warnings(&config, config_file_found);
+        emit_config_warnings(
+            &config,
+            config_file_found,
+            claude_full_access_explicit,
+            codex_full_access_explicit,
+        );
 
         Ok(config)
     }
@@ -612,6 +632,15 @@ impl Config {
 
 /// Validate that agent string fields in the config contain known values.
 fn validate_file_config(config: &FileConfig, path: &Path) -> Result<(), AgentLoopError> {
+    // Migration error: old `max_rounds` TOML key renamed to `review_max_rounds`.
+    if config.max_rounds.is_some() {
+        return Err(AgentLoopError::Config(format!(
+            "`max_rounds` was renamed to `review_max_rounds` in {}. \
+             Please update your config file.",
+            path.display(),
+        )));
+    }
+
     if let Some(ref value) = config.implementer
         && !crate::agent_registry::is_known_agent(value)
     {
@@ -756,29 +785,8 @@ fn parse_env<T: FromStr>(key: &str) -> Option<T> {
 }
 
 fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
-    if config.max_rounds == 0 {
-        return Err(AgentLoopError::Config(
-            "max_rounds must be > 0. \
-             Set MAX_ROUNDS or max_rounds in .agent-loop.toml to a positive value."
-                .to_string(),
-        ));
-    }
-
-    if config.planning_max_rounds == 0 {
-        return Err(AgentLoopError::Config(
-            "planning_max_rounds must be > 0. \
-             Set PLANNING_MAX_ROUNDS or planning_max_rounds in .agent-loop.toml to a positive value."
-                .to_string(),
-        ));
-    }
-
-    if config.decomposition_max_rounds == 0 {
-        return Err(AgentLoopError::Config(
-            "decomposition_max_rounds must be > 0. \
-             Set DECOMPOSITION_MAX_ROUNDS or decomposition_max_rounds in .agent-loop.toml to a positive value."
-                .to_string(),
-        ));
-    }
+    // review_max_rounds, planning_max_rounds, decomposition_max_rounds:
+    // 0 means unlimited — no validation needed for these fields.
 
     if config.timeout_seconds == 0 {
         return Err(AgentLoopError::Config(
@@ -881,18 +889,78 @@ fn try_emit_missing_config_hint(
     !guard.swap(true, std::sync::atomic::Ordering::Relaxed)
 }
 
-fn emit_config_warnings(_config: &Config, config_file_found: bool) {
+/// Returns true if the full-access default warning should be emitted.
+/// Fires when full-access is on for either agent AND the user has not
+/// explicitly set the value via TOML or env.
+fn should_emit_full_access_warning(
+    claude_full_access: bool,
+    claude_explicit: bool,
+    codex_full_access: bool,
+    codex_explicit: bool,
+    ci_set: bool,
+    is_terminal: bool,
+) -> bool {
+    if ci_set || !is_terminal {
+        return false;
+    }
+    // Warn only when full-access is still the implicit default.
+    (claude_full_access && !claude_explicit) || (codex_full_access && !codex_explicit)
+}
+
+fn try_emit_full_access_warning(
+    claude_full_access: bool,
+    claude_explicit: bool,
+    codex_full_access: bool,
+    codex_explicit: bool,
+    ci_set: bool,
+    is_terminal: bool,
+    guard: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if !should_emit_full_access_warning(
+        claude_full_access,
+        claude_explicit,
+        codex_full_access,
+        codex_explicit,
+        ci_set,
+        is_terminal,
+    ) {
+        return false;
+    }
+    !guard.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn emit_config_warnings(
+    config: &Config,
+    config_file_found: bool,
+    claude_full_access_explicit: bool,
+    codex_full_access_explicit: bool,
+) {
     use std::sync::atomic::AtomicBool;
 
     static MISSING_CONFIG_HINT_EMITTED: AtomicBool = AtomicBool::new(false);
+    static FULL_ACCESS_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
 
-    if try_emit_missing_config_hint(
-        config_file_found,
-        std::env::var_os("CI").is_some(),
-        std::io::IsTerminal::is_terminal(&std::io::stderr()),
-        &MISSING_CONFIG_HINT_EMITTED,
-    ) {
+    let ci_set = std::env::var_os("CI").is_some();
+    let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+
+    if try_emit_missing_config_hint(config_file_found, ci_set, is_terminal, &MISSING_CONFIG_HINT_EMITTED) {
         eprintln!("Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one.");
+    }
+
+    if try_emit_full_access_warning(
+        config.claude_full_access,
+        claude_full_access_explicit,
+        config.codex_full_access,
+        codex_full_access_explicit,
+        ci_set,
+        is_terminal,
+        &FULL_ACCESS_WARNING_EMITTED,
+    ) {
+        eprintln!(
+            "Warning: full-access mode is active by default (--dangerously-skip-permissions / \
+             --dangerously-bypass-approvals-and-sandbox). \
+             Set claude_full_access=false or codex_full_access=false in .agent-loop.toml to constrain."
+        );
     }
 }
 
@@ -903,9 +971,10 @@ pub fn generate_default_config_template() -> String {
         r#"# agent-loop configuration
 # All settings are optional — uncomment and modify as needed.
 # Precedence: CLI flags > environment variables > this file > built-in defaults.
+# Round limits: 0 = unlimited (default); positive values cap rounds.
 
 # ── Core ─────────────────────────────────────────────────────────────────────
-# max_rounds = {max_rounds}
+# review_max_rounds = {review_max_rounds}
 # planning_max_rounds = {planning_max_rounds}
 # decomposition_max_rounds = {decomposition_max_rounds}
 # timeout = {timeout}
@@ -934,7 +1003,8 @@ pub fn generate_default_config_template() -> String {
 # planner_permission_mode = "default"
 
 # ── Claude CLI tuning ────────────────────────────────────────────────────────
-# claude_full_access = false
+# claude_full_access = true
+# If you need constraints, set claude_full_access = false and configure:
 # claude_allowed_tools = "{claude_allowed_tools}"
 # reviewer_allowed_tools = "{reviewer_allowed_tools}"
 # claude_session_persistence = true
@@ -945,7 +1015,8 @@ pub fn generate_default_config_template() -> String {
 # reviewer_effort_level = ""
 
 # ── Codex CLI tuning ────────────────────────────────────────────────────────
-# codex_full_access = false
+# codex_full_access = true
+# If you need reduced permissions, set codex_full_access = false.
 # codex_session_persistence = true
 
 # ── Stuck detection ──────────────────────────────────────────────────────────
@@ -968,7 +1039,7 @@ pub fn generate_default_config_template() -> String {
 # [[quality_commands]]
 # command = "cargo test"
 "#,
-        max_rounds = DEFAULT_MAX_ROUNDS,
+        review_max_rounds = DEFAULT_REVIEW_MAX_ROUNDS,
         planning_max_rounds = DEFAULT_PLANNING_MAX_ROUNDS,
         decomposition_max_rounds = DEFAULT_DECOMPOSITION_MAX_ROUNDS,
         timeout = DEFAULT_TIMEOUT_SECONDS,
@@ -1000,7 +1071,8 @@ mod tests {
             "AUTO_TEST_CMD",
             "COMPOUND",
             "DECISIONS_MAX_LINES",
-            "MAX_ROUNDS",
+            "REVIEW_MAX_ROUNDS",
+            "MAX_ROUNDS", // deprecated — kept so migration error tests start clean
             "PLANNING_MAX_ROUNDS",
             "DECOMPOSITION_MAX_ROUNDS",
             "TIMEOUT",
@@ -1161,7 +1233,7 @@ mod tests {
         let dir = create_temp_project_root("toml_missing");
         let result = load_file_config(&dir).expect("missing file should return Ok(default)");
         assert!(!result.file_found);
-        assert!(result.config.max_rounds.is_none());
+        assert!(result.config.review_max_rounds.is_none());
         assert!(result.config.implementer.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1172,7 +1244,7 @@ mod tests {
         write_toml(
             &dir,
             r#"
-max_rounds = 10
+review_max_rounds = 10
 planning_max_rounds = 5
 decomposition_max_rounds = 4
 timeout = 300
@@ -1202,7 +1274,7 @@ command = "cargo test"
         let result = load_file_config(&dir).expect("valid full file should parse");
         assert!(result.file_found);
         let config = result.config;
-        assert_eq!(config.max_rounds, Some(10));
+        assert_eq!(config.review_max_rounds, Some(10));
         assert_eq!(config.planning_max_rounds, Some(5));
         assert_eq!(config.decomposition_max_rounds, Some(4));
         assert_eq!(config.timeout, Some(300));
@@ -1238,10 +1310,10 @@ command = "cargo test"
     #[test]
     fn load_file_config_partial_file() {
         let dir = create_temp_project_root("toml_partial");
-        write_toml(&dir, "max_rounds = 7\n");
+        write_toml(&dir, "review_max_rounds = 7\n");
         let result = load_file_config(&dir).expect("partial file should parse");
         assert!(result.file_found);
-        assert_eq!(result.config.max_rounds, Some(7));
+        assert_eq!(result.config.review_max_rounds, Some(7));
         assert!(result.config.implementer.is_none());
         assert!(result.config.auto_test.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -1268,7 +1340,7 @@ command = "cargo test"
     #[test]
     fn load_file_config_wrong_types_returns_error() {
         let dir = create_temp_project_root("toml_wrong_type");
-        write_toml(&dir, "max_rounds = \"not a number\"\n");
+        write_toml(&dir, "review_max_rounds = \"not a number\"\n");
         let err = load_file_config(&dir).expect_err("wrong type should fail");
         assert!(matches!(err, AgentLoopError::Config(_)));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1289,7 +1361,7 @@ command = "cargo test"
 
         assert_eq!(config.project_dir, project_dir);
         assert_eq!(config.state_dir, project_dir.join(".agent-loop/state"));
-        assert_eq!(config.max_rounds, DEFAULT_MAX_ROUNDS);
+        assert_eq!(config.review_max_rounds, DEFAULT_REVIEW_MAX_ROUNDS);
         assert_eq!(config.planning_max_rounds, DEFAULT_PLANNING_MAX_ROUNDS);
         assert_eq!(
             config.decomposition_max_rounds,
@@ -1307,6 +1379,8 @@ command = "cargo test"
         assert_eq!(config.decisions_max_lines, DEFAULT_DECISIONS_MAX_LINES);
         assert!(config.quality_commands.is_empty());
         assert!(config.batch_implement);
+        assert!(config.claude_full_access);
+        assert!(config.codex_full_access);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -1321,7 +1395,7 @@ command = "cargo test"
         set_env("SINGLE_AGENT", "true");
         set_env("IMPLEMENTER", "codex");
         set_env("AUTO_COMMIT", "0");
-        set_env("MAX_ROUNDS", "42");
+        set_env("REVIEW_MAX_ROUNDS", "42");
         set_env("PLANNING_MAX_ROUNDS", "7");
         set_env("DECOMPOSITION_MAX_ROUNDS", "8");
         set_env("TIMEOUT", "900");
@@ -1330,7 +1404,7 @@ command = "cargo test"
         let config =
             Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
-        assert_eq!(config.max_rounds, 42);
+        assert_eq!(config.review_max_rounds, 42);
         assert_eq!(config.planning_max_rounds, 7);
         assert_eq!(config.decomposition_max_rounds, 8);
         assert_eq!(config.timeout_seconds, 900);
@@ -1346,7 +1420,7 @@ command = "cargo test"
     fn from_cli_uses_safe_defaults_for_invalid_numeric_env_values() {
         let _guard = env_lock();
         clear_env();
-        set_env("MAX_ROUNDS", "not-a-number");
+        set_env("REVIEW_MAX_ROUNDS", "not-a-number");
         set_env("PLANNING_MAX_ROUNDS", "invalid");
         set_env("DECOMPOSITION_MAX_ROUNDS", "-1");
         set_env("TIMEOUT", "-1");
@@ -1355,7 +1429,7 @@ command = "cargo test"
         let config =
             Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
 
-        assert_eq!(config.max_rounds, DEFAULT_MAX_ROUNDS);
+        assert_eq!(config.review_max_rounds, DEFAULT_REVIEW_MAX_ROUNDS);
         assert_eq!(config.planning_max_rounds, DEFAULT_PLANNING_MAX_ROUNDS);
         assert_eq!(
             config.decomposition_max_rounds,
@@ -1366,15 +1440,15 @@ command = "cargo test"
     }
 
     #[test]
-    fn from_cli_rejects_zero_max_rounds() {
+    fn from_cli_zero_review_max_rounds_is_valid_unlimited() {
         let _guard = env_lock();
         clear_env();
-        set_env("MAX_ROUNDS", "0");
+        set_env("REVIEW_MAX_ROUNDS", "0");
 
         let project_dir = create_temp_project_root("cfg_zero_rounds");
-        let err = Config::from_cli(project_dir.clone(), false, false)
-            .expect_err("max_rounds=0 should fail");
-        assert!(err.to_string().contains("max_rounds must be > 0"));
+        let config =
+            Config::from_cli(project_dir.clone(), false, false).expect("0 should be valid");
+        assert_eq!(config.review_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
 
@@ -1453,7 +1527,7 @@ command = "cargo test"
         write_toml(
             &dir,
             r#"
-max_rounds = 10
+review_max_rounds = 10
 planning_max_rounds = 5
 decomposition_max_rounds = 4
 timeout = 300
@@ -1471,7 +1545,7 @@ batch_implement = false
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
-        assert_eq!(config.max_rounds, 10);
+        assert_eq!(config.review_max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
         assert_eq!(config.decomposition_max_rounds, 4);
         assert_eq!(config.timeout_seconds, 300);
@@ -1500,7 +1574,7 @@ batch_implement = false
         write_toml(
             &dir,
             r#"
-max_rounds = 10
+review_max_rounds = 10
 timeout = 300
 implementer = "codex"
 single_agent = true
@@ -1513,7 +1587,7 @@ batch_implement = true
 "#,
         );
 
-        set_env("MAX_ROUNDS", "50");
+        set_env("REVIEW_MAX_ROUNDS", "50");
         set_env("TIMEOUT", "1200");
         set_env("IMPLEMENTER", "claude");
         set_env("SINGLE_AGENT", "false");
@@ -1523,7 +1597,7 @@ batch_implement = true
 
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
 
-        assert_eq!(config.max_rounds, 50);
+        assert_eq!(config.review_max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
         assert_eq!(config.implementer, Agent::known("claude"));
         assert!(!config.single_agent);
@@ -1818,31 +1892,28 @@ batch_implement = true
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_zero_planning_max_rounds() {
+    fn zero_planning_max_rounds_is_valid_unlimited() {
         let _guard = env_lock();
         clear_env();
         set_env("PLANNING_MAX_ROUNDS", "0");
 
         let dir = create_temp_project_root("cfg_zero_planning");
-        let err = Config::from_cli(dir.clone(), false, false)
-            .expect_err("planning_max_rounds=0 should fail");
-        assert!(err.to_string().contains("planning_max_rounds must be > 0"));
+        let config =
+            Config::from_cli(dir.clone(), false, false).expect("0 should be valid (unlimited)");
+        assert_eq!(config.planning_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn validate_rejects_zero_decomposition_max_rounds() {
+    fn zero_decomposition_max_rounds_is_valid_unlimited() {
         let _guard = env_lock();
         clear_env();
         set_env("DECOMPOSITION_MAX_ROUNDS", "0");
 
         let dir = create_temp_project_root("cfg_zero_decomp");
-        let err = Config::from_cli(dir.clone(), false, false)
-            .expect_err("decomposition_max_rounds=0 should fail");
-        assert!(
-            err.to_string()
-                .contains("decomposition_max_rounds must be > 0")
-        );
+        let config =
+            Config::from_cli(dir.clone(), false, false).expect("0 should be valid (unlimited)");
+        assert_eq!(config.decomposition_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1996,8 +2067,8 @@ command = "cargo test"
         let dir = create_temp_project_root("cfg_valid_defaults");
         let config =
             Config::from_cli(dir.clone(), false, false).expect("default config should be valid");
-        assert!(config.max_rounds > 0);
-        assert!(config.planning_max_rounds > 0);
+        assert_eq!(config.review_max_rounds, 0); // unlimited by default
+        assert_eq!(config.planning_max_rounds, 0); // unlimited by default
         assert!(config.timeout_seconds > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2023,7 +2094,7 @@ planning_context_excerpt_lines = 75
         assert_eq!(result.config.context_line_cap, Some(150));
         assert_eq!(result.config.planning_context_excerpt_lines, Some(75));
         // Other fields remain None
-        assert!(result.config.max_rounds.is_none());
+        assert!(result.config.review_max_rounds.is_none());
         assert!(result.config.implementer.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2299,29 +2370,29 @@ planning_context_excerpt_lines = 75
     // -----------------------------------------------------------------------
 
     #[test]
-    fn overrides_max_rounds_applied_before_validation() {
+    fn overrides_review_max_rounds_applied_before_validation() {
         let _guard = env_lock();
         clear_env();
 
         let dir = create_temp_project_root("cfg_override_mr");
         let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(42))
-            .expect("override max_rounds should succeed");
-        assert_eq!(config.max_rounds, 42);
+            .expect("override review_max_rounds should succeed");
+        assert_eq!(config.review_max_rounds, 42);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn overrides_max_rounds_wins_over_env_and_toml() {
+    fn overrides_review_max_rounds_wins_over_env_and_toml() {
         let _guard = env_lock();
         clear_env();
-        set_env("MAX_ROUNDS", "100");
+        set_env("REVIEW_MAX_ROUNDS", "100");
 
         let dir = create_temp_project_root("cfg_override_mr_env");
-        write_toml(&dir, "max_rounds = 50\n");
+        write_toml(&dir, "review_max_rounds = 50\n");
 
         let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(7))
-            .expect("override max_rounds should win");
-        assert_eq!(config.max_rounds, 7);
+            .expect("override review_max_rounds should win");
+        assert_eq!(config.review_max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2452,8 +2523,11 @@ planning_context_excerpt_lines = 75
 
         // DEFAULT_* constant values
         assert!(
-            template.contains(&format!("# max_rounds = {}", DEFAULT_MAX_ROUNDS)),
-            "missing DEFAULT_MAX_ROUNDS"
+            template.contains(&format!(
+                "# review_max_rounds = {}",
+                DEFAULT_REVIEW_MAX_ROUNDS
+            )),
+            "missing DEFAULT_REVIEW_MAX_ROUNDS"
         );
         assert!(
             template.contains(&format!(
@@ -2590,5 +2664,190 @@ planning_context_excerpt_lines = 75
             "planning_context_excerpt_lines = 0 should map to u32::MAX"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Migration error: old max_rounds TOML key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn toml_max_rounds_rejected_with_rename_guidance() {
+        let dir = create_temp_project_root("toml_old_max_rounds");
+        write_toml(&dir, "max_rounds = 10\n");
+        let err = load_file_config(&dir).expect_err("old max_rounds key should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("renamed to `review_max_rounds`"),
+            "expected rename guidance, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_max_rounds_rejected_with_rename_guidance() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("MAX_ROUNDS", "10");
+
+        let dir = create_temp_project_root("cfg_old_max_rounds_env");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("old MAX_ROUNDS env should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("renamed to `REVIEW_MAX_ROUNDS`"),
+            "expected rename guidance, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-access defaults
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_access_defaults_to_true_for_claude_and_codex() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_full_access_default");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(config.claude_full_access, "claude_full_access should default to true");
+        assert!(config.codex_full_access, "codex_full_access should default to true");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_access_can_be_disabled_via_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_full_access_toml");
+        write_toml(&dir, "claude_full_access = false\ncodex_full_access = false\n");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(!config.claude_full_access);
+        assert!(!config.codex_full_access);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn full_access_env_overrides_toml() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_full_access_env");
+        write_toml(&dir, "claude_full_access = true\ncodex_full_access = true\n");
+        set_env("CLAUDE_FULL_ACCESS", "0");
+        set_env("CODEX_FULL_ACCESS", "0");
+        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        assert!(!config.claude_full_access);
+        assert!(!config.codex_full_access);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // Template: full-access and review_max_rounds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn template_contains_full_access_true_defaults() {
+        let template = generate_default_config_template();
+        assert!(
+            template.contains("# claude_full_access = true"),
+            "template should show claude_full_access = true"
+        );
+        assert!(
+            template.contains("# codex_full_access = true"),
+            "template should show codex_full_access = true"
+        );
+    }
+
+    #[test]
+    fn template_contains_review_max_rounds_not_max_rounds() {
+        let template = generate_default_config_template();
+        assert!(
+            template.contains("# review_max_rounds = 0"),
+            "template should contain review_max_rounds = 0"
+        );
+        assert!(
+            !template.contains("# max_rounds ="),
+            "template should not contain old max_rounds key"
+        );
+    }
+
+    #[test]
+    fn template_contains_round_limit_note() {
+        let template = generate_default_config_template();
+        assert!(
+            template.contains("Round limits: 0 = unlimited"),
+            "template should contain round limit note"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Full-access warning: should_emit_full_access_warning (pure logic)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn full_access_warning_fires_when_defaults_active() {
+        assert!(
+            should_emit_full_access_warning(true, false, true, false, false, true),
+            "warning should fire when both full-access on and not explicit"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_suppressed_when_claude_explicit() {
+        assert!(
+            !should_emit_full_access_warning(true, true, true, true, false, true),
+            "warning should be suppressed when user explicitly set values"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_suppressed_in_ci() {
+        assert!(
+            !should_emit_full_access_warning(true, false, true, false, true, true),
+            "warning should be suppressed in CI"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_suppressed_when_not_terminal() {
+        assert!(
+            !should_emit_full_access_warning(true, false, true, false, false, false),
+            "warning should be suppressed when stderr is not a terminal"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_fires_when_only_claude_implicit() {
+        // codex explicit but claude still implicit
+        assert!(
+            should_emit_full_access_warning(true, false, true, true, false, true),
+            "warning should fire when at least one agent uses implicit full-access"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_suppressed_when_both_disabled() {
+        assert!(
+            !should_emit_full_access_warning(false, false, false, false, false, true),
+            "warning should not fire when full-access is off"
+        );
+    }
+
+    #[test]
+    fn full_access_warning_one_time_guard() {
+        use std::sync::atomic::AtomicBool;
+
+        let guard = AtomicBool::new(false);
+        assert!(
+            try_emit_full_access_warning(true, false, true, false, false, true, &guard),
+            "first call should emit"
+        );
+        assert!(
+            !try_emit_full_access_warning(true, false, true, false, false, true, &guard),
+            "second call should be blocked by guard"
+        );
     }
 }

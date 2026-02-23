@@ -1246,7 +1246,7 @@ pub fn init(
     log(
         &format!(
             "Max rounds: {} | Timeout: {}s",
-            config.max_rounds, config.timeout_seconds
+            config.review_max_rounds, config.timeout_seconds
         ),
         config,
     )?;

@@ -321,7 +321,7 @@ fn implement_falls_back_to_plan_when_tasks_missing() {
         )
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
-        .env("MAX_ROUNDS", "1")
+        .env("REVIEW_MAX_ROUNDS", "1")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop implement should execute");
