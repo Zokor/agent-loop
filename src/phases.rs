@@ -624,7 +624,8 @@ fn should_emit_high_watermark(round: u32, limit: Option<u32>) -> bool {
     if limit.is_some() {
         return false;
     }
-    round == 50 || (round > 50 && (round - 50).is_multiple_of(25))
+    // 0.is_multiple_of(25) is true, so this fires at 50, 75, 100, …
+    round >= 50 && (round - 50).is_multiple_of(25)
 }
 
 fn planning_next_step_command() -> &'static str {

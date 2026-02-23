@@ -7,8 +7,11 @@ use serde::Deserialize;
 
 use crate::error::AgentLoopError;
 
+/// Default review/implementation round limit. `0` = unlimited (no cap).
 pub const DEFAULT_REVIEW_MAX_ROUNDS: u32 = 0;
+/// Default planning consensus round limit. `0` = unlimited (no cap).
 pub const DEFAULT_PLANNING_MAX_ROUNDS: u32 = 0;
+/// Default task-decomposition round limit. `0` = unlimited (no cap).
 pub const DEFAULT_DECOMPOSITION_MAX_ROUNDS: u32 = 0;
 pub const DEFAULT_TIMEOUT_SECONDS: u64 = 600;
 pub const DEFAULT_DIFF_MAX_LINES: u32 = 500;
@@ -1067,6 +1070,7 @@ pub fn generate_default_config_template() -> String {
 #
 # [[quality_commands]]
 # command = "cargo test"
+# remediation = "Fix failing tests."
 "#,
         review_max_rounds = DEFAULT_REVIEW_MAX_ROUNDS,
         planning_max_rounds = DEFAULT_PLANNING_MAX_ROUNDS,

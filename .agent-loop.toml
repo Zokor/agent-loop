@@ -68,3 +68,4 @@
 #
 # [[quality_commands]]
 # command = "cargo test"
+# remediation = "Fix failing tests."

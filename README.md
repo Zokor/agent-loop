@@ -563,6 +563,12 @@ planning_max_rounds = 5
 decomposition_max_rounds = 5
 ```
 
+Or via environment variables:
+
+```bash
+REVIEW_MAX_ROUNDS=20 PLANNING_MAX_ROUNDS=5 DECOMPOSITION_MAX_ROUNDS=5 agent-loop implement
+```
+
 ### Full-access mode is now default
 
 `claude_full_access` and `codex_full_access` now default to `true`. See [Permission Mode Defaults](#permission-mode-defaults) for details and how to constrain.
