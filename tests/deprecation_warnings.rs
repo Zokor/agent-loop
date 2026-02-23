@@ -182,3 +182,49 @@ fn review_max_rounds_zero_accepted_at_cli_level() {
         "REVIEW_MAX_ROUNDS=0 should be accepted, stderr: {stderr}"
     );
 }
+
+/// `PLANNING_MAX_ROUNDS=0` (unlimited) should be accepted without error.
+#[test]
+fn planning_max_rounds_zero_accepted_at_cli_level() {
+    let tmp = TempDir::new("planning_max_rounds_zero");
+    let output = run_with_env(&tmp, &["status"], &[("PLANNING_MAX_ROUNDS", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "PLANNING_MAX_ROUNDS=0 should be accepted, stderr: {stderr}"
+    );
+}
+
+/// `DECOMPOSITION_MAX_ROUNDS=0` (unlimited) should be accepted without error.
+#[test]
+fn decomposition_max_rounds_zero_accepted_at_cli_level() {
+    let tmp = TempDir::new("decomp_max_rounds_zero");
+    let output = run_with_env(&tmp, &["status"], &[("DECOMPOSITION_MAX_ROUNDS", "0")]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "DECOMPOSITION_MAX_ROUNDS=0 should be accepted, stderr: {stderr}"
+    );
+}
+
+/// Negative `REVIEW_MAX_ROUNDS` should be rejected at the binary level.
+#[test]
+fn review_max_rounds_negative_rejected_at_cli_level() {
+    let tmp = TempDir::new("review_max_rounds_neg");
+    let output = run_with_env(&tmp, &["status"], &[("REVIEW_MAX_ROUNDS", "-1")]);
+    assert!(
+        !output.status.success(),
+        "REVIEW_MAX_ROUNDS=-1 should be rejected"
+    );
+}
+
+/// Non-numeric `REVIEW_MAX_ROUNDS` should be rejected at the binary level.
+#[test]
+fn review_max_rounds_non_numeric_rejected_at_cli_level() {
+    let tmp = TempDir::new("review_max_rounds_nan");
+    let output = run_with_env(&tmp, &["status"], &[("REVIEW_MAX_ROUNDS", "abc")]);
+    assert!(
+        !output.status.success(),
+        "REVIEW_MAX_ROUNDS=abc should be rejected"
+    );
+}
