@@ -2848,6 +2848,74 @@ planning_context_excerpt_lines = 75
         );
     }
 
+    #[test]
+    fn sample_toml_matches_generated_template() {
+        // The repository-root `.agent-loop.toml` sample must stay in sync with
+        // generate_default_config_template(). This test fails when the template
+        // is updated but the sample is not (or vice versa).
+        let template = generate_default_config_template();
+        let sample_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".agent-loop.toml");
+        let sample = std::fs::read_to_string(&sample_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read sample .agent-loop.toml at {}: {err}",
+                sample_path.display()
+            )
+        });
+        assert_eq!(
+            template.trim(),
+            sample.trim(),
+            "sample .agent-loop.toml and generate_default_config_template() have drifted"
+        );
+    }
+
+    #[test]
+    fn sample_toml_is_valid_parseable_config() {
+        // Verify the sample .agent-loop.toml parses as valid TOML that serde
+        // can deserialize to FileConfig. Catches stale keys or type mismatches.
+        let sample_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".agent-loop.toml");
+        let content = std::fs::read_to_string(&sample_path).unwrap_or_else(|err| {
+            panic!(
+                "failed to read sample .agent-loop.toml at {}: {err}",
+                sample_path.display()
+            )
+        });
+        // All lines are comments, so it should deserialize to a default FileConfig.
+        let config: FileConfig = toml::from_str(&content).unwrap_or_else(|err| {
+            panic!("sample .agent-loop.toml is not valid FileConfig TOML: {err}")
+        });
+        // All comment-only config should yield None for everything.
+        assert!(
+            config.review_max_rounds.is_none(),
+            "commented-out sample should not set review_max_rounds"
+        );
+        assert!(
+            config.implementer.is_none(),
+            "commented-out sample should not set implementer"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // from_cli_with_overrides: unlimited (0) override
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn overrides_review_max_rounds_zero_is_valid_unlimited() {
+        let _guard = env_lock();
+        clear_env();
+        // Even when env/TOML set a finite limit, override with Some(0) should
+        // take highest precedence and set unlimited.
+        set_env("REVIEW_MAX_ROUNDS", "20");
+
+        let dir = create_temp_project_root("cfg_override_mr_zero");
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(0))
+            .expect("override review_max_rounds=0 should succeed");
+        assert_eq!(
+            config.review_max_rounds, 0,
+            "Some(0) override should set unlimited (0)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // -----------------------------------------------------------------------
     // Full-access warning: should_emit_full_access_warning (pure logic)
     // -----------------------------------------------------------------------
