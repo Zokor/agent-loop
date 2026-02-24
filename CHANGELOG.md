@@ -20,6 +20,7 @@ All notable changes to this project are documented in this file.
 - **BREAKING**: `max_rounds` renamed to `review_max_rounds` (TOML key) and `MAX_ROUNDS` renamed to `REVIEW_MAX_ROUNDS` (env var). Old names produce explicit rename errors with upgrade guidance.
 - **BREAKING**: All round limits (`review_max_rounds`, `planning_max_rounds`, `decomposition_max_rounds`) now default to `0` (unlimited). Timeout and stuck detection remain as active safeguards; high-watermark warnings fire at round 50 then every 25 rounds in unlimited mode.
 - **BREAKING**: Claude and Codex now default to full-access mode (`claude_full_access = true`, `codex_full_access = true`). Claude uses `--dangerously-skip-permissions`; Codex uses `--dangerously-bypass-approvals-and-sandbox`. Set `*_full_access = false` in `.agent-loop.toml` to constrain.
+- **BREAKING**: Dual-agent implementation review now uses a mandatory three-gate flow: same-context reviewer approval, fresh-context reviewer approval, then implementer signoff. The old 5/5-only second-review trigger was removed.
 - Round-limit environment variables now fail with explicit errors on invalid values (previously silently fell back to defaults).
 - Implementation/review loops now reconcile reviewer findings with status transitions (including forcing `NEEDS_CHANGES` when unresolved findings remain).
 - Quality checks now auto-select platform shell (`sh -c` on Unix, `cmd /C` on Windows) for native Windows support.

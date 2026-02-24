@@ -12,7 +12,7 @@ use crate::{
         AgentRole, PlanningReviewerParams, compound_prompt,
         decomposition_implementer_signoff_prompt, decomposition_initial_prompt,
         decomposition_reviewer_prompt, decomposition_revision_prompt, gather_project_context,
-        implementation_adversarial_review_prompt, implementation_consensus_prompt,
+        implementation_consensus_prompt, implementation_fresh_context_reviewer_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
         planning_adversarial_review_prompt, planning_implementer_revision_prompt,
         planning_implementer_signoff_prompt, planning_initial_prompt, planning_reviewer_prompt,
@@ -36,6 +36,9 @@ const PLANNING_CONSENSUS_REQUIRED_REASON: &str =
     "Planning-only mode requires consensus before task decomposition.";
 const IMPLEMENTATION_HIGH_WATERMARK_LOG: &str =
     "⚠ High round count in unlimited mode — timeout and stuck detection remain active safeguards";
+const IMPLEMENT_GATE_SAME_CONTEXT: &str = "[gate:same-context]";
+const IMPLEMENT_GATE_FRESH_CONTEXT: &str = "[gate:fresh-context]";
+const IMPLEMENT_GATE_SIGNOFF: &str = "[gate:implementer-signoff]";
 const CHECKPOINT_SUMMARY_MAX_LEN: usize = 80;
 const IMPLEMENTATION_CHECKPOINT_FALLBACK: &str = "implementation updates";
 const QUALITY_CHECK_TIMEOUT_SECS: u64 = 120;
@@ -680,7 +683,13 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     run_agent_fn: &mut FRunAgent,
     log_fn: &mut FLog,
 ) where
-    FRunAgent: FnMut(&crate::config::Agent, AgentRole, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(
+        &crate::config::Agent,
+        AgentRole,
+        &str,
+        Option<&str>,
+        &Config,
+    ) -> Result<(), AgentLoopError>,
     FLog: FnMut(&str, &Config),
 {
     if !config.compound {
@@ -692,6 +701,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
         &config.implementer,
         AgentRole::Implementer,
         &compound_prompt(task, plan),
+        None,
         config,
     ) {
         log_fn(
@@ -709,7 +719,11 @@ pub fn compound_phase(task: &str, plan: &str, config: &Config) {
         task,
         plan,
         config,
-        &mut |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
+        &mut |agent: &crate::config::Agent,
+              role: AgentRole,
+              prompt,
+              _session_hint: Option<&str>,
+              current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -842,6 +856,21 @@ fn status_error_reason(status: &LoopStatus) -> String {
         .reason
         .clone()
         .unwrap_or_else(|| "status.json is in ERROR state".to_string())
+}
+
+fn gate_reason(marker: &str, reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.starts_with("[gate:") {
+        trimmed.to_string()
+    } else if trimmed.is_empty() {
+        marker.to_string()
+    } else {
+        format!("{marker} {trimmed}")
+    }
+}
+
+fn gate_reason_opt(marker: &str, reason: Option<String>) -> Option<String> {
+    reason.map(|text| gate_reason(marker, &text))
 }
 
 fn planner_plan_mode_active(config: &Config, agent: &Agent, role: AgentRole) -> bool {
@@ -1860,10 +1889,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     // --- Adversarial planning review (dual-agent only) ---
                     if planning_adversarial_enabled(config) {
                         let first_review = read_state_file("review.md", config);
-                        let _ = log(
-                            "🔍 Running adversarial second review of plan...",
-                            config,
-                        );
+                        let _ = log("🔍 Running adversarial second review of plan...", config);
 
                         let adversarial_output = match run_agent_with_output_or_record_error(
                             config,
@@ -1889,8 +1915,10 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
                         // Parse adversarial verdict and findings
                         let adversarial_verdict = parse_planning_verdict(&adversarial_output);
-                        let adversarial_findings =
-                            parse_planning_findings_from_output(&adversarial_output, planning_round);
+                        let adversarial_findings = parse_planning_findings_from_output(
+                            &adversarial_output,
+                            planning_round,
+                        );
 
                         let (adversarial_action, adversarial_updated) = reconcile_planning_verdict(
                             adversarial_verdict,
@@ -2535,7 +2563,13 @@ fn implementation_loop_internal<
     resume: bool,
 ) -> bool
 where
-    FRunAgent: FnMut(&crate::config::Agent, AgentRole, &str, &Config) -> Result<(), AgentLoopError>,
+    FRunAgent: FnMut(
+        &crate::config::Agent,
+        AgentRole,
+        &str,
+        Option<&str>,
+        &Config,
+    ) -> Result<(), AgentLoopError>,
     FCheckpoint: FnMut(&str, &Config, &HashSet<String>),
     FLog: FnMut(&str, &Config),
     FWriteStatus: FnMut(StatusPatch, &Config),
@@ -2663,6 +2697,7 @@ where
                 &paths,
                 &impl_history,
             ),
+            None,
             config,
         ) {
             let status = status_for_error(&err);
@@ -2752,6 +2787,11 @@ where
         write_status_fn(
             StatusPatch {
                 status: Some(Status::Reviewing),
+                round: Some(round),
+                reason: Some(gate_reason(
+                    IMPLEMENT_GATE_SAME_CONTEXT,
+                    "Awaiting same-context reviewer gate",
+                )),
                 ..StatusPatch::default()
             },
             config,
@@ -2776,6 +2816,7 @@ where
                 &phase_decisions,
                 &reviewer_history,
             ),
+            None,
             config,
         ) {
             let status = status_for_error(&err);
@@ -2804,7 +2845,10 @@ where
                 StatusPatch {
                     status: Some(Status::NeedsChanges),
                     round: Some(round),
-                    reason: Some(STALE_TIMESTAMP_REASON.to_string()),
+                    reason: Some(gate_reason(
+                        IMPLEMENT_GATE_SAME_CONTEXT,
+                        STALE_TIMESTAMP_REASON,
+                    )),
                     ..StatusPatch::default()
                 },
                 config,
@@ -2840,7 +2884,10 @@ where
                     StatusPatch {
                         status: Some(reviewer_findings.status),
                         round: Some(round),
-                        reason: reviewer_findings.reason.clone(),
+                        reason: gate_reason_opt(
+                            IMPLEMENT_GATE_SAME_CONTEXT,
+                            reviewer_findings.reason.clone(),
+                        ),
                         ..StatusPatch::default()
                     },
                     config,
@@ -2895,12 +2942,9 @@ where
                         &mut log_fn,
                     );
                     return true;
-                } else if is_perfect_score {
-                    // === BRANCH 2: Dual-agent 5/5 — adversarial second review ===
-                    log_fn(
-                        "🔍 Perfect score — running adversarial second review...",
-                        config,
-                    );
+                } else if !config.single_agent {
+                    // === BRANCH 2: Dual-agent — mandatory fresh-context reviewer gate ===
+                    log_fn("🔍 Gate B: running fresh-context reviewer pass...", config);
                     let first_review = read_state_file_fn("review.md", config);
                     let findings_before_adversarial_result = read_findings_with_warnings(config);
                     for warning in &findings_before_adversarial_result.warnings {
@@ -2911,26 +2955,27 @@ where
                         round,
                     );
 
-                    // Write intermediate Reviewing status before adversarial call.
-                    // This prevents false consensus if the adversarial agent fails to
-                    // update status.json — the status stays Reviewing (not Approved),
-                    // so implementation_reviewer_decision returns NeedsChanges.
+                    // Write intermediate Reviewing status before fresh-context gate call.
                     write_status_fn(
                         StatusPatch {
                             status: Some(Status::Reviewing),
                             round: Some(round),
-                            reason: Some("Awaiting adversarial second review".to_string()),
+                            reason: Some(gate_reason(
+                                IMPLEMENT_GATE_FRESH_CONTEXT,
+                                "Awaiting fresh-context reviewer gate",
+                            )),
                             ..StatusPatch::default()
                         },
                         config,
                     );
 
                     let adversarial_timestamp = timestamp_fn();
+                    let fresh_session_hint = format!("fresh-context-review-r{round}");
 
                     if let Err(err) = run_agent_fn(
                         &config.reviewer,
                         AgentRole::Reviewer,
-                        &implementation_adversarial_review_prompt(
+                        &implementation_fresh_context_reviewer_prompt(
                             config,
                             &task,
                             &plan,
@@ -2940,8 +2985,12 @@ where
                             round,
                             &adversarial_timestamp,
                             &paths,
+                            &open_findings_for_prompt,
                             quality_checks_output.as_deref(),
+                            &phase_decisions,
+                            &reviewer_history,
                         ),
+                        Some(fresh_session_hint.as_str()),
                         config,
                     ) {
                         let status = status_for_error(&err);
@@ -2965,14 +3014,17 @@ where
                         && is_status_stale(&adversarial_timestamp, &adversarial_status)
                     {
                         log_fn(
-                            "⚠️ Stale status after adversarial review — writing NeedsChanges fallback",
+                            "⚠️ Stale status after fresh-context review — writing NeedsChanges fallback",
                             config,
                         );
                         write_status_fn(
                             StatusPatch {
                                 status: Some(Status::NeedsChanges),
                                 round: Some(round),
-                                reason: Some(STALE_TIMESTAMP_REASON.to_string()),
+                                reason: Some(gate_reason(
+                                    IMPLEMENT_GATE_FRESH_CONTEXT,
+                                    STALE_TIMESTAMP_REASON,
+                                )),
                                 ..StatusPatch::default()
                             },
                             config,
@@ -3012,7 +3064,10 @@ where
                                 StatusPatch {
                                     status: Some(adversarial_findings.status),
                                     round: Some(round),
-                                    reason: adversarial_findings.reason.clone(),
+                                    reason: gate_reason_opt(
+                                        IMPLEMENT_GATE_FRESH_CONTEXT,
+                                        adversarial_findings.reason.clone(),
+                                    ),
                                     ..StatusPatch::default()
                                 },
                                 config,
@@ -3022,22 +3077,22 @@ where
                     }
 
                     let adversarial_summary = match adversarial_status.status {
-                        Status::Approved => "APPROVED (adversarial)".to_string(),
+                        Status::Approved => "APPROVED (fresh-context)".to_string(),
                         Status::NeedsChanges => format!(
-                            "NEEDS_CHANGES (adversarial) — {}",
+                            "NEEDS_CHANGES (fresh-context) — {}",
                             adversarial_status
                                 .reason
                                 .as_deref()
                                 .unwrap_or("see review.md")
                         ),
-                        other => format!("{other} (adversarial)"),
+                        other => format!("{other} (fresh-context)"),
                     };
-                    append_history_fn(round, "adversarial-review", &adversarial_summary, config);
+                    append_history_fn(round, "fresh-review", &adversarial_summary, config);
 
                     match implementation_reviewer_decision(adversarial_status.status) {
                         ImplementationReviewerDecision::Approved => {
                             log_fn(
-                                "🤝 Adversarial review approved — running implementer self-review...",
+                                "🤝 Fresh-context review approved — checking implementer consensus...",
                                 config,
                             );
 
@@ -3047,6 +3102,19 @@ where
                                 round,
                             ));
                             let consensus_prompt_timestamp = timestamp_fn();
+                            write_status_fn(
+                                StatusPatch {
+                                    status: Some(Status::Reviewing),
+                                    round: Some(round),
+                                    reason: Some(gate_reason(
+                                        IMPLEMENT_GATE_SIGNOFF,
+                                        "Awaiting implementer signoff",
+                                    )),
+                                    ..StatusPatch::default()
+                                },
+                                config,
+                            );
+                            let signoff_session_hint = format!("fresh-context-signoff-r{round}");
                             if let Err(err) = run_agent_fn(
                                 &config.implementer,
                                 AgentRole::Implementer,
@@ -3060,6 +3128,7 @@ where
                                     &consensus_prompt_timestamp,
                                     &paths,
                                 ),
+                                Some(signoff_session_hint.as_str()),
                                 config,
                             ) {
                                 let status = status_for_error(&err);
@@ -3090,7 +3159,10 @@ where
                                     StatusPatch {
                                         status: Some(Status::Disputed),
                                         round: Some(round),
-                                        reason: Some(STALE_TIMESTAMP_REASON.to_string()),
+                                        reason: Some(gate_reason(
+                                            IMPLEMENT_GATE_SIGNOFF,
+                                            STALE_TIMESTAMP_REASON,
+                                        )),
                                         ..StatusPatch::default()
                                     },
                                     config,
@@ -3175,7 +3247,7 @@ where
                         ImplementationReviewerDecision::NeedsChanges => {
                             log_fn(
                                 &format!(
-                                    "⚠ Adversarial review found issues: {}",
+                                    "⚠ Fresh-context review found issues: {}",
                                     adversarial_status
                                         .reason
                                         .as_deref()
@@ -3233,137 +3305,6 @@ where
                         &mut log_fn,
                     );
                     return true;
-                } else {
-                    // === BRANCH 3b: Dual-agent non-5/5 — implementer consensus flow ===
-                    log_fn(
-                        "🤝 Reviewer approved — checking implementer consensus...",
-                        config,
-                    );
-
-                    let review = read_state_file_fn("review.md", config);
-                    let open_findings = findings_for_prompt(&normalize_findings_for_round(
-                        read_findings(config),
-                        round,
-                    ));
-                    let consensus_prompt_timestamp = timestamp_fn();
-                    if let Err(err) = run_agent_fn(
-                        &config.implementer,
-                        AgentRole::Implementer,
-                        &implementation_consensus_prompt(
-                            config,
-                            &task,
-                            &plan,
-                            &review,
-                            &open_findings,
-                            round,
-                            &consensus_prompt_timestamp,
-                            &paths,
-                        ),
-                        config,
-                    ) {
-                        let status = status_for_error(&err);
-                        let reason = err.to_string();
-                        log_fn(&format!("❌ {reason}"), config);
-                        write_status_fn(
-                            StatusPatch {
-                                status: Some(status),
-                                round: Some(round),
-                                reason: Some(reason),
-                                ..StatusPatch::default()
-                            },
-                            config,
-                        );
-                        record_struggle_signal(&task, &err.to_string(), round, config);
-                        return false;
-                    }
-
-                    let mut final_status = read_status_fn(config);
-                    if final_status.status != Status::Error
-                        && is_status_stale(&consensus_prompt_timestamp, &final_status)
-                    {
-                        log_fn(
-                            "⚠️ Stale status detected after implementation consensus — writing Disputed fallback",
-                            config,
-                        );
-                        write_status_fn(
-                            StatusPatch {
-                                status: Some(Status::Disputed),
-                                round: Some(round),
-                                reason: Some(STALE_TIMESTAMP_REASON.to_string()),
-                                ..StatusPatch::default()
-                            },
-                            config,
-                        );
-                        final_status = read_status_fn(config);
-                    }
-
-                    if final_status.rating.is_none()
-                        && let Some(r) = reviewer_rating
-                    {
-                        write_status_fn(
-                            StatusPatch {
-                                rating: Some(r),
-                                ..StatusPatch::default()
-                            },
-                            config,
-                        );
-                    }
-
-                    let consensus_summary = match final_status.status {
-                        Status::Consensus => "CONSENSUS".to_string(),
-                        Status::Disputed => {
-                            format!(
-                                "DISPUTED — {}",
-                                final_status.reason.as_deref().unwrap_or("see status.json")
-                            )
-                        }
-                        other => format!("{other}"),
-                    };
-                    append_history_fn(round, "consensus", &consensus_summary, config);
-
-                    match implementation_consensus_decision(final_status.status) {
-                        ImplementationConsensusDecision::Consensus => {
-                            log_fn(&format!("\n🎉 CONSENSUS reached in round {round}!"), config);
-                            git_checkpoint_fn(
-                                &format!("consensus-round-{round}"),
-                                config,
-                                baseline_files,
-                            );
-                            run_compound_phase_with_runner(
-                                &task,
-                                &plan,
-                                config,
-                                &mut run_agent_fn,
-                                &mut log_fn,
-                            );
-                            return true;
-                        }
-                        ImplementationConsensusDecision::Disputed
-                        | ImplementationConsensusDecision::Continue => {
-                            log_fn(
-                                &format!(
-                                    "⚠ Implementer disputed: {}",
-                                    final_status.reason.as_deref().unwrap_or("see status.json")
-                                ),
-                                config,
-                            );
-                        }
-                        ImplementationConsensusDecision::Error => {
-                            let reason = status_error_reason(&final_status);
-                            log_fn(&format!("❌ {reason}"), config);
-                            write_status_fn(
-                                StatusPatch {
-                                    status: Some(Status::Error),
-                                    round: Some(round),
-                                    reason: Some(reason.clone()),
-                                    ..StatusPatch::default()
-                                },
-                                config,
-                            );
-                            record_struggle_signal(&task, &reason, round, config);
-                            return false;
-                        }
-                    }
                 }
             }
             ImplementationReviewerDecision::NeedsChanges => {}
@@ -3405,6 +3346,7 @@ where
         StatusPatch {
             status: Some(Status::MaxRounds),
             round: Some(round),
+            reason: Some(issue.clone()),
             ..StatusPatch::default()
         },
         config,
@@ -3418,7 +3360,11 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
+        |agent: &crate::config::Agent,
+         role: AgentRole,
+         prompt,
+         session_hint: Option<&str>,
+         current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -3430,7 +3376,10 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
                 AgentRole::Reviewer => "reviewer",
                 AgentRole::Planner => "planner",
             };
-            let session_key = format!("implement-{}-{}", role_str, agent.name());
+            let session_key = match session_hint {
+                Some(hint) => format!("implement-{}-{}-{}", role_str, agent.name(), hint),
+                None => format!("implement-{}-{}", role_str, agent.name()),
+            };
             run_agent_with_session(
                 agent,
                 prompt,
@@ -3474,7 +3423,11 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
     implementation_loop_internal(
         config,
         baseline_files,
-        |agent: &crate::config::Agent, role: AgentRole, prompt, current_config| {
+        |agent: &crate::config::Agent,
+         role: AgentRole,
+         prompt,
+         session_hint: Option<&str>,
+         current_config| {
             let sp = system_prompt_for_role(role, current_config);
             let sp_ref = if sp.is_empty() {
                 None
@@ -3486,7 +3439,10 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
                 AgentRole::Reviewer => "reviewer",
                 AgentRole::Planner => "planner",
             };
-            let session_key = format!("implement-{}-{}", role_str, agent.name());
+            let session_key = match session_hint {
+                Some(hint) => format!("implement-{}-{}-{}", role_str, agent.name(), hint),
+                None => format!("implement-{}-{}", role_str, agent.name()),
+            };
             run_agent_with_session(
                 agent,
                 prompt,
@@ -3630,7 +3586,11 @@ mod tests {
             "Task",
             "Plan",
             &enabled,
-            &mut |_agent: &crate::config::Agent, _role: AgentRole, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent,
+                  _role: AgentRole,
+                  _prompt,
+                  _session_hint,
+                  _config| {
                 enabled_calls += 1;
                 Ok(())
             },
@@ -3643,7 +3603,11 @@ mod tests {
             "Task",
             "Plan",
             &disabled,
-            &mut |_agent: &crate::config::Agent, _role: AgentRole, _prompt, _config| {
+            &mut |_agent: &crate::config::Agent,
+                  _role: AgentRole,
+                  _prompt,
+                  _session_hint,
+                  _config| {
                 disabled_calls += 1;
                 Ok(())
             },
@@ -4684,7 +4648,7 @@ More text.
         implementation_loop_internal(
             &config,
             &baseline,
-            |_agent, role, _prompt, _cfg| {
+            |_agent, role, _prompt, _session_hint, _cfg| {
                 agent_calls.push((format!("{role:?}"), "called".to_string()));
                 Ok(())
             },
@@ -4730,6 +4694,203 @@ More text.
         // No third consensus call should happen.
         let role_names: Vec<&str> = agent_calls.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(role_names, vec!["Implementer", "Reviewer"]);
+    }
+
+    #[test]
+    fn implementation_dual_agent_non_5_5_runs_fresh_context_gate_before_signoff() {
+        let root = create_temp_project_root("phases_impl_da_fresh_gate");
+        let config = make_test_config(
+            &root,
+            TestConfigOptions {
+                single_agent: false,
+                review_max_rounds: 2,
+                compound: false,
+                ..Default::default()
+            },
+        );
+
+        let baseline = HashSet::new();
+        let calls: std::cell::RefCell<Vec<(String, Option<String>)>> =
+            std::cell::RefCell::new(Vec::new());
+        let status_calls = std::cell::RefCell::new(0usize);
+
+        let reached = implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, role, _prompt, session_hint, _cfg| {
+                calls
+                    .borrow_mut()
+                    .push((format!("{role:?}"), session_hint.map(|s| s.to_string())));
+                Ok(())
+            },
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |_patch, _cfg| {},
+            |name, _cfg| {
+                if name == "review.md" {
+                    return "Gate review".to_string();
+                }
+                String::new()
+            },
+            |_cfg| {
+                let mut idx = status_calls.borrow_mut();
+                let status = match *idx {
+                    0 => LoopStatus {
+                        status: Status::Approved,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "codex".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: None,
+                        rating: Some(3),
+                        timestamp: "ts".to_string(),
+                    },
+                    1 => LoopStatus {
+                        status: Status::Approved,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "codex".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: None,
+                        rating: Some(4),
+                        timestamp: "ts".to_string(),
+                    },
+                    _ => LoopStatus {
+                        status: Status::Consensus,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "codex".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: None,
+                        rating: Some(4),
+                        timestamp: "ts".to_string(),
+                    },
+                };
+                *idx += 1;
+                status
+            },
+            |_head, _cfg| String::new(),
+            || "ts".to_string(),
+            |_cfg, _max| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        assert!(reached, "dual-agent loop should reach consensus");
+        let observed = calls.borrow();
+        assert_eq!(
+            observed.len(),
+            4,
+            "expected implementer + gate A reviewer + gate B reviewer + signoff implementer"
+        );
+        assert_eq!(observed[0].0, "Implementer");
+        assert_eq!(observed[0].1, None);
+        assert_eq!(observed[1].0, "Reviewer");
+        assert_eq!(observed[1].1, None);
+        assert_eq!(observed[2].0, "Reviewer");
+        assert_eq!(
+            observed[2].1.as_deref(),
+            Some("fresh-context-review-r1"),
+            "gate B reviewer should use fresh-context session hint"
+        );
+        assert_eq!(observed[3].0, "Implementer");
+        assert_eq!(
+            observed[3].1.as_deref(),
+            Some("fresh-context-signoff-r1"),
+            "signoff should use fresh implementer session hint"
+        );
+    }
+
+    #[test]
+    fn implementation_dual_agent_max_rounds_in_fresh_context_preserves_gate_reason() {
+        let root = create_temp_project_root("phases_impl_da_max_rounds_fresh");
+        let config = make_test_config(
+            &root,
+            TestConfigOptions {
+                single_agent: false,
+                review_max_rounds: 1,
+                compound: false,
+                ..Default::default()
+            },
+        );
+
+        let baseline = HashSet::new();
+        let status_calls = std::cell::RefCell::new(0usize);
+        let written: std::cell::RefCell<Vec<StatusPatch>> = std::cell::RefCell::new(Vec::new());
+
+        let reached = implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, _role, _prompt, _session_hint, _cfg| Ok(()),
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |patch, _cfg| {
+                written.borrow_mut().push(patch);
+            },
+            |name, _cfg| {
+                if name == "review.md" {
+                    return "Gate review".to_string();
+                }
+                String::new()
+            },
+            |_cfg| {
+                let mut idx = status_calls.borrow_mut();
+                let status = if *idx == 0 {
+                    LoopStatus {
+                        status: Status::Approved,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "codex".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: None,
+                        rating: Some(3),
+                        timestamp: "ts".to_string(),
+                    }
+                } else {
+                    LoopStatus {
+                        status: Status::NeedsChanges,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "codex".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: Some(
+                            "[gate:fresh-context] Open findings: F-001. See .agent-loop/state/findings.json."
+                                .to_string(),
+                        ),
+                        rating: Some(3),
+                        timestamp: "ts".to_string(),
+                    }
+                };
+                *idx += 1;
+                status
+            },
+            |_head, _cfg| String::new(),
+            || "ts".to_string(),
+            |_cfg, _max| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        assert!(!reached, "loop should stop at configured max rounds");
+        let max_round_patch = written
+            .borrow()
+            .iter()
+            .find(|p| p.status == Some(Status::MaxRounds))
+            .cloned()
+            .expect("max-rounds status patch should be written");
+        assert!(
+            max_round_patch
+                .reason
+                .as_deref()
+                .unwrap_or("")
+                .contains(IMPLEMENT_GATE_FRESH_CONTEXT),
+            "max-rounds reason should preserve fresh-context gate marker"
+        );
     }
 
     // -----------------------------------------------------------------------

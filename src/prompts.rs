@@ -793,7 +793,7 @@ Allowed categories: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY."
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn implementation_adversarial_review_prompt(
+pub(crate) fn implementation_fresh_context_reviewer_prompt(
     config: &Config,
     task: &str,
     plan: &str,
@@ -803,33 +803,47 @@ pub(crate) fn implementation_adversarial_review_prompt(
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
+    open_findings: &str,
     quality_checks: Option<&str>,
+    decisions: &str,
+    round_history: &str,
 ) -> String {
     let quality_section = match quality_checks {
         Some(checks) if !checks.trim().is_empty() => format!("\n\n{checks}"),
         _ => String::new(),
     };
+    let findings_section = if open_findings.trim().is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nOPEN FINDINGS FROM PREVIOUS ROUND (keep IDs for still-open issues):\n{open_findings}"
+        )
+    };
+    let history_section = if round_history.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\nROUND HISTORY:\n{round_history}")
+    };
+    let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "{}You are a SECOND REVIEWER performing an adversarial review in round {round}.\n\n\
-        A first reviewer has already approved this implementation with a perfect 5/5 rating. \
-        Your job is to find what the first reviewer missed. Look for subtle bugs, edge cases, \
-        missing error handling, security issues, insufficient tests, or design flaws that a \
-        favorable first review might overlook.\n\n\
+        "{}You are the REVIEWER in a mandatory fresh-context Gate B pass (round {round}).\n\n\
+        A same-context reviewer has already approved this round. Your role is independent verification \
+        from a fresh context.\n\n\
         IMPORTANT GUARDRAIL: If you find no meaningful issues after thorough analysis, then \
-        APPROVED is the correct verdict. Do not manufacture issues or nitpick for the sake of \
-        finding problems.\n\n\
+        APPROVED is the correct verdict. Do not manufacture issues.\n\n\
         TASK:\n{task}\n\n\
-        PLAN:\n{plan}\n\n\
+        PLAN:\n{plan}{decisions_section}\n\n\
         CHANGES SUMMARY:\n{changes}\n\n\
-        ACTUAL CODE DIFF:\n{diff}\n\n\
-        FIRST REVIEWER'S ASSESSMENT:\n{first_review}{quality_section}\n\n\
-        Focus your adversarial review on:\n\
-        1. Bugs or edge cases the first reviewer may have overlooked\n\
-        2. Missing or insufficient test coverage\n\
-        3. Security vulnerabilities or unsafe patterns\n\
-        4. Deviations from the plan that weren't flagged\n\
-        5. Error handling gaps or silent failures\n\n\
+        ACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{findings_section}\n\n\
+        GATE A REVIEW (same-context reviewer):\n{first_review}\n\n\
+        Review the ACTUAL code changes shown in the diff above (not just the summary).\n\n\
+        Focus this fresh-context review on:\n\
+        1. Bugs or edge cases missed by Gate A\n\
+        2. Missing or insufficient tests\n\
+        3. Security weaknesses or unsafe patterns\n\
+        4. Plan deviations not previously flagged\n\
+        5. Error-handling gaps and silent failures\n\n\
         Write your detailed review to: {}\n\n\
         Also write structured findings JSON to {}:\n\
         - If APPROVED: {{\"round\": {round}, \"findings\": []}}\n\
@@ -842,9 +856,9 @@ pub(crate) fn implementation_adversarial_review_prompt(
         4 = good (solid implementation, minor issues only)\n  \
         5 = excellent (clean, well-tested, follows plan precisely)\n\n\
         Then write one of these to {}:\n\n\
-        If APPROVED (no meaningful issues found):\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 5, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If CHANGES NEEDED (found issues the first reviewer missed):\n\
+        If APPROVED:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If CHANGES NEEDED:\n\
         {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 3, \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
@@ -1656,10 +1670,7 @@ mod tests {
             prompt.contains("## Completeness"),
             "missing Completeness section"
         );
-        assert!(
-            prompt.contains("## Accuracy"),
-            "missing Accuracy section"
-        );
+        assert!(prompt.contains("## Accuracy"), "missing Accuracy section");
         assert!(
             prompt.contains("## Feasibility"),
             "missing Feasibility section"
@@ -1763,10 +1774,10 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_review_prompt_contains_diff_and_first_review() {
+    fn fresh_context_review_prompt_contains_diff_and_first_review() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = implementation_adversarial_review_prompt(
+        let prompt = implementation_fresh_context_reviewer_prompt(
             &config,
             "Task",
             "Plan",
@@ -1776,24 +1787,27 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
+            "",
+            "",
         );
 
         assert!(
             prompt.contains("diff --git a/file.rs\n+new code"),
-            "adversarial prompt should contain the diff"
+            "fresh-context prompt should contain the diff"
         );
         assert!(
             prompt.contains("First review: looks great!"),
-            "adversarial prompt should contain the first review"
+            "fresh-context prompt should contain the first review"
         );
     }
 
     #[test]
-    fn adversarial_review_prompt_contains_guardrail_and_framing() {
+    fn fresh_context_review_prompt_contains_guardrail_and_framing() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = implementation_adversarial_review_prompt(
+        let prompt = implementation_fresh_context_reviewer_prompt(
             &config,
             "Task",
             "Plan",
@@ -1803,29 +1817,32 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
+            "",
+            "",
         );
 
         assert!(
-            prompt.contains("find what the first reviewer missed"),
-            "adversarial prompt should contain adversarial framing"
+            prompt.contains("mandatory fresh-context Gate B pass"),
+            "fresh-context prompt should contain gate framing"
         );
         assert!(
             prompt.contains("no meaningful issues"),
-            "adversarial prompt should contain guardrail text"
+            "fresh-context prompt should contain guardrail text"
         );
         assert!(
             prompt.contains("Do not manufacture issues"),
-            "adversarial prompt should discourage false negatives"
+            "fresh-context prompt should discourage manufactured findings"
         );
     }
 
     #[test]
-    fn adversarial_review_prompt_includes_quality_checks_when_provided() {
+    fn fresh_context_review_prompt_includes_quality_checks_when_provided() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let checks = "QUALITY CHECKS:\n\n--- cargo test [PASS] ---\nAll 42 tests passed.";
-        let prompt = implementation_adversarial_review_prompt(
+        let prompt = implementation_fresh_context_reviewer_prompt(
             &config,
             "Task",
             "Plan",
@@ -1835,7 +1852,10 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             Some(checks),
+            "",
+            "",
         );
 
         assert!(prompt.contains("QUALITY CHECKS:"));
@@ -1843,10 +1863,10 @@ mod tests {
     }
 
     #[test]
-    fn adversarial_review_prompt_omits_quality_checks_when_none() {
+    fn fresh_context_review_prompt_omits_quality_checks_when_none() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = implementation_adversarial_review_prompt(
+        let prompt = implementation_fresh_context_reviewer_prompt(
             &config,
             "Task",
             "Plan",
@@ -1856,17 +1876,20 @@ mod tests {
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
+            "",
             None,
+            "",
+            "",
         );
 
         assert!(!prompt.contains("QUALITY CHECKS:"));
     }
 
     #[test]
-    fn adversarial_review_prompt_includes_json_status_templates() {
+    fn fresh_context_review_prompt_includes_json_status_templates() {
         let config = test_config_for_prompts();
         let paths = test_phase_paths();
-        let prompt = implementation_adversarial_review_prompt(
+        let prompt = implementation_fresh_context_reviewer_prompt(
             &config,
             "Task",
             "Plan",
@@ -1876,7 +1899,10 @@ mod tests {
             2,
             "2026-02-15T12:00:00.000Z",
             &paths,
+            "",
             None,
+            "",
+            "",
         );
 
         assert!(
@@ -1903,6 +1929,39 @@ mod tests {
             prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
             "missing timestamp in JSON status"
         );
+        assert!(
+            !prompt.contains("\"status\": \"CONSENSUS\""),
+            "fresh-context reviewer must not write consensus statuses"
+        );
+        assert!(
+            prompt.contains("\"file_refs\":"),
+            "fresh-context findings template should require file_refs evidence"
+        );
+    }
+
+    #[test]
+    fn fresh_context_review_prompt_includes_open_findings_history_and_decisions() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = implementation_fresh_context_reviewer_prompt(
+            &config,
+            "Task",
+            "Plan",
+            "Changes",
+            "diff content",
+            "First review text",
+            3,
+            "2026-02-15T12:00:00.000Z",
+            &paths,
+            "- F-001 [HIGH] missing check (src/lib.rs:10)",
+            Some("QUALITY CHECKS:\nPASS"),
+            "- [PATTERN] keep IDs stable",
+            "Round 1 implementation: x\nRound 1 review: NEEDS_CHANGES",
+        );
+
+        assert!(prompt.contains("OPEN FINDINGS FROM PREVIOUS ROUND"));
+        assert!(prompt.contains("ROUND HISTORY:"));
+        assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
     }
 
     // -----------------------------------------------------------------------

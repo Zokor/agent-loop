@@ -127,7 +127,9 @@ Implement single-agent:
   (5/5 remains auto-consensus)
 
 Implement dual-agent:
-  reviewer APPROVED -> implementer signoff (CONSENSUS or DISPUTED)
+  reviewer APPROVED (same-context gate)
+  -> reviewer APPROVED (fresh-context gate)
+  -> implementer signoff (CONSENSUS or DISPUTED)
 ```
 
 ## Wave Mode
@@ -319,15 +321,19 @@ After plan consensus, the decomposition reviewer validates the task breakdown:
 
 ### Implementation Review
 
-After each implementation round, the reviewer evaluates:
+After each implementation round, Gate A reviewer evaluates:
 - **Correctness** — code matches plan, no bugs or edge cases
 - **Tests** — present, sufficient, covering key scenarios
 - **Style** — clean, maintainable, follows project conventions
 - **Security** — vulnerabilities, error handling adequacy
 
-Implementation findings use `F-xxx` IDs with severity levels (HIGH/MEDIUM/LOW)
-and a quality rating (1-5). A perfect 5/5 triggers an additional adversarial review
-to catch what the first reviewer missed.
+In dual-agent mode, every Gate A approval triggers a mandatory Gate B fresh-context
+reviewer pass using the same findings protocol (`F-xxx` IDs with severity and
+`file_refs` evidence). Only when both reviewer gates approve does implementer
+signoff run.
+
+`REVIEW_MAX_ROUNDS` is shared across the full implementation loop (implementer work,
+Gate A review, Gate B review, and signoff), not per gate.
 
 ## Decisions And Compound
 
