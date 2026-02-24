@@ -277,6 +277,12 @@ fn remove_project_guide_decisions_references(config: &Config) {
 // ---------------------------------------------------------------------------
 
 /// Metadata for a single agent invocation, passed from the phase/runner layer.
+/// Fallback workflow label for agent calls that originate outside the
+/// phase system (e.g. direct `run_agent()` calls in tests or one-off use).
+pub const FALLBACK_WORKFLOW: &str = "direct";
+/// Fallback phase label for agent calls not associated with a named phase.
+pub const FALLBACK_PHASE: &str = "untracked";
+
 #[derive(Debug, Clone, Default)]
 pub struct AgentCallMeta {
     pub workflow: String,
@@ -285,6 +291,14 @@ pub struct AgentCallMeta {
     pub role: String,
     pub agent_name: String,
     pub session_hint: Option<String>,
+}
+
+impl AgentCallMeta {
+    /// Returns `true` when this metadata was populated by a phase caller
+    /// (i.e. workflow and phase are not the fallback sentinel values).
+    pub fn is_phase_tracked(&self) -> bool {
+        self.workflow != FALLBACK_WORKFLOW || self.phase != FALLBACK_PHASE
+    }
 }
 
 /// Append a human-readable transcript entry to `.agent-loop/state/transcript.log`.
@@ -301,6 +315,14 @@ pub fn append_transcript_entry(
         return;
     }
 
+    // Debug-mode sanity check: phase callers should always provide real
+    // metadata.  Fallback "direct/untracked" entries are expected only from
+    // run_agent() (non-session, non-phase) calls.
+    debug_assert!(
+        !meta.workflow.is_empty() && !meta.phase.is_empty(),
+        "transcript entry has empty workflow/phase — caller should provide AgentCallMeta"
+    );
+
     let path = config.state_dir.join("transcript.log");
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
@@ -309,6 +331,9 @@ pub fn append_transcript_entry(
     let ts = timestamp();
     let mut entry = String::new();
     entry.push_str(&format!("=== AGENT CALL [{ts}] ===\n"));
+    if !meta.is_phase_tracked() {
+        entry.push_str("tracking: untracked (direct agent call)\n");
+    }
     entry.push_str(&format!("workflow: {}\n", meta.workflow));
     entry.push_str(&format!("phase: {}\n", meta.phase));
     entry.push_str(&format!("round: {}\n", meta.round));
@@ -3721,7 +3746,11 @@ mod tests {
         fs::write(&path, &big).unwrap();
 
         // Now append a new entry which triggers rotation
-        let meta = AgentCallMeta::default();
+        let meta = AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            ..AgentCallMeta::default()
+        };
         append_transcript_entry(&project.config, &meta, "p", None, "o");
 
         let content = fs::read_to_string(&path).unwrap();
@@ -3731,5 +3760,79 @@ mod tests {
             "transcript should be rotated: got {line_count} lines"
         );
         assert!(content.starts_with("[transcript rotated]"));
+    }
+
+    #[test]
+    fn agent_call_meta_is_phase_tracked_returns_true_for_real_phases() {
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "gate-a-review".to_string(),
+            round: 2,
+            role: "reviewer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        assert!(meta.is_phase_tracked(), "real phase meta must be tracked");
+    }
+
+    #[test]
+    fn agent_call_meta_is_phase_tracked_returns_false_for_fallback() {
+        let meta = AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            round: 0,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        assert!(!meta.is_phase_tracked(), "fallback meta must not be tracked");
+    }
+
+    #[test]
+    fn transcript_entry_includes_untracked_annotation_for_fallback() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            round: 0,
+            role: "unknown".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        append_transcript_entry(&project.config, &meta, "p", None, "o");
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("tracking: untracked (direct agent call)"),
+            "fallback entries must include tracking annotation, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn transcript_entry_omits_untracked_annotation_for_phase_meta() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 1,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        append_transcript_entry(&project.config, &meta, "p", None, "o");
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("tracking: untracked"),
+            "phase-tracked entries must NOT include untracked annotation, got:\n{content}"
+        );
     }
 }

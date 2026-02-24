@@ -18,7 +18,9 @@ use crate::{
     config::{Agent, Config},
     error::AgentLoopError,
     prompts::AgentRole,
-    state::{AgentCallMeta, append_transcript_entry, log, timestamp},
+    state::{
+        AgentCallMeta, FALLBACK_PHASE, FALLBACK_WORKFLOW, append_transcript_entry, log, timestamp,
+    },
 };
 
 pub(crate) fn resolve_command(
@@ -1002,8 +1004,8 @@ fn run_agent_inner(
                 None => "unknown",
             };
             AgentCallMeta {
-                workflow: "direct".to_string(),
-                phase: "untracked".to_string(),
+                workflow: FALLBACK_WORKFLOW.to_string(),
+                phase: FALLBACK_PHASE.to_string(),
                 round: 0,
                 agent_name: agent.name().to_string(),
                 role: role_str.to_string(),
@@ -2384,18 +2386,23 @@ mod tests {
             transcript.contains("agent: claude"),
             "fallback must derive agent_name from agent parameter"
         );
-        // Fallback uses descriptive defaults instead of empty strings
+        // Fallback uses named constants instead of empty strings
         assert!(
-            transcript.contains("workflow: direct"),
-            "fallback must use 'direct' workflow, got: {transcript}"
+            transcript.contains(&format!("workflow: {}", crate::state::FALLBACK_WORKFLOW)),
+            "fallback must use FALLBACK_WORKFLOW constant, got: {transcript}"
         );
         assert!(
-            transcript.contains("phase: untracked"),
-            "fallback must use 'untracked' phase, got: {transcript}"
+            transcript.contains(&format!("phase: {}", crate::state::FALLBACK_PHASE)),
+            "fallback must use FALLBACK_PHASE constant, got: {transcript}"
         );
         assert!(
             transcript.contains("round: 0"),
             "fallback has round 0"
+        );
+        // Untracked entries get a tracking line
+        assert!(
+            transcript.contains("tracking: untracked"),
+            "fallback entries must include tracking: untracked line"
         );
         // No session_key was passed, so session_hint line should be absent
         assert!(
@@ -2445,14 +2452,19 @@ mod tests {
             transcript.contains("agent: claude"),
             "fallback must still derive agent_name"
         );
-        // Fallback uses descriptive defaults for workflow/phase
+        // Fallback uses named constants for workflow/phase
         assert!(
-            transcript.contains("workflow: direct"),
-            "fallback must use 'direct' workflow even with session_key"
+            transcript.contains(&format!("workflow: {}", crate::state::FALLBACK_WORKFLOW)),
+            "fallback must use FALLBACK_WORKFLOW constant even with session_key"
         );
         assert!(
-            transcript.contains("phase: untracked"),
-            "fallback must use 'untracked' phase even with session_key"
+            transcript.contains(&format!("phase: {}", crate::state::FALLBACK_PHASE)),
+            "fallback must use FALLBACK_PHASE constant even with session_key"
+        );
+        // Untracked annotation line present
+        assert!(
+            transcript.contains("tracking: untracked"),
+            "fallback entries must include tracking line even with session_key"
         );
     }
 }

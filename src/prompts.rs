@@ -891,6 +891,47 @@ pub(crate) fn implementation_fresh_context_reviewer_prompt(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn implementation_gate_b_verification_prompt(
+    config: &Config,
+    task: &str,
+    findings_text: &str,
+    review_text: &str,
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "You are the SAME fresh-context reviewer from Gate B (round {round}).\n\n\
+        You previously found the following issues. Re-examine each finding carefully \
+        against the actual code. For each finding, either CONFIRM it is a real issue \
+        or WITHDRAW it if you were mistaken.\n\n\
+        TASK:\n{task}\n\n\
+        YOUR PREVIOUS FINDINGS:\n{findings_text}\n\n\
+        YOUR PREVIOUS REVIEW:\n{review_text}\n\n\
+        Re-read the code for each finding. Be honest — if a finding was incorrect or \
+        based on a misunderstanding, withdraw it.\n\n\
+        If ALL findings are withdrawn, write APPROVED status.\n\
+        If ANY findings are confirmed, write NEEDS_CHANGES status.\n\n\
+        Update findings JSON at {}:\n\
+        - Keep only confirmed findings (remove withdrawn ones)\n\
+        - {{\"round\": {round}, \"findings\": [...confirmed only...]}}\n\n\
+        Write to {}:\n\n\
+        If all withdrawn (APPROVED):\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If any confirmed (NEEDS_CHANGES):\n\
+        {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"confirmed findings summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        path_text(&paths.findings_json),
+        path_text(&paths.status_json),
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
+        config.implementer,
+        config.reviewer,
+        config.run_mode,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2333,6 +2374,43 @@ mod tests {
         assert!(
             !manifest.contains("decisions.md"),
             "decisions.md should be omitted from manifest when disabled"
+        );
+    }
+
+    #[test]
+    fn gate_b_verification_prompt_contains_findings_and_status_templates() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+
+        let prompt = implementation_gate_b_verification_prompt(
+            &config,
+            "Implement auth",
+            "F-001: Race condition in pool.rs:42",
+            "NEEDS_CHANGES: race condition found",
+            3,
+            "2025-01-01T00:00:00Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("Re-examine each finding"),
+            "prompt must ask for re-examination"
+        );
+        assert!(
+            prompt.contains("F-001: Race condition"),
+            "prompt must include the findings text"
+        );
+        assert!(
+            prompt.contains("NEEDS_CHANGES"),
+            "prompt must include previous review text"
+        );
+        assert!(
+            prompt.contains("APPROVED"),
+            "prompt must have APPROVED template"
+        );
+        assert!(
+            prompt.contains("\"round\": 3"),
+            "prompt must include round number in JSON templates"
         );
     }
 }
