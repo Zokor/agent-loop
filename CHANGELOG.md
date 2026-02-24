@@ -5,6 +5,9 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- `decisions_enabled` toggle (default: `true`): master switch for the decisions subsystem. When `false`, `decisions.md` is not created or read, decision capture instructions are omitted from prompts, struggle signals are not recorded, compound learning is skipped, and managed reference blocks are removed from project guides.
+- `decisions_auto_reference` toggle (default: `true`): controls automatic syncing of managed decisions-reference blocks into `AGENTS.md`/`CLAUDE.md`. Set to `false` to keep `decisions.md` but skip reference syncing.
+- `transcript_enabled` toggle (default: `false`): writes a human-readable per-agent-call transcript to `.agent-loop/state/transcript.log` with metadata (workflow, phase, round, role, agent). Auto-rotates at 10,000 lines.
 - Structured phase workflow commands: `plan`, `tasks`, and `implement`.
 - Batch implementation mode by default (`implement` runs all tasks from `.agent-loop/state/tasks.md` in one loop).
 - Task lifecycle persistence for status and metrics in `.agent-loop/state/task_status.json` and `.agent-loop/state/task_metrics.json`.

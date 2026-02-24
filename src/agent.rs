@@ -18,7 +18,7 @@ use crate::{
     config::{Agent, Config},
     error::AgentLoopError,
     prompts::AgentRole,
-    state::{log, timestamp},
+    state::{AgentCallMeta, append_transcript_entry, log, timestamp},
 };
 
 pub(crate) fn resolve_command(
@@ -986,6 +986,25 @@ fn run_agent_inner(
     let raw_has_resume_error = session_id.is_some() && has_session_resume_error(&combined_output);
 
     let normalized_output = normalize_agent_output(agent, combined_output);
+
+    // Transcript capture: append human-readable entry before error checks
+    // so we capture data even for interrupted/timed-out calls.
+    if config.transcript_enabled {
+        let role_str = match role {
+            Some(AgentRole::Implementer) => "implementer",
+            Some(AgentRole::Reviewer) => "reviewer",
+            Some(AgentRole::Planner) => "planner",
+            None => "unknown",
+        };
+        let meta = AgentCallMeta {
+            agent_name: agent.name().to_string(),
+            role: role_str.to_string(),
+            session_hint: session_key.map(ToString::to_string),
+            ..AgentCallMeta::default()
+        };
+        append_transcript_entry(config, &meta, prompt, system_prompt, &normalized_output);
+    }
+
     if let Err(err) = append_response_block(agent, &normalized_output, config) {
         let _ = log(&format!("⚠ {agent} error: {err}"), config);
     }

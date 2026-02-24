@@ -12,6 +12,8 @@
 # auto_test = false
 # auto_test_cmd = ""
 # compound = true
+# decisions_enabled = true
+# decisions_auto_reference = true
 # decisions_max_lines = 50
 # diff_max_lines = 500
 # context_line_cap = 0
@@ -59,6 +61,9 @@
 # max_parallel = 1
 # wave_lock_stale_seconds = 30
 # wave_shutdown_grace_ms = 30000
+
+# ── Observability ─────────────────────────────────────────────────────────────
+# transcript_enabled = false
 
 # ── Quality commands ─────────────────────────────────────────────────────────
 # Uncomment and customize to define explicit quality checks.

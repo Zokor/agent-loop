@@ -165,12 +165,14 @@ pub(crate) fn state_manifest(config: &Config) -> String {
         root.display()
     ));
 
-    let doc_files: &[(&str, &str)] = &[
+    let mut doc_files: Vec<(&str, &str)> = vec![
         ("README.md", "project documentation"),
         ("CLAUDE.md", "project instructions for AI"),
         ("AGENTS.md", "agent conventions & guidelines"),
-        (".agent-loop/decisions.md", "prior decisions & learnings"),
     ];
+    if config.decisions_enabled {
+        doc_files.push((".agent-loop/decisions.md", "prior decisions & learnings"));
+    }
 
     for (relative, description) in doc_files {
         let full = root.join(relative);
@@ -274,7 +276,9 @@ pub(crate) enum AgentRole {
 pub(crate) fn system_prompt_for_role(role: AgentRole, config: &Config) -> String {
     let mut parts: Vec<String> = Vec::new();
 
-    parts.push(DECISION_CAPTURE_INSTRUCTIONS.to_string());
+    if config.decisions_enabled {
+        parts.push(DECISION_CAPTURE_INSTRUCTIONS.to_string());
+    }
 
     if role == AgentRole::Reviewer && config.single_agent {
         parts.push(SINGLE_AGENT_REVIEWER_PREAMBLE.to_string());
@@ -638,6 +642,7 @@ pub(crate) fn implementation_implementer_prompt(
     decisions: &str,
     paths: &PhasePaths,
     round_history: &str,
+    decisions_enabled: bool,
 ) -> String {
     let review_section = if previous_review.trim().is_empty() {
         "This is the first implementation round.".to_string()
@@ -657,8 +662,14 @@ pub(crate) fn implementation_implementer_prompt(
     };
     let decisions_section = prior_decisions_section(decisions);
 
+    let decision_tail = if decisions_enabled {
+        format!("\n\n{DECISION_CAPTURE_INSTRUCTIONS}")
+    } else {
+        String::new()
+    };
+
     format!(
-        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\n{findings_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Resolving every open finding ID\n- Adding tests where appropriate\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
+        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\n{findings_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Resolving every open finding ID\n- Adding tests where appropriate{decision_tail}",
         path_text(&paths.changes_md)
     )
 }
@@ -677,6 +688,7 @@ pub(crate) fn implementation_reviewer_prompt(
     quality_checks: Option<&str>,
     decisions: &str,
     round_history: &str,
+    decisions_enabled: bool,
 ) -> String {
     let quality_section = match quality_checks {
         Some(checks) if !checks.trim().is_empty() => format!("\n\n{checks}"),
@@ -697,8 +709,14 @@ pub(crate) fn implementation_reviewer_prompt(
     };
     let decisions_section = prior_decisions_section(decisions);
 
+    let decision_tail = if decisions_enabled {
+        format!("\n\n{DECISION_CAPTURE_INSTRUCTIONS}")
+    } else {
+        String::new()
+    };
+
     format!(
-        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{open_findings_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Findings\nList unresolved issues using IDs like F-001, F-002. Include severity and file refs.\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nAlso write structured findings JSON to {}:\n\nIf APPROVED (no unresolved issues):\n{{\"round\": {round}, \"findings\": []}}\n\nIf CHANGES NEEDED:\n{{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what is wrong\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\nRules for findings.json:\n- Include every unresolved issue in the findings array.\n- Keep IDs stable for issues that remain unresolved across rounds.\n- Do not mark APPROVED when findings is non-empty.\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n{DECISION_CAPTURE_INSTRUCTIONS}",
+        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{open_findings_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Findings\nList unresolved issues using IDs like F-001, F-002. Include severity and file refs.\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nAlso write structured findings JSON to {}:\n\nIf APPROVED (no unresolved issues):\n{{\"round\": {round}, \"findings\": []}}\n\nIf CHANGES NEEDED:\n{{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what is wrong\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\nRules for findings.json:\n- Include every unresolved issue in the findings array.\n- Keep IDs stable for issues that remain unresolved across rounds.\n- Do not mark APPROVED when findings is non-empty.\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}{decision_tail}",
         single_agent_reviewer_preamble(config),
         path_text(&paths.review_md),
         path_text(&paths.findings_json),
@@ -1414,6 +1432,7 @@ mod tests {
             None,
             "",
             "",
+            true,
         );
 
         assert!(!prompt.contains("QUALITY CHECKS:"));
@@ -1438,6 +1457,7 @@ mod tests {
             Some(checks),
             "",
             "",
+            true,
         );
 
         assert!(prompt.contains("QUALITY CHECKS:"));
@@ -1465,6 +1485,7 @@ mod tests {
             Some("   "),
             "",
             "",
+            true,
         );
 
         assert!(!prompt.contains("QUALITY CHECKS:"));
@@ -1483,6 +1504,7 @@ mod tests {
             "",
             &paths,
             history,
+            true,
         );
 
         assert!(prompt.contains("ROUND HISTORY:\nRound 1 implementation: Added auth\nRound 1 review: NEEDS_CHANGES — missing validation"));
@@ -1497,7 +1519,7 @@ mod tests {
     #[test]
     fn implementation_implementer_prompt_omits_round_history_when_empty() {
         let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "");
+        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "", true);
 
         assert!(!prompt.contains("ROUND HISTORY:"));
     }
@@ -1506,7 +1528,7 @@ mod tests {
     fn implementation_implementer_prompt_omits_round_history_when_whitespace_only() {
         let paths = test_phase_paths();
         let prompt =
-            implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "   \n  ");
+            implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "   \n  ", true);
 
         assert!(!prompt.contains("ROUND HISTORY:"));
     }
@@ -1523,6 +1545,7 @@ mod tests {
             "",
             &paths,
             "",
+            true,
         );
 
         assert!(prompt.contains("OPEN FINDINGS (resolve every item before approval):"));
@@ -1543,6 +1566,7 @@ mod tests {
             "- [CONSTRAINT] Keep compatibility",
             &paths,
             "",
+            true,
         );
         assert!(implementer.contains("DECISION CAPTURE"));
         assert!(implementer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
@@ -1561,6 +1585,7 @@ mod tests {
             None,
             "- [GOTCHA] Handle stale status writes",
             "",
+            true,
         );
         assert!(reviewer.contains("DECISION CAPTURE"));
         assert!(reviewer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
@@ -1614,6 +1639,7 @@ mod tests {
             None,
             "",
             history,
+            true,
         );
 
         assert!(prompt.contains(
@@ -1644,6 +1670,7 @@ mod tests {
             None,
             "",
             "",
+            true,
         );
 
         assert!(!prompt.contains("ROUND HISTORY:"));
@@ -1696,6 +1723,7 @@ mod tests {
             None,
             "",
             "",
+            true,
         );
 
         assert!(
@@ -1753,6 +1781,7 @@ mod tests {
             None,
             "",
             "",
+            true,
         );
 
         assert!(
@@ -2225,6 +2254,85 @@ mod tests {
         assert!(
             !manifest.contains("conversation.md"),
             "absent conversation.md should be omitted"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // decisions_enabled gating in prompts
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn system_prompt_omits_decision_capture_when_disabled() {
+        let mut config = test_config_for_prompts();
+        config.decisions_enabled = false;
+        let prompt = system_prompt_for_role(AgentRole::Implementer, &config);
+        assert!(
+            !prompt.contains("DECISION CAPTURE"),
+            "decision capture should be absent when decisions disabled"
+        );
+    }
+
+    #[test]
+    fn system_prompt_includes_decision_capture_when_enabled() {
+        let config = test_config_for_prompts();
+        assert!(config.decisions_enabled);
+        let prompt = system_prompt_for_role(AgentRole::Implementer, &config);
+        assert!(
+            prompt.contains("DECISION CAPTURE"),
+            "decision capture should be present when decisions enabled"
+        );
+    }
+
+    #[test]
+    fn implementation_implementer_prompt_omits_decision_capture_when_disabled() {
+        let paths = test_phase_paths();
+        let prompt = implementation_implementer_prompt(
+            1, "Task", "Plan", "", "", "", &paths, "", false,
+        );
+        assert!(
+            !prompt.contains("DECISION CAPTURE"),
+            "decision capture should be absent in implementer prompt when disabled"
+        );
+    }
+
+    #[test]
+    fn implementation_reviewer_prompt_omits_decision_capture_when_disabled() {
+        let config = test_config_for_prompts();
+        let paths = test_phase_paths();
+        let prompt = implementation_reviewer_prompt(
+            &config, "Task", "Plan", "Changes", "diff", 1,
+            "2026-02-15T00:00:00.000Z", &paths, "", None, "", "", false,
+        );
+        assert!(
+            !prompt.contains("DECISION CAPTURE"),
+            "decision capture should be absent in reviewer prompt when disabled"
+        );
+    }
+
+    #[test]
+    fn state_manifest_omits_decisions_file_when_disabled() {
+        let dir = make_temp_dir();
+        let _guard = TempDir(dir.clone());
+
+        let state_dir = dir.join(".agent-loop").join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        let decisions_dir = dir.join(".agent-loop");
+        fs::write(decisions_dir.join("decisions.md"), "decisions").unwrap();
+
+        let mut config = Config {
+            project_dir: dir.clone(),
+            state_dir: state_dir.clone(),
+            ..crate::test_support::make_test_config(
+                &dir,
+                crate::test_support::TestConfigOptions::default(),
+            )
+        };
+        config.decisions_enabled = false;
+
+        let manifest = state_manifest(&config);
+        assert!(
+            !manifest.contains("decisions.md"),
+            "decisions.md should be omitted from manifest when disabled"
         );
     }
 }

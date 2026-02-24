@@ -32,6 +32,8 @@ pub struct TestConfigOptions {
     pub auto_test_cmd: Option<String>,
     pub quality_commands: Vec<QualityCommand>,
     pub compound: bool,
+    pub decisions_enabled: bool,
+    pub decisions_auto_reference: bool,
     pub decisions_max_lines: u32,
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
@@ -59,6 +61,7 @@ pub struct TestConfigOptions {
     pub reviewer_effort_level: Option<String>,
     pub codex_full_access: bool,
     pub codex_session_persistence: bool,
+    pub transcript_enabled: bool,
 }
 
 impl Default for TestConfigOptions {
@@ -76,6 +79,8 @@ impl Default for TestConfigOptions {
             auto_test_cmd: None,
             quality_commands: Vec::new(),
             compound: true,
+            decisions_enabled: true,
+            decisions_auto_reference: true,
             decisions_max_lines: DEFAULT_DECISIONS_MAX_LINES,
             diff_max_lines: None,
             context_line_cap: None,
@@ -103,6 +108,7 @@ impl Default for TestConfigOptions {
             reviewer_effort_level: None,
             codex_full_access: true,
             codex_session_persistence: true,
+            transcript_enabled: false,
         }
     }
 }
@@ -143,6 +149,8 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         auto_test_cmd: options.auto_test_cmd.clone(),
         quality_commands: options.quality_commands.clone(),
         compound: options.compound,
+        decisions_enabled: options.decisions_enabled,
+        decisions_auto_reference: options.decisions_auto_reference,
         decisions_max_lines: options.decisions_max_lines,
         diff_max_lines: options.diff_max_lines,
         context_line_cap: options.context_line_cap,
@@ -170,6 +178,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         reviewer_effort_level: options.reviewer_effort_level.clone(),
         codex_full_access: options.codex_full_access,
         codex_session_persistence: options.codex_session_persistence,
+        transcript_enabled: options.transcript_enabled,
     }
 }
 

@@ -653,6 +653,10 @@ fn struggle_date() -> String {
 }
 
 fn record_struggle_signal(task: &str, issue: &str, round: u32, config: &Config) {
+    if !config.decisions_enabled {
+        return;
+    }
+
     let task_summary = summarize_task(task, Some(120));
     let safe_task = if task_summary.trim().is_empty() {
         "(unknown task)"
@@ -692,7 +696,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     ) -> Result<(), AgentLoopError>,
     FLog: FnMut(&str, &Config),
 {
-    if !config.compound {
+    if !config.compound || !config.decisions_enabled {
         return;
     }
 
@@ -2696,6 +2700,7 @@ where
                 &phase_decisions,
                 &paths,
                 &impl_history,
+                config.decisions_enabled,
             ),
             None,
             config,
@@ -2815,6 +2820,7 @@ where
                 quality_checks_output.as_deref(),
                 &phase_decisions,
                 &reviewer_history,
+                config.decisions_enabled,
             ),
             None,
             config,
@@ -4975,5 +4981,59 @@ More text.
     #[test]
     fn round_display_formats_bounded_with_slash() {
         assert_eq!(round_display(5, Some(10)), "5/10");
+    }
+
+    // -----------------------------------------------------------------------
+    // decisions_enabled gating tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_struggle_signal_skips_when_decisions_disabled() {
+        let root = create_temp_project_root("phases_struggle_disabled");
+        let mut config = make_test_config(
+            &root,
+            TestConfigOptions {
+                decisions_enabled: false,
+                ..Default::default()
+            },
+        );
+        config.decisions_enabled = false;
+
+        // Should be a no-op; decisions.md should not exist.
+        record_struggle_signal("Task 1: build widget", "timeout", 2, &config);
+
+        let content = crate::state::read_decisions(&config);
+        assert!(
+            content.is_empty(),
+            "decisions should not be written when disabled"
+        );
+    }
+
+    #[test]
+    fn compound_phase_skips_when_decisions_disabled() {
+        let root = create_temp_project_root("phases_compound_decisions_off");
+        let mut config = make_test_config(&root, TestConfigOptions::default());
+        config.compound = true;
+        config.decisions_enabled = false;
+
+        let mut calls = 0u32;
+        run_compound_phase_with_runner(
+            "Task",
+            "Plan",
+            &config,
+            &mut |_agent: &crate::config::Agent,
+                  _role: AgentRole,
+                  _prompt,
+                  _session_hint,
+                  _config| {
+                calls += 1;
+                Ok(())
+            },
+            &mut |_message, _config| {},
+        );
+        assert_eq!(
+            calls, 0,
+            "compound phase should be skipped when decisions_enabled=false"
+        );
     }
 }

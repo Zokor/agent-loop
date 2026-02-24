@@ -17,6 +17,9 @@ const CONVERSATION_MAX_LINES: usize = 200;
 const DECISIONS_REFERENCE_START: &str = "<!-- agent-loop:decisions-reference:start -->";
 const DECISIONS_REFERENCE_END: &str = "<!-- agent-loop:decisions-reference:end -->";
 
+/// Maximum number of lines in the transcript log before rotation.
+const TRANSCRIPT_MAX_LINES: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
@@ -124,6 +127,10 @@ pub fn decisions_path(config: &Config) -> PathBuf {
 }
 
 pub fn read_decisions(config: &Config) -> String {
+    if !config.decisions_enabled {
+        return String::new();
+    }
+
     let Ok(content) = fs::read_to_string(decisions_path(config)) else {
         return String::new();
     };
@@ -142,6 +149,10 @@ pub fn read_decisions(config: &Config) -> String {
 }
 
 pub fn append_decision(entry: &str, config: &Config) -> io::Result<()> {
+    if !config.decisions_enabled {
+        return Ok(());
+    }
+
     if entry.trim().is_empty() {
         return Ok(());
     }
@@ -212,6 +223,150 @@ fn ensure_project_guide_decisions_references(config: &Config) {
         let path = config.project_dir.join(filename);
         if let Err(err) = ensure_decisions_reference_file(&path) {
             eprintln!("⚠ failed to sync decisions reference in {filename}: {err}");
+        }
+    }
+}
+
+/// Strip the managed decisions-reference block from content, returning the
+/// updated content if a change was made.
+fn strip_decisions_reference(content: &str) -> Option<String> {
+    let start_idx = content.find(DECISIONS_REFERENCE_START)?;
+    let end_rel_idx = content[start_idx..].find(DECISIONS_REFERENCE_END)?;
+    let end_idx = start_idx + end_rel_idx + DECISIONS_REFERENCE_END.len();
+
+    // Remove the block and any surrounding blank lines that were added
+    let before = content[..start_idx].trim_end_matches('\n');
+    let after = content[end_idx..].trim_start_matches('\n');
+
+    let mut updated = String::with_capacity(content.len());
+    if !before.is_empty() {
+        updated.push_str(before);
+        if !after.is_empty() {
+            updated.push('\n');
+        }
+    }
+    if !after.is_empty() {
+        updated.push_str(after);
+    }
+    // Ensure trailing newline for file
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+
+    (updated != content).then_some(updated)
+}
+
+/// Remove managed decisions-reference blocks from AGENTS.md and CLAUDE.md.
+fn remove_project_guide_decisions_references(config: &Config) {
+    for filename in ["AGENTS.md", "CLAUDE.md"] {
+        let path = config.project_dir.join(filename);
+        let content = match fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if let Some(updated) = strip_decisions_reference(&content) {
+            if let Err(err) = fs::write(&path, updated) {
+                eprintln!("⚠ failed to remove decisions reference from {filename}: {err}");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transcript capture (human-readable agent I/O log)
+// ---------------------------------------------------------------------------
+
+/// Metadata for a single agent invocation, passed from the phase/runner layer.
+#[derive(Debug, Clone, Default)]
+pub struct AgentCallMeta {
+    pub workflow: String,
+    pub phase: String,
+    pub round: u32,
+    pub role: String,
+    pub agent_name: String,
+    pub session_hint: Option<String>,
+}
+
+/// Append a human-readable transcript entry to `.agent-loop/state/transcript.log`.
+///
+/// No-op when `!config.transcript_enabled`. Failures are best-effort (non-fatal).
+pub fn append_transcript_entry(
+    config: &Config,
+    meta: &AgentCallMeta,
+    user_prompt: &str,
+    system_prompt: Option<&str>,
+    normalized_output: &str,
+) {
+    if !config.transcript_enabled {
+        return;
+    }
+
+    let path = config.state_dir.join("transcript.log");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+
+    let ts = timestamp();
+    let mut entry = String::new();
+    entry.push_str(&format!("=== AGENT CALL [{ts}] ===\n"));
+    entry.push_str(&format!("workflow: {}\n", meta.workflow));
+    entry.push_str(&format!("phase: {}\n", meta.phase));
+    entry.push_str(&format!("round: {}\n", meta.round));
+    entry.push_str(&format!("role: {}\n", meta.role));
+    entry.push_str(&format!("agent: {}\n", meta.agent_name));
+    if let Some(hint) = &meta.session_hint {
+        entry.push_str(&format!("session_hint: {hint}\n"));
+    }
+
+    entry.push_str("\n--- USER PROMPT ---\n");
+    entry.push_str(user_prompt);
+    if !user_prompt.ends_with('\n') {
+        entry.push('\n');
+    }
+
+    if let Some(sp) = system_prompt {
+        entry.push_str("\n--- SYSTEM PROMPT ---\n");
+        entry.push_str(sp);
+        if !sp.ends_with('\n') {
+            entry.push('\n');
+        }
+    }
+
+    entry.push_str("\n--- NORMALIZED OUTPUT ---\n");
+    entry.push_str(normalized_output);
+    if !normalized_output.ends_with('\n') {
+        entry.push('\n');
+    }
+    entry.push_str("=== END ===\n\n");
+
+    // Best-effort append
+    let write_result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
+
+    if let Err(err) = write_result {
+        eprintln!("⚠ transcript write failed: {err}");
+        return;
+    }
+
+    // Cap/rotate: if file exceeds TRANSCRIPT_MAX_LINES, keep the last half.
+    if let Ok(content) = fs::read_to_string(&path) {
+        let line_count = content.lines().count();
+        if line_count > TRANSCRIPT_MAX_LINES {
+            let keep_from = line_count - (TRANSCRIPT_MAX_LINES / 2);
+            let trimmed: String = content
+                .lines()
+                .skip(keep_from)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut rotated = String::from("[transcript rotated]\n");
+            rotated.push_str(&trimmed);
+            if !rotated.ends_with('\n') {
+                rotated.push('\n');
+            }
+            let _ = fs::write(&path, rotated);
         }
     }
 }
@@ -1195,17 +1350,28 @@ pub fn init(
     workflow: WorkflowKind,
 ) -> io::Result<()> {
     fs::create_dir_all(&config.state_dir)?;
-    let decisions = decisions_path(config);
-    if !decisions.exists() {
-        if let Some(parent) = decisions.parent() {
-            fs::create_dir_all(parent)?;
+
+    // Decisions subsystem initialization
+    if config.decisions_enabled {
+        let decisions = decisions_path(config);
+        if !decisions.exists() {
+            if let Some(parent) = decisions.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(decisions)?;
         }
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(decisions)?;
+
+        if config.decisions_auto_reference {
+            ensure_project_guide_decisions_references(config);
+        } else {
+            remove_project_guide_decisions_references(config);
+        }
+    } else {
+        remove_project_guide_decisions_references(config);
     }
-    ensure_project_guide_decisions_references(config);
     // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
     let _baseline_files = baseline_files;
 
@@ -3339,5 +3505,201 @@ mod tests {
             .expect("write should succeed");
         let findings = read_tasks_findings(&project.config);
         assert!(findings.findings.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // decisions_enabled gating
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_decisions_returns_empty_when_disabled() {
+        let mut project = new_project();
+        project.config.decisions_enabled = false;
+        // Write some decisions
+        let path = decisions_path(&project.config);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, "- [PATTERN] some pattern\n").unwrap();
+        assert!(
+            read_decisions(&project.config).is_empty(),
+            "disabled decisions should return empty"
+        );
+    }
+
+    #[test]
+    fn append_decision_noop_when_disabled() {
+        let mut project = new_project();
+        project.config.decisions_enabled = false;
+        let path = decisions_path(&project.config);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&path, "").unwrap();
+        append_decision("- [GOTCHA] something", &project.config).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.is_empty(), "disabled decisions should not append");
+    }
+
+    // -----------------------------------------------------------------------
+    // strip_decisions_reference
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_decisions_reference_removes_managed_block() {
+        let content = format!(
+            "# CLAUDE.md\n\nSome content\n\n{DECISIONS_REFERENCE_START}\n## Agent Loop\nBody\n{DECISIONS_REFERENCE_END}\n"
+        );
+        let updated = strip_decisions_reference(&content).expect("should produce update");
+        assert!(!updated.contains(DECISIONS_REFERENCE_START));
+        assert!(!updated.contains(DECISIONS_REFERENCE_END));
+        assert!(updated.contains("Some content"));
+    }
+
+    #[test]
+    fn strip_decisions_reference_returns_none_when_no_block() {
+        let content = "# CLAUDE.md\n\nSome content\n";
+        assert!(strip_decisions_reference(content).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // init gating
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn init_does_not_create_decisions_file_when_disabled() {
+        let mut project = new_project();
+        project.config.decisions_enabled = false;
+        init("Task", &project.config, &[], WorkflowKind::Implement).unwrap();
+        assert!(!decisions_path(&project.config).exists());
+    }
+
+    #[test]
+    fn init_creates_decisions_file_when_enabled() {
+        let project = new_project();
+        init("Task", &project.config, &[], WorkflowKind::Implement).unwrap();
+        assert!(decisions_path(&project.config).exists());
+    }
+
+    #[test]
+    fn init_removes_managed_blocks_when_decisions_disabled() {
+        let mut project = new_project();
+        // First create CLAUDE.md with a managed block
+        let claude_md = project.config.project_dir.join("CLAUDE.md");
+        let block = decisions_reference_block();
+        fs::write(&claude_md, format!("# CLAUDE\n\n{block}\n")).unwrap();
+
+        project.config.decisions_enabled = false;
+        init("Task", &project.config, &[], WorkflowKind::Implement).unwrap();
+
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            !content.contains(DECISIONS_REFERENCE_START),
+            "disabled decisions should remove managed blocks"
+        );
+    }
+
+    #[test]
+    fn init_removes_managed_blocks_when_auto_reference_disabled() {
+        let mut project = new_project();
+        // First create CLAUDE.md with a managed block
+        let claude_md = project.config.project_dir.join("CLAUDE.md");
+        let block = decisions_reference_block();
+        fs::write(&claude_md, format!("# CLAUDE\n\n{block}\n")).unwrap();
+
+        project.config.decisions_auto_reference = false;
+        init("Task", &project.config, &[], WorkflowKind::Implement).unwrap();
+
+        let content = fs::read_to_string(&claude_md).unwrap();
+        assert!(
+            !content.contains(DECISIONS_REFERENCE_START),
+            "auto_reference=false should remove managed blocks"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // transcript
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn append_transcript_entry_noop_when_disabled() {
+        let project = new_project();
+        // Default: transcript_enabled = false
+        let meta = AgentCallMeta {
+            agent_name: "claude".to_string(),
+            role: "implementer".to_string(),
+            ..AgentCallMeta::default()
+        };
+        append_transcript_entry(&project.config, &meta, "prompt", None, "output");
+        let path = project.config.state_dir.join("transcript.log");
+        assert!(!path.exists(), "transcript should not be created when disabled");
+    }
+
+    #[test]
+    fn append_transcript_entry_writes_when_enabled() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "review".to_string(),
+            round: 3,
+            role: "reviewer".to_string(),
+            agent_name: "codex".to_string(),
+            session_hint: Some("implement-reviewer-codex".to_string()),
+        };
+        append_transcript_entry(
+            &project.config,
+            &meta,
+            "user prompt text",
+            Some("system prompt text"),
+            "normalized output text",
+        );
+
+        let path = project.config.state_dir.join("transcript.log");
+        assert!(path.exists(), "transcript.log should be created");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("AGENT CALL"));
+        assert!(content.contains("workflow: implement"));
+        assert!(content.contains("phase: review"));
+        assert!(content.contains("round: 3"));
+        assert!(content.contains("role: reviewer"));
+        assert!(content.contains("agent: codex"));
+        assert!(content.contains("session_hint: implement-reviewer-codex"));
+        assert!(content.contains("--- USER PROMPT ---"));
+        assert!(content.contains("user prompt text"));
+        assert!(content.contains("--- SYSTEM PROMPT ---"));
+        assert!(content.contains("system prompt text"));
+        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("normalized output text"));
+        assert!(content.contains("=== END ==="));
+    }
+
+    #[test]
+    fn transcript_rotation_caps_large_files() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let path = project.config.state_dir.join("transcript.log");
+        // Pre-seed a large file
+        let mut big = String::new();
+        for i in 0..TRANSCRIPT_MAX_LINES + 100 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(&path, &big).unwrap();
+
+        // Now append a new entry which triggers rotation
+        let meta = AgentCallMeta::default();
+        append_transcript_entry(&project.config, &meta, "p", None, "o");
+
+        let content = fs::read_to_string(&path).unwrap();
+        let line_count = content.lines().count();
+        assert!(
+            line_count <= TRANSCRIPT_MAX_LINES,
+            "transcript should be rotated: got {line_count} lines"
+        );
+        assert!(content.starts_with("[transcript rotated]"));
     }
 }

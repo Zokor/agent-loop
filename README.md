@@ -358,6 +358,27 @@ Decision categories used in prompts:
 - `GOTCHA`
 - `DEPENDENCY`
 
+### Disabling Decisions
+
+The entire decisions subsystem can be turned off:
+
+```toml
+decisions_enabled = false
+```
+
+When disabled:
+- `decisions.md` is not created or read
+- Decision capture instructions are omitted from prompts
+- Struggle signals are not recorded
+- Compound learning phase is skipped
+- Managed reference blocks are removed from `AGENTS.md`/`CLAUDE.md`
+
+To keep `decisions.md` but disable the automatic reference syncing into project guide files:
+
+```toml
+decisions_auto_reference = false
+```
+
 ### Compound phase
 
 After implementation consensus, `agent-loop` can run a best-effort compound reflection phase to extract reusable learnings into `decisions.md`.
@@ -374,6 +395,18 @@ On round-limit, error, and stuck implementation exits, `agent-loop` appends a st
 ```text
 - [STRUGGLE] Task: <task_summary> | Issue: <reason> | Round: <n> | Date: <YYYY-MM-DD>
 ```
+
+## Inspecting Model Input/Output
+
+Enable transcript logging to capture the full prompt and response for every agent call:
+
+```toml
+transcript_enabled = true
+```
+
+Or via env: `TRANSCRIPT_ENABLED=1`.
+
+Transcripts are written to `.agent-loop/state/transcript.log` in a human-readable format with metadata (workflow, phase, round, role, agent). The file is capped at 10,000 lines and auto-rotates by keeping the last half when the limit is reached.
 
 ## Configuration
 
@@ -396,6 +429,8 @@ auto_test = false
 auto_test_cmd = "cargo test"
 
 compound = true
+decisions_enabled = true
+decisions_auto_reference = true
 decisions_max_lines = 50
 
 max_parallel = 1
@@ -416,6 +451,9 @@ reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
 # Progressive context
 progressive_context = false
 planning_adversarial_review = true      # adversarial second review of plans (dual-agent only)
+
+# Observability
+transcript_enabled = false
 
 # Session persistence
 claude_session_persistence = true
@@ -467,6 +505,8 @@ Core:
 - `AUTO_TEST` (default: 0)
 - `AUTO_TEST_CMD`
 - `COMPOUND` (default: 1)
+- `DECISIONS_ENABLED` (default: 1)
+- `DECISIONS_AUTO_REFERENCE` (default: 1)
 - `DECISIONS_MAX_LINES` (default: 50)
 - `DIFF_MAX_LINES`
 - `CONTEXT_LINE_CAP`
@@ -500,6 +540,9 @@ Codex CLI tuning:
 - `CODEX_FULL_ACCESS` (default: 1)
 - `CODEX_SESSION_PERSISTENCE` (default: 1)
 
+Observability:
+- `TRANSCRIPT_ENABLED` (default: 0)
+
 Stuck detection:
 - `STUCK_DETECTION_ENABLED` (default: 0)
 - `STUCK_NO_DIFF_ROUNDS` (default: 3)
@@ -531,6 +574,7 @@ Wave runtime:
     planning-progress.md
     wave.lock
     wave-progress.jsonl
+    transcript.log         # agent I/O transcript (when transcript_enabled=true)
     task-{index}/          # per-task state dirs (wave mode)
 ```
 

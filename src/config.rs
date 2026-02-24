@@ -107,6 +107,10 @@ struct FileConfig {
     quality_commands: Option<Vec<QualityCommand>>,
     /// Run post-consensus compound phase to extract reusable learnings.
     compound: Option<bool>,
+    /// Master switch for the decisions subsystem (default true).
+    decisions_enabled: Option<bool>,
+    /// Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md (default true).
+    decisions_auto_reference: Option<bool>,
     /// Number of trailing decisions lines to inject in prompts.
     decisions_max_lines: Option<u32>,
     /// Maximum diff lines before truncation.
@@ -177,6 +181,10 @@ struct FileConfig {
     codex_full_access: Option<bool>,
     /// Persist Codex sessions across rounds (mirrors claude_session_persistence).
     codex_session_persistence: Option<bool>,
+
+    // ── Observability ────────────────────────────────────────────────
+    /// Write a human-readable agent I/O transcript to `.agent-loop/state/transcript.log` (default false).
+    transcript_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -266,6 +274,10 @@ pub struct Config {
     pub auto_test_cmd: Option<String>,
     pub quality_commands: Vec<QualityCommand>,
     pub compound: bool,
+    /// Master switch for the decisions subsystem.
+    pub decisions_enabled: bool,
+    /// Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md.
+    pub decisions_auto_reference: bool,
     pub decisions_max_lines: u32,
     pub diff_max_lines: Option<u32>,
     pub context_line_cap: Option<u32>,
@@ -328,6 +340,10 @@ pub struct Config {
     pub codex_full_access: bool,
     /// Persist Codex sessions across rounds (default true).
     pub codex_session_persistence: bool,
+
+    // ── Observability ─────────────────────────────────────────────────
+    /// When true, write a human-readable agent I/O transcript.
+    pub transcript_enabled: bool,
 }
 
 impl Config {
@@ -492,6 +508,12 @@ impl Config {
         });
         let quality_commands = file.quality_commands.unwrap_or_default();
         let compound = env_bool("COMPOUND").or(file.compound).unwrap_or(true);
+        let decisions_enabled = env_bool("DECISIONS_ENABLED")
+            .or(file.decisions_enabled)
+            .unwrap_or(true);
+        let decisions_auto_reference = env_bool("DECISIONS_AUTO_REFERENCE")
+            .or(file.decisions_auto_reference)
+            .unwrap_or(true);
         let decisions_max_lines = parse_env("DECISIONS_MAX_LINES")
             .or(file.decisions_max_lines)
             .unwrap_or(DEFAULT_DECISIONS_MAX_LINES);
@@ -578,6 +600,11 @@ impl Config {
             .or(file.codex_session_persistence)
             .unwrap_or(true);
 
+        // --- Observability: env > TOML > default ---
+        let transcript_enabled = env_bool("TRANSCRIPT_ENABLED")
+            .or(file.transcript_enabled)
+            .unwrap_or(false);
+
         let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
             run_mode: resolve_run_mode(single_agent),
@@ -595,6 +622,8 @@ impl Config {
             auto_test_cmd,
             quality_commands,
             compound,
+            decisions_enabled,
+            decisions_auto_reference,
             decisions_max_lines,
             diff_max_lines,
             context_line_cap,
@@ -622,6 +651,7 @@ impl Config {
             reviewer_effort_level,
             codex_full_access,
             codex_session_persistence,
+            transcript_enabled,
         };
 
         validate_config_bounds(&config)?;
@@ -836,9 +866,9 @@ fn validate_config_bounds(config: &Config) -> Result<(), AgentLoopError> {
         ));
     }
 
-    if config.decisions_max_lines == 0 {
+    if config.decisions_enabled && config.decisions_max_lines == 0 {
         return Err(AgentLoopError::Config(
-            "decisions_max_lines must be > 0. \
+            "decisions_max_lines must be > 0 when decisions are enabled. \
              Set DECISIONS_MAX_LINES or decisions_max_lines in .agent-loop.toml to a positive value."
                 .to_string(),
         ));
@@ -1014,6 +1044,8 @@ pub fn generate_default_config_template() -> String {
 # auto_test = false
 # auto_test_cmd = ""
 # compound = true
+# decisions_enabled = true
+# decisions_auto_reference = true
 # decisions_max_lines = {decisions_max_lines}
 # diff_max_lines = {diff_max_lines}
 # context_line_cap = {context_line_cap}
@@ -1062,6 +1094,9 @@ pub fn generate_default_config_template() -> String {
 # wave_lock_stale_seconds = 30
 # wave_shutdown_grace_ms = 30000
 
+# ── Observability ─────────────────────────────────────────────────────────────
+# transcript_enabled = false
+
 # ── Quality commands ─────────────────────────────────────────────────────────
 # Uncomment and customize to define explicit quality checks.
 # [[quality_commands]]
@@ -1103,6 +1138,8 @@ mod tests {
             "AUTO_TEST",
             "AUTO_TEST_CMD",
             "COMPOUND",
+            "DECISIONS_ENABLED",
+            "DECISIONS_AUTO_REFERENCE",
             "DECISIONS_MAX_LINES",
             "REVIEW_MAX_ROUNDS",
             "MAX_ROUNDS", // deprecated — kept so migration error tests start clean
@@ -1143,6 +1180,8 @@ mod tests {
             // Codex CLI tuning
             "CODEX_FULL_ACCESS",
             "CODEX_SESSION_PERSISTENCE",
+            // Observability
+            "TRANSCRIPT_ENABLED",
         ] {
             // SAFETY: tests serialize env mutation with a process-wide mutex.
             unsafe {
@@ -3175,6 +3214,119 @@ planning_context_excerpt_lines = 75
             msg.contains("invalid value '-5' for REVIEW_MAX_ROUNDS"),
             "expected strict parse error for negative, got: {msg}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // decisions_enabled / decisions_auto_reference / transcript_enabled
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decisions_enabled_defaults_to_true() {
+        let _guard = env_lock();
+        clear_env();
+        let dir = create_temp_project_root("cfg_decisions_default");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(config.decisions_enabled);
+        assert!(config.decisions_auto_reference);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_enabled_env_override() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECISIONS_ENABLED", "false");
+        set_env("DECISIONS_MAX_LINES", "50"); // avoid triggering validation
+
+        let dir = create_temp_project_root("cfg_decisions_env");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(!config.decisions_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_auto_reference_env_override() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECISIONS_AUTO_REFERENCE", "0");
+
+        let dir = create_temp_project_root("cfg_decisions_ref_env");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(!config.decisions_auto_reference);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_enabled_toml_override() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_decisions_toml");
+        write_toml(&dir, "decisions_enabled = false\n");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(!config.decisions_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_max_lines_zero_accepted_when_decisions_disabled() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECISIONS_ENABLED", "false");
+        set_env("DECISIONS_MAX_LINES", "0");
+
+        let dir = create_temp_project_root("cfg_decisions_zero_ok");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert_eq!(config.decisions_max_lines, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decisions_max_lines_zero_rejected_when_decisions_enabled() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("DECISIONS_MAX_LINES", "0");
+
+        let dir = create_temp_project_root("cfg_decisions_zero_err");
+        let err = Config::from_cli(dir.clone(), false, false)
+            .expect_err("decisions_max_lines=0 with decisions_enabled should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("decisions_max_lines must be > 0"), "got: {msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_enabled_defaults_to_false() {
+        let _guard = env_lock();
+        clear_env();
+        let dir = create_temp_project_root("cfg_transcript_default");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(!config.transcript_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_enabled_env_override() {
+        let _guard = env_lock();
+        clear_env();
+        set_env("TRANSCRIPT_ENABLED", "true");
+
+        let dir = create_temp_project_root("cfg_transcript_env");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(config.transcript_enabled);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transcript_enabled_toml_override() {
+        let _guard = env_lock();
+        clear_env();
+
+        let dir = create_temp_project_root("cfg_transcript_toml");
+        write_toml(&dir, "transcript_enabled = true\n");
+        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        assert!(config.transcript_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
