@@ -709,7 +709,7 @@ pub(crate) fn run_agent(
     config: &Config,
     system_prompt: Option<&str>,
 ) -> Result<String, AgentLoopError> {
-    run_agent_inner(agent, prompt, config, system_prompt, None, None)
+    run_agent_inner(agent, prompt, config, system_prompt, None, None, None)
 }
 
 /// Run an agent with optional session persistence and explicit role.
@@ -729,8 +729,9 @@ pub fn run_agent_with_session(
     system_prompt: Option<&str>,
     session_key: Option<&str>,
     role: Option<AgentRole>,
+    meta: Option<&AgentCallMeta>,
 ) -> Result<String, AgentLoopError> {
-    run_agent_inner(agent, prompt, config, system_prompt, session_key, role)
+    run_agent_inner(agent, prompt, config, system_prompt, session_key, role, meta)
 }
 
 /// Select the effective Claude effort level based on the agent's role.
@@ -758,6 +759,7 @@ fn run_agent_inner(
     system_prompt: Option<&str>,
     session_key: Option<&str>,
     role: Option<AgentRole>,
+    caller_meta: Option<&AgentCallMeta>,
 ) -> Result<String, AgentLoopError> {
     let _ = log(&format!("▶ Running {agent}..."), config);
 
@@ -990,17 +992,21 @@ fn run_agent_inner(
     // Transcript capture: append human-readable entry before error checks
     // so we capture data even for interrupted/timed-out calls.
     if config.transcript_enabled {
-        let role_str = match role {
-            Some(AgentRole::Implementer) => "implementer",
-            Some(AgentRole::Reviewer) => "reviewer",
-            Some(AgentRole::Planner) => "planner",
-            None => "unknown",
-        };
-        let meta = AgentCallMeta {
-            agent_name: agent.name().to_string(),
-            role: role_str.to_string(),
-            session_hint: session_key.map(ToString::to_string),
-            ..AgentCallMeta::default()
+        let meta = if let Some(m) = caller_meta {
+            m.clone()
+        } else {
+            let role_str = match role {
+                Some(AgentRole::Implementer) => "implementer",
+                Some(AgentRole::Reviewer) => "reviewer",
+                Some(AgentRole::Planner) => "planner",
+                None => "unknown",
+            };
+            AgentCallMeta {
+                agent_name: agent.name().to_string(),
+                role: role_str.to_string(),
+                session_hint: session_key.map(ToString::to_string),
+                ..AgentCallMeta::default()
+            }
         };
         append_transcript_entry(config, &meta, prompt, system_prompt, &normalized_output);
     }
@@ -1059,7 +1065,7 @@ fn run_agent_inner(
         clear_session_id(config, key);
 
         // Retry once without session resume.
-        return run_agent_inner(agent, prompt, config, system_prompt, session_key, role);
+        return run_agent_inner(agent, prompt, config, system_prompt, session_key, role, caller_meta);
     }
 
     if !exit_status.success() {
@@ -2091,6 +2097,7 @@ mod tests {
             None,
             Some(session_key),
             Some(AgentRole::Implementer),
+            None,
         );
 
         // Should succeed because the retry without session resume works
@@ -2142,6 +2149,7 @@ mod tests {
             None,
             Some(session_key),
             Some(AgentRole::Implementer),
+            None,
         );
 
         // Should succeed because the retry without session resume works
@@ -2256,6 +2264,132 @@ mod tests {
         assert_eq!(
             effective_effort_level(Some(AgentRole::Planner), &project.config),
             Some("medium")
+        );
+    }
+
+    /// F-001: Prove that `run_agent_inner` uses `caller_meta` for transcript entries
+    /// when metadata is provided, instead of falling back to defaults.
+    #[test]
+    #[cfg(unix)]
+    fn run_agent_with_session_uses_caller_meta_for_transcript() {
+        let _env_guard = env_lock();
+        let mut project = new_project(5);
+        project.config.transcript_enabled = true;
+        std::fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        project.create_executable("claude", "#!/bin/sh\nprintf 'agent-output-here'\n");
+        let _path_guard = project.with_path_override();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "gate-a-review".to_string(),
+            round: 7,
+            role: "reviewer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: Some("impl-reviewer-claude".to_string()),
+        };
+
+        let result = run_agent_with_session(
+            &Agent::known("claude"),
+            "test prompt content",
+            &project.config,
+            Some("system instructions here"),
+            None,
+            Some(AgentRole::Reviewer),
+            Some(&meta),
+        );
+        assert!(result.is_ok(), "agent should succeed: {:?}", result);
+
+        let transcript_path = project.config.state_dir.join("transcript.log");
+        assert!(transcript_path.exists(), "transcript.log should be created");
+        let transcript = std::fs::read_to_string(&transcript_path).unwrap();
+
+        // Verify caller_meta fields are used (not fallback defaults)
+        assert!(
+            transcript.contains("workflow: implement"),
+            "transcript must contain workflow from caller_meta"
+        );
+        assert!(
+            transcript.contains("phase: gate-a-review"),
+            "transcript must contain phase from caller_meta"
+        );
+        assert!(
+            transcript.contains("round: 7"),
+            "transcript must contain round from caller_meta"
+        );
+        assert!(
+            transcript.contains("role: reviewer"),
+            "transcript must contain role from caller_meta"
+        );
+        assert!(
+            transcript.contains("agent: claude"),
+            "transcript must contain agent_name from caller_meta"
+        );
+        assert!(
+            transcript.contains("session_hint: impl-reviewer-claude"),
+            "transcript must contain session_hint from caller_meta"
+        );
+
+        // Verify prompt and output content is captured
+        assert!(
+            transcript.contains("test prompt content"),
+            "transcript must contain user prompt"
+        );
+        assert!(
+            transcript.contains("system instructions here"),
+            "transcript must contain system prompt"
+        );
+        assert!(
+            transcript.contains("agent-output-here"),
+            "transcript must contain normalized agent output"
+        );
+    }
+
+    /// F-001: Verify that without caller_meta, transcript falls back to role/agent
+    /// from function parameters (not completely empty).
+    #[test]
+    #[cfg(unix)]
+    fn run_agent_with_session_transcript_fallback_without_caller_meta() {
+        let _env_guard = env_lock();
+        let mut project = new_project(5);
+        project.config.transcript_enabled = true;
+        std::fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        project.create_executable("claude", "#!/bin/sh\nprintf 'output'\n");
+        let _path_guard = project.with_path_override();
+
+        // Call without caller_meta — exercises the fallback path
+        let result = run_agent_with_session(
+            &Agent::known("claude"),
+            "prompt",
+            &project.config,
+            None,
+            None,
+            Some(AgentRole::Implementer),
+            None, // no caller_meta
+        );
+        assert!(result.is_ok());
+
+        let transcript_path = project.config.state_dir.join("transcript.log");
+        let transcript = std::fs::read_to_string(&transcript_path).unwrap();
+
+        // Fallback should still populate role and agent_name from function args
+        assert!(
+            transcript.contains("role: implementer"),
+            "fallback must derive role from AgentRole parameter"
+        );
+        assert!(
+            transcript.contains("agent: claude"),
+            "fallback must derive agent_name from agent parameter"
+        );
+        // Workflow/phase/round should be empty/zero in fallback
+        assert!(
+            transcript.contains("workflow: "),
+            "fallback has empty workflow"
+        );
+        assert!(
+            transcript.contains("round: 0"),
+            "fallback has round 0"
         );
     }
 }
