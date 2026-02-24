@@ -5530,35 +5530,57 @@ More text.
             metas.len()
         );
 
-        // Implementer phase
+        // Implementer phase — shared session, no session_hint
         assert_eq!(metas[0].workflow, "implement");
         assert_eq!(metas[0].phase, "implementer");
         assert_eq!(metas[0].round, 1);
         assert_eq!(metas[0].role, "implementer");
+        assert!(
+            metas[0].session_hint.is_none(),
+            "implementer uses shared session, session_hint must be None"
+        );
 
-        // Gate A: same-context review
+        // Gate A: same-context review — shared session, no session_hint
         assert_eq!(metas[1].workflow, "implement");
         assert_eq!(metas[1].phase, "gate-a-review");
         assert_eq!(metas[1].round, 1);
         assert_eq!(metas[1].role, "reviewer");
+        assert!(
+            metas[1].session_hint.is_none(),
+            "gate-a review uses shared session, session_hint must be None"
+        );
 
-        // Gate B: fresh-context review
+        // Gate B: fresh-context review — fresh session, has session_hint
         assert_eq!(metas[2].workflow, "implement");
         assert_eq!(metas[2].phase, "gate-b-review");
         assert_eq!(metas[2].round, 1);
         assert_eq!(metas[2].role, "reviewer");
         assert!(
-            metas[2].session_hint.is_some(),
-            "fresh-context review should have session_hint"
+            metas[2]
+                .session_hint
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-review-r"),
+            "gate-b must carry fresh-context session_hint, got: {:?}",
+            metas[2].session_hint
         );
 
-        // Implementer signoff
+        // Implementer signoff — fresh session, has session_hint
         assert_eq!(metas[3].workflow, "implement");
         assert_eq!(metas[3].phase, "implementer-signoff");
         assert_eq!(metas[3].round, 1);
         assert_eq!(metas[3].role, "implementer");
+        assert!(
+            metas[3]
+                .session_hint
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-signoff-r"),
+            "signoff must carry fresh-context session_hint, got: {:?}",
+            metas[3].session_hint
+        );
 
-        // Also verify transcript file contains all phase labels
+        // Also verify transcript file contains all phase labels and session_hints
         let transcript_path = config.state_dir.join("transcript.log");
         let transcript = std::fs::read_to_string(&transcript_path)
             .expect("transcript.log should exist");
@@ -5566,6 +5588,15 @@ More text.
         assert!(transcript.contains("phase: gate-a-review"));
         assert!(transcript.contains("phase: gate-b-review"));
         assert!(transcript.contains("phase: implementer-signoff"));
+        // Gate-b and signoff have fresh-context session hints in the transcript
+        assert!(
+            transcript.contains("session_hint: fresh-context-review-r1"),
+            "transcript must contain gate-b session_hint"
+        );
+        assert!(
+            transcript.contains("session_hint: fresh-context-signoff-r1"),
+            "transcript must contain signoff session_hint"
+        );
     }
 
     /// F-002: Verify that `run_agent_with_output_or_record_error` builds
@@ -5608,5 +5639,179 @@ More text.
         assert_eq!(meta.role, "reviewer");
         assert!(!meta.agent_name.is_empty());
         assert!(meta.session_hint.as_ref().unwrap().starts_with("plan-reviewer-"));
+    }
+
+    /// F-002: Parse individual transcript entries and verify per-entry metadata
+    /// and that the reviewer entry specifically contains open-findings text.
+    #[test]
+    fn transcript_entries_carry_per_entry_metadata_and_reviewer_findings() {
+        let root = create_temp_project_root("phases_per_entry_meta");
+        let mut config = make_test_config(&root, TestConfigOptions::default());
+        config.single_agent = true;
+        config.transcript_enabled = true;
+        config.review_max_rounds = 1;
+        std::fs::create_dir_all(&config.state_dir).expect("create state dir");
+
+        // Write findings so they appear in reviewer prompts
+        let findings = crate::state::FindingsFile {
+            round: 1,
+            findings: vec![crate::state::FindingEntry {
+                id: "F-001".to_string(),
+                severity: "HIGH".to_string(),
+                summary: "Null pointer in parser".to_string(),
+                file_refs: vec!["src/parser.rs:99".to_string()],
+            }],
+        };
+        let _ = crate::state::write_findings(&findings, &config);
+
+        let baseline = HashSet::new();
+        let status_sequence = std::cell::RefCell::new(vec![
+            LoopStatus {
+                status: Status::Implementing,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "single-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+                rating: None,
+                timestamp: "now".to_string(),
+            },
+            LoopStatus {
+                status: Status::NeedsChanges,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "single-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: Some("Open findings: F-001".to_string()),
+                rating: Some(2),
+                timestamp: "now".to_string(),
+            },
+        ]);
+        let status_call_count = std::cell::RefCell::new(0usize);
+
+        implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, _role, prompt, _session_hint, cfg, meta| {
+                if let Some(m) = meta {
+                    crate::state::append_transcript_entry(
+                        cfg,
+                        m,
+                        prompt,
+                        Some("system-prompt-test"),
+                        "mock agent output",
+                    );
+                }
+                Ok(())
+            },
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |_patch, _cfg| {},
+            |name, _cfg| {
+                if name == "review.md" {
+                    return "NEEDS_CHANGES. F-001 unresolved.".to_string();
+                }
+                String::new()
+            },
+            |_cfg| {
+                let mut count = status_call_count.borrow_mut();
+                let seq = status_sequence.borrow();
+                if *count < seq.len() {
+                    let result = seq[*count].clone();
+                    *count += 1;
+                    result
+                } else {
+                    LoopStatus {
+                        status: Status::NeedsChanges,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "claude".to_string(),
+                        mode: "single-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: Some("Open findings: F-001".to_string()),
+                        rating: Some(2),
+                        timestamp: "now".to_string(),
+                    }
+                }
+            },
+            |_head, _cfg| String::new(),
+            || "now".to_string(),
+            |_cfg, _n| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        // Parse the transcript into individual entries
+        let transcript_path = config.state_dir.join("transcript.log");
+        let transcript = std::fs::read_to_string(&transcript_path)
+            .expect("transcript.log must exist");
+
+        // Split into individual entries by the delimiter
+        let entries: Vec<&str> = transcript
+            .split("=== AGENT CALL [")
+            .filter(|e| !e.trim().is_empty())
+            .collect();
+
+        assert!(
+            entries.len() >= 2,
+            "expected at least 2 transcript entries (implementer + reviewer), got {}",
+            entries.len()
+        );
+
+        // Entry 0: implementer — should have phase: implementer, round: 1
+        let impl_entry = entries[0];
+        assert!(
+            impl_entry.contains("phase: implementer"),
+            "first entry must be implementer phase, got:\n{impl_entry}"
+        );
+        assert!(
+            impl_entry.contains("workflow: implement"),
+            "implementer entry must have workflow: implement"
+        );
+        assert!(
+            impl_entry.contains("round: 1"),
+            "implementer entry must have round: 1"
+        );
+        assert!(
+            impl_entry.contains("role: implementer"),
+            "implementer entry must have role: implementer"
+        );
+
+        // Entry 1: reviewer — should have phase: gate-a-review, round: 1,
+        // AND must contain the open-findings text (F-001 + summary).
+        let review_entry = entries[1];
+        assert!(
+            review_entry.contains("phase: gate-a-review"),
+            "second entry must be gate-a-review phase, got:\n{review_entry}"
+        );
+        assert!(
+            review_entry.contains("workflow: implement"),
+            "reviewer entry must have workflow: implement"
+        );
+        assert!(
+            review_entry.contains("round: 1"),
+            "reviewer entry must have round: 1"
+        );
+        assert!(
+            review_entry.contains("role: reviewer"),
+            "reviewer entry must have role: reviewer"
+        );
+
+        // The reviewer prompt (captured in USER PROMPT section) must contain
+        // the open findings — this proves findings flow is visible in transcript.
+        assert!(
+            review_entry.contains("--- USER PROMPT ---"),
+            "reviewer entry must have USER PROMPT section"
+        );
+        assert!(
+            review_entry.contains("F-001"),
+            "reviewer entry prompt must contain finding ID F-001"
+        );
+        assert!(
+            review_entry.contains("Null pointer in parser"),
+            "reviewer entry prompt must contain finding summary"
+        );
     }
 }

@@ -1002,10 +1002,12 @@ fn run_agent_inner(
                 None => "unknown",
             };
             AgentCallMeta {
+                workflow: "direct".to_string(),
+                phase: "untracked".to_string(),
+                round: 0,
                 agent_name: agent.name().to_string(),
                 role: role_str.to_string(),
                 session_hint: session_key.map(ToString::to_string),
-                ..AgentCallMeta::default()
             }
         };
         append_transcript_entry(config, &meta, prompt, system_prompt, &normalized_output);
@@ -2382,14 +2384,75 @@ mod tests {
             transcript.contains("agent: claude"),
             "fallback must derive agent_name from agent parameter"
         );
-        // Workflow/phase/round should be empty/zero in fallback
+        // Fallback uses descriptive defaults instead of empty strings
         assert!(
-            transcript.contains("workflow: "),
-            "fallback has empty workflow"
+            transcript.contains("workflow: direct"),
+            "fallback must use 'direct' workflow, got: {transcript}"
+        );
+        assert!(
+            transcript.contains("phase: untracked"),
+            "fallback must use 'untracked' phase, got: {transcript}"
         );
         assert!(
             transcript.contains("round: 0"),
             "fallback has round 0"
+        );
+        // No session_key was passed, so session_hint line should be absent
+        assert!(
+            !transcript.contains("session_hint:"),
+            "fallback without session_key must omit session_hint"
+        );
+    }
+
+    /// F-001: Verify that the fallback path maps `session_key` → `session_hint`
+    /// when `caller_meta` is `None` but a session key is supplied.
+    #[test]
+    #[cfg(unix)]
+    fn run_agent_with_session_transcript_fallback_preserves_session_key() {
+        let _env_guard = env_lock();
+        let mut project = new_project(5);
+        project.config.transcript_enabled = true;
+        std::fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        project.create_executable("claude", "#!/bin/sh\nprintf 'ok'\n");
+        let _path_guard = project.with_path_override();
+
+        // Pass session_key but no caller_meta — exercises the fallback
+        // branch at agent.rs:1004-1010 where session_key is mapped.
+        let result = run_agent_with_session(
+            &Agent::known("claude"),
+            "prompt",
+            &project.config,
+            None,
+            Some("impl-implementer-claude"),
+            Some(AgentRole::Implementer),
+            None, // no caller_meta
+        );
+        assert!(result.is_ok(), "agent should succeed: {:?}", result);
+
+        let transcript_path = project.config.state_dir.join("transcript.log");
+        let transcript = std::fs::read_to_string(&transcript_path).unwrap();
+
+        assert!(
+            transcript.contains("session_hint: impl-implementer-claude"),
+            "fallback must map session_key to session_hint in transcript"
+        );
+        assert!(
+            transcript.contains("role: implementer"),
+            "fallback must still derive role"
+        );
+        assert!(
+            transcript.contains("agent: claude"),
+            "fallback must still derive agent_name"
+        );
+        // Fallback uses descriptive defaults for workflow/phase
+        assert!(
+            transcript.contains("workflow: direct"),
+            "fallback must use 'direct' workflow even with session_key"
+        );
+        assert!(
+            transcript.contains("phase: untracked"),
+            "fallback must use 'untracked' phase even with session_key"
         );
     }
 }

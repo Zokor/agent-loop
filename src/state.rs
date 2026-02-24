@@ -3677,6 +3677,36 @@ mod tests {
     }
 
     #[test]
+    fn append_transcript_entry_omits_session_hint_when_none() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 1,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None, // explicitly None
+        };
+        append_transcript_entry(&project.config, &meta, "p", None, "o");
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+
+        // The session_hint line must be absent when the field is None
+        assert!(
+            !content.contains("session_hint:"),
+            "session_hint line must be omitted when None"
+        );
+        // Other metadata fields must still be present
+        assert!(content.contains("phase: implementer"));
+        assert!(content.contains("role: implementer"));
+        assert!(content.contains("agent: claude"));
+    }
+
+    #[test]
     fn transcript_rotation_caps_large_files() {
         let mut project = new_project();
         project.config.transcript_enabled = true;
