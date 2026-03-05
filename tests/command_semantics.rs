@@ -450,6 +450,8 @@ fn reset_clears_state_and_preserves_decisions() {
     let state_dir = project_dir.join(".agent-loop").join("state");
     fs::create_dir_all(&state_dir).expect("state dir should be created");
     fs::write(state_dir.join("status.json"), "{}\n").expect("status file should be written");
+    fs::write(state_dir.join("quality_checks.md"), "stale checks")
+        .expect("quality checks file should be written");
 
     let decisions_path = project_dir.join(".agent-loop").join("decisions.md");
     fs::create_dir_all(decisions_path.parent().unwrap()).expect(".agent-loop should be created");

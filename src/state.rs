@@ -12,6 +12,11 @@ use serde_json::Value;
 
 use crate::config::Config;
 
+pub const FINDINGS_FILENAME: &str = "findings.json";
+pub const PLANNING_FINDINGS_FILENAME: &str = "planning_findings.json";
+pub const TASKS_FINDINGS_FILENAME: &str = "tasks_findings.json";
+pub const QUALITY_CHECKS_FILENAME: &str = "quality_checks.md";
+
 const LAST_RUN_TASK_MAX_CHARS: usize = 500;
 const CONVERSATION_MAX_LINES: usize = 200;
 const DECISIONS_REFERENCE_START: &str = "<!-- agent-loop:decisions-reference:start -->";
@@ -101,8 +106,6 @@ pub struct LoopStatus {
     #[serde(rename = "lastRunTask")]
     pub last_run_task: String,
     pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rating: Option<u32>,
     pub timestamp: String,
 }
 
@@ -115,7 +118,6 @@ pub struct StatusPatch {
     pub mode: Option<String>,
     pub last_run_task: Option<String>,
     pub reason: Option<String>,
-    pub rating: Option<u32>,
 }
 
 fn state_file_path(name: &str, config: &Config) -> PathBuf {
@@ -126,6 +128,7 @@ pub fn decisions_path(config: &Config) -> PathBuf {
     config.project_dir.join(".agent-loop").join("decisions.md")
 }
 
+#[allow(dead_code)]
 pub fn read_decisions(config: &Config) -> String {
     if !config.decisions_enabled {
         return String::new();
@@ -502,7 +505,6 @@ pub fn default_status(config: &Config) -> LoopStatus {
         mode: config.run_mode.to_string(),
         last_run_task: resolve_last_run_task(None, config),
         reason: None,
-        rating: None,
         timestamp: timestamp(),
     }
 }
@@ -519,6 +521,7 @@ pub fn normalize_status_value(raw: &Value, config: &Config) -> LoopStatus {
 }
 
 /// Escape control characters in a string for safe terminal output.
+#[cfg(test)]
 fn sanitize_for_display(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -592,76 +595,27 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
         }
     };
 
-    // --- implementer ---
-    let implementer = match map.get("implementer") {
-        Some(v) => match v.as_str() {
-            Some(s) => s.to_owned(),
-            None => {
-                warnings.push(format!(
-                    "field 'implementer': expected string, got {}; falling back to '{}'",
-                    v, fallback.implementer
-                ));
-                fallback.implementer.clone()
-            }
-        },
-        None => {
-            warnings.push(format!(
-                "field 'implementer': missing; falling back to '{}'",
-                fallback.implementer
-            ));
-            fallback.implementer.clone()
-        }
-    };
+    // --- implementer / reviewer / mode ---
+    // These fields are never part of the status.json template given to agents,
+    // so silently fall back to the values the binary already knows.
+    let implementer = map
+        .get("implementer")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.implementer.clone());
 
-    // --- reviewer ---
-    let reviewer = match map.get("reviewer") {
-        Some(v) => match v.as_str() {
-            Some(s) => s.to_owned(),
-            None => {
-                warnings.push(format!(
-                    "field 'reviewer': expected string, got {}; falling back to '{}'",
-                    v, fallback.reviewer
-                ));
-                fallback.reviewer.clone()
-            }
-        },
-        None => {
-            warnings.push(format!(
-                "field 'reviewer': missing; falling back to '{}'",
-                fallback.reviewer
-            ));
-            fallback.reviewer.clone()
-        }
-    };
+    let reviewer = map
+        .get("reviewer")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.reviewer.clone());
 
-    // --- mode ---
-    let mode = match map.get("mode") {
-        Some(v) => match v.as_str() {
-            Some(s) if matches!(s, "single-agent" | "dual-agent") => s.to_owned(),
-            Some(s) => {
-                warnings.push(format!(
-                    "field 'mode': unsupported value '{}'; falling back to '{}'",
-                    sanitize_for_display(s),
-                    fallback.mode
-                ));
-                fallback.mode.clone()
-            }
-            None => {
-                warnings.push(format!(
-                    "field 'mode': expected string, got {}; falling back to '{}'",
-                    v, fallback.mode
-                ));
-                fallback.mode.clone()
-            }
-        },
-        None => {
-            warnings.push(format!(
-                "field 'mode': missing; falling back to '{}'",
-                fallback.mode
-            ));
-            fallback.mode.clone()
-        }
-    };
+    let mode = map
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .filter(|s| matches!(*s, "single-agent" | "dual-agent"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| fallback.mode.clone());
 
     // --- timestamp ---
     let status_timestamp = match map.get("timestamp") {
@@ -709,34 +663,6 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
         None => None,
     };
 
-    // --- rating (optional — warn only when present but invalid) ---
-    let rating = match map.get("rating") {
-        Some(Value::Number(value)) => {
-            match value
-                .as_u64()
-                .and_then(|v| u32::try_from(v).ok())
-                .filter(|v| (1..=5).contains(v))
-            {
-                Some(r) => Some(r),
-                None => {
-                    warnings.push(format!(
-                        "field 'rating': value {} out of range 1..=5; ignoring",
-                        value
-                    ));
-                    None
-                }
-            }
-        }
-        Some(v) if !v.is_null() => {
-            warnings.push(format!(
-                "field 'rating': expected number, got {}; ignoring",
-                v
-            ));
-            None
-        }
-        _ => None,
-    };
-
     StatusReadResult {
         status: LoopStatus {
             status,
@@ -746,7 +672,6 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
             mode,
             last_run_task,
             reason,
-            rating,
             timestamp: status_timestamp,
         },
         warnings,
@@ -811,7 +736,18 @@ pub fn write_state_file(name: &str, content: &str, config: &Config) -> io::Resul
 }
 
 pub fn is_status_stale(expected_ts: &str, status: &LoopStatus) -> bool {
-    status.timestamp != expected_ts
+    if status.timestamp == expected_ts {
+        return false;
+    }
+
+    // Treat timestamp mismatch as stale only while the loop remains in an
+    // in-progress phase. Terminal/verdict statuses may legitimately carry a
+    // freshly generated timestamp from the agent instead of the echoed prompt
+    // timestamp.
+    matches!(
+        status.status,
+        Status::Pending | Status::Planning | Status::Implementing | Status::Reviewing
+    )
 }
 
 pub fn read_status_with_warnings(config: &Config) -> StatusReadResult {
@@ -858,7 +794,6 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
         mode,
         last_run_task,
         reason,
-        rating,
     } = patch;
 
     let merged_task_input = match last_run_task.as_deref() {
@@ -872,12 +807,6 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
         None if clear_stale_diagnostics => None,
         None => current.reason,
     };
-    let next_rating = match rating {
-        Some(value) => Some(value),
-        None if clear_stale_diagnostics => None,
-        None => current.rating,
-    };
-
     let resolved_task = resolve_last_run_task(merged_task_input, config);
     let original_task_len = resolved_task.chars().count();
     let truncated_task = summarize_task(&resolved_task, Some(LAST_RUN_TASK_MAX_CHARS));
@@ -898,7 +827,6 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
         mode: mode.unwrap_or_else(|| config.run_mode.to_string()),
         last_run_task: truncated_task,
         reason: next_reason,
-        rating: next_rating,
         timestamp: timestamp(),
     };
 
@@ -994,7 +922,7 @@ pub struct FindingsReadResult {
 }
 
 pub fn read_findings_with_warnings(config: &Config) -> FindingsReadResult {
-    let raw = read_state_file("findings.json", config);
+    let raw = read_state_file(FINDINGS_FILENAME, config);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return FindingsReadResult {
@@ -1009,7 +937,7 @@ pub fn read_findings_with_warnings(config: &Config) -> FindingsReadResult {
             warnings: Vec::new(),
         },
         Err(err) => {
-            let warning = format!("invalid findings.json: {err}; starting fresh");
+            let warning = format!("invalid {FINDINGS_FILENAME}: {err}; starting fresh");
             eprintln!("\u{26a0} {warning}");
             FindingsReadResult {
                 findings_file: FindingsFile::default(),
@@ -1025,7 +953,7 @@ pub fn read_findings(config: &Config) -> FindingsFile {
 
 pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
-    write_state_file("findings.json", &serialized, config)
+    write_state_file(FINDINGS_FILENAME, &serialized, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,7 +983,7 @@ pub struct PlanningFindingsFile {
 }
 
 pub fn read_planning_findings(config: &Config) -> PlanningFindingsFile {
-    let raw = read_state_file("planning_findings.json", config);
+    let raw = read_state_file(PLANNING_FINDINGS_FILENAME, config);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return PlanningFindingsFile::default();
@@ -1063,12 +991,9 @@ pub fn read_planning_findings(config: &Config) -> PlanningFindingsFile {
     serde_json::from_str(trimmed).unwrap_or_default()
 }
 
-pub fn write_planning_findings(
-    findings: &PlanningFindingsFile,
-    config: &Config,
-) -> io::Result<()> {
+pub fn write_planning_findings(findings: &PlanningFindingsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
-    write_state_file("planning_findings.json", &serialized, config)
+    write_state_file(PLANNING_FINDINGS_FILENAME, &serialized, config)
 }
 
 pub fn open_planning_findings_for_prompt(findings: &PlanningFindingsFile) -> String {
@@ -1136,7 +1061,7 @@ pub struct TasksFindingsFile {
 }
 
 pub fn read_tasks_findings(config: &Config) -> TasksFindingsFile {
-    let raw = read_state_file("tasks_findings.json", config);
+    let raw = read_state_file(TASKS_FINDINGS_FILENAME, config);
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return TasksFindingsFile::default();
@@ -1144,16 +1069,13 @@ pub fn read_tasks_findings(config: &Config) -> TasksFindingsFile {
     serde_json::from_str(trimmed).unwrap_or_default()
 }
 
-pub fn write_tasks_findings(
-    findings: &TasksFindingsFile,
-    config: &Config,
-) -> io::Result<()> {
+pub fn write_tasks_findings(findings: &TasksFindingsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
-    write_state_file("tasks_findings.json", &serialized, config)
+    write_state_file(TASKS_FINDINGS_FILENAME, &serialized, config)
 }
 
 pub fn clear_tasks_findings(config: &Config) {
-    let path = config.state_dir.join("tasks_findings.json");
+    let path = config.state_dir.join(TASKS_FINDINGS_FILENAME);
     let _ = fs::remove_file(path);
 }
 
@@ -1400,6 +1322,15 @@ pub fn init(
     // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
     let _baseline_files = baseline_files;
 
+    // Clear stale quality check output when starting a new workflow. A fresh
+    // run should not inherit old results if checks are skipped this round.
+    let quality_checks_path = state_file_path(QUALITY_CHECKS_FILENAME, config);
+    match fs::remove_file(&quality_checks_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+
     write_state_file("task.md", task, config)?;
     write_state_file("plan.md", "", config)?;
     write_state_file("review.md", "", config)?;
@@ -1491,7 +1422,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "task".to_string(),
             reason: None,
-            rating: None,
+
             timestamp: "2026-02-14T00:00:00.000Z".to_string(),
         };
 
@@ -1653,7 +1584,8 @@ mod tests {
 
     #[test]
     fn init_creates_expected_files_and_initial_status() {
-        let project = new_project();
+        let mut project = new_project();
+        project.config.decisions_enabled = true;
         let baseline_files = vec!["src/main.rs".to_string()];
 
         init(
@@ -1705,7 +1637,6 @@ mod tests {
         assert_eq!(status.mode, "dual-agent");
         assert_eq!(status.last_run_task, "Build a robust state module");
         assert_eq!(status.reason, None);
-        assert_eq!(status.rating, None);
 
         let workflow = read_workflow(&project.config);
         assert_eq!(workflow, Some(WorkflowKind::Implement));
@@ -1716,8 +1647,29 @@ mod tests {
     }
 
     #[test]
-    fn init_decisions_reference_blocks_are_idempotent() {
+    fn init_clears_stale_quality_checks_file() {
         let project = new_project();
+        fs::create_dir_all(&project.config.state_dir).expect("state dir should be created");
+        write_state_file(
+            QUALITY_CHECKS_FILENAME,
+            "QUALITY CHECKS:\n\n--- stale [PASS] ---\nold",
+            &project.config,
+        )
+        .expect("stale quality checks should be written");
+
+        init("fresh task", &project.config, &[], WorkflowKind::Implement)
+            .expect("init should succeed");
+
+        assert!(
+            !state_file_path(QUALITY_CHECKS_FILENAME, &project.config).exists(),
+            "quality checks file should be removed during init"
+        );
+    }
+
+    #[test]
+    fn init_decisions_reference_blocks_are_idempotent() {
+        let mut project = new_project();
+        project.config.decisions_enabled = true;
         let baseline_files = vec!["src/main.rs".to_string()];
 
         init(
@@ -1777,7 +1729,8 @@ mod tests {
 
     #[test]
     fn append_decision_noops_for_empty_entry_and_appends_non_empty_entry() {
-        let project = new_project();
+        let mut project = new_project();
+        project.config.decisions_enabled = true;
 
         append_decision("   ", &project.config).expect("empty append should succeed");
         assert_eq!(read_decisions(&project.config), "");
@@ -1795,6 +1748,7 @@ mod tests {
     #[test]
     fn read_decisions_returns_last_n_lines() {
         let mut project = new_project();
+        project.config.decisions_enabled = true;
         project.config.decisions_max_lines = 2;
 
         append_decision("- [ARCHITECTURE] A", &project.config).expect("append should succeed");
@@ -1808,128 +1762,7 @@ mod tests {
     }
 
     #[test]
-    fn loop_status_serialization_omits_none_rating_and_includes_present_rating() {
-        let without_rating = LoopStatus {
-            status: Status::Approved,
-            round: 1,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "task".to_string(),
-            reason: None,
-            rating: None,
-            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
-        };
-
-        let json_without = serde_json::to_value(&without_rating).expect("should serialize");
-        assert!(!json_without.as_object().unwrap().contains_key("rating"));
-
-        let with_rating = LoopStatus {
-            rating: Some(4),
-            ..without_rating
-        };
-
-        let json_with = serde_json::to_value(&with_rating).expect("should serialize");
-        assert_eq!(json_with["rating"], 4);
-    }
-
-    #[test]
-    fn normalize_status_value_accepts_valid_ratings_and_rejects_invalid() {
-        let project = new_project();
-
-        // Valid rating: 1
-        let raw = json!({"rating": 1});
-        assert_eq!(
-            normalize_status_value(&raw, &project.config).rating,
-            Some(1)
-        );
-
-        // Valid rating: 5
-        let raw = json!({"rating": 5});
-        assert_eq!(
-            normalize_status_value(&raw, &project.config).rating,
-            Some(5)
-        );
-
-        // Valid rating: 3
-        let raw = json!({"rating": 3});
-        assert_eq!(
-            normalize_status_value(&raw, &project.config).rating,
-            Some(3)
-        );
-
-        // Invalid: 0 (out of range)
-        let raw = json!({"rating": 0});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Invalid: 6 (out of range)
-        let raw = json!({"rating": 6});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Invalid: negative
-        let raw = json!({"rating": -1});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Invalid: float
-        let raw = json!({"rating": 3.5});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Invalid: string
-        let raw = json!({"rating": "4"});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Invalid: null
-        let raw = json!({"rating": null});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-
-        // Missing rating
-        let raw = json!({"status": "APPROVED"});
-        assert_eq!(normalize_status_value(&raw, &project.config).rating, None);
-    }
-
-    #[test]
-    fn write_status_clears_stale_rating_on_status_transition_and_allows_explicit_override() {
-        let project = new_project();
-        write_state_file("task.md", "test task", &project.config)
-            .expect("task.md should be writable");
-
-        // Set initial rating
-        let first = write_status(
-            StatusPatch {
-                status: Some(Status::Approved),
-                rating: Some(4),
-                ..StatusPatch::default()
-            },
-            &project.config,
-        )
-        .expect("first write should succeed");
-        assert_eq!(first.rating, Some(4));
-
-        // Status transition without explicit rating clears stale rating.
-        let second = write_status(
-            StatusPatch {
-                status: Some(Status::Consensus),
-                ..StatusPatch::default()
-            },
-            &project.config,
-        )
-        .expect("second write should succeed");
-        assert_eq!(second.rating, None);
-
-        // Explicit rating overwrites
-        let third = write_status(
-            StatusPatch {
-                rating: Some(5),
-                ..StatusPatch::default()
-            },
-            &project.config,
-        )
-        .expect("third write should succeed");
-        assert_eq!(third.rating, Some(5));
-    }
-
-    #[test]
-    fn write_status_preserves_reason_and_rating_when_status_is_unchanged() {
+    fn write_status_preserves_reason_when_status_is_unchanged() {
         let project = new_project();
         write_state_file("task.md", "test task", &project.config)
             .expect("task.md should be writable");
@@ -1938,14 +1771,12 @@ mod tests {
             StatusPatch {
                 status: Some(Status::NeedsChanges),
                 reason: Some("missing test coverage".to_string()),
-                rating: Some(2),
                 ..StatusPatch::default()
             },
             &project.config,
         )
         .expect("initial write should succeed");
         assert_eq!(initial.reason.as_deref(), Some("missing test coverage"));
-        assert_eq!(initial.rating, Some(2));
 
         let updated_task = write_status(
             StatusPatch {
@@ -1961,7 +1792,6 @@ mod tests {
             updated_task.reason.as_deref(),
             Some("missing test coverage")
         );
-        assert_eq!(updated_task.rating, Some(2));
         assert_eq!(updated_task.last_run_task, "updated task title");
     }
 
@@ -2219,7 +2049,24 @@ mod tests {
     }
 
     #[test]
-    fn is_status_stale_returns_true_when_timestamp_differs() {
+    fn is_status_stale_returns_true_when_timestamp_differs_for_in_progress_status() {
+        let status = LoopStatus {
+            status: Status::Reviewing,
+            round: 1,
+            implementer: "claude".to_string(),
+            reviewer: "codex".to_string(),
+            mode: "dual-agent".to_string(),
+            last_run_task: "task".to_string(),
+            reason: None,
+
+            timestamp: "2026-02-14T00:00:00.000Z".to_string(),
+        };
+
+        assert!(is_status_stale("2026-02-14T12:00:00.000Z", &status));
+    }
+
+    #[test]
+    fn is_status_stale_returns_false_when_timestamp_differs_for_verdict_status() {
         let status = LoopStatus {
             status: Status::Approved,
             round: 1,
@@ -2228,11 +2075,10 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "task".to_string(),
             reason: None,
-            rating: None,
             timestamp: "2026-02-14T00:00:00.000Z".to_string(),
         };
 
-        assert!(is_status_stale("2026-02-14T12:00:00.000Z", &status));
+        assert!(!is_status_stale("2026-02-14T12:00:00.000Z", &status));
     }
 
     #[test]
@@ -2245,7 +2091,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "task".to_string(),
             reason: None,
-            rating: None,
+
             timestamp: "2026-02-14T00:00:00.000Z".to_string(),
         };
 
@@ -2588,15 +2434,9 @@ mod tests {
         let raw = json!({});
         let result = normalize_status_value_with_warnings(&raw, &project.config);
 
-        // Should produce warnings for: status, round, implementer, reviewer, mode, timestamp
-        let required_fields = [
-            "status",
-            "round",
-            "implementer",
-            "reviewer",
-            "mode",
-            "timestamp",
-        ];
+        // Should produce warnings for: status, round, timestamp
+        // (implementer, reviewer, mode silently fall back)
+        let required_fields = ["status", "round", "timestamp"];
         for field in required_fields {
             assert!(
                 result
@@ -2628,14 +2468,8 @@ mod tests {
 
         let result = normalize_status_value_with_warnings(&raw, &project.config);
 
-        for field in [
-            "status",
-            "round",
-            "implementer",
-            "reviewer",
-            "mode",
-            "timestamp",
-        ] {
+        // implementer, reviewer, mode silently fall back — no warnings
+        for field in ["status", "round", "timestamp"] {
             assert!(
                 result
                     .warnings
@@ -2660,18 +2494,6 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("'status'") && w.contains("invalid")),
             "expected warning for unknown status, got: {:?}",
-            result.warnings
-        );
-
-        // Unsupported mode
-        let raw = json!({"status": "PENDING", "round": 1, "implementer": "a", "reviewer": "b", "mode": "triple-agent", "timestamp": "t"});
-        let result = normalize_status_value_with_warnings(&raw, &project.config);
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("'mode'") && w.contains("unsupported")),
-            "expected warning for unsupported mode, got: {:?}",
             result.warnings
         );
 
@@ -2705,7 +2527,6 @@ mod tests {
             "mode": "dual-agent",
             "lastRunTask": "build feature",
             "reason": "all good",
-            "rating": 4,
             "timestamp": "2026-02-14T00:00:00.000Z"
         });
 
@@ -2722,22 +2543,6 @@ mod tests {
     #[test]
     fn warnings_optional_fields_only_warn_when_present_but_invalid() {
         let project = new_project();
-
-        // rating out of range
-        let raw = json!({
-            "status": "PENDING", "round": 0, "implementer": "a",
-            "reviewer": "b", "mode": "dual-agent", "timestamp": "t",
-            "rating": 10
-        });
-        let result = normalize_status_value_with_warnings(&raw, &project.config);
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|w| w.contains("'rating'") && w.contains("out of range")),
-            "expected out-of-range rating warning, got: {:?}",
-            result.warnings
-        );
 
         // reason wrong type
         let raw = json!({
@@ -2793,36 +2598,6 @@ mod tests {
         );
         assert_eq!(sanitize_for_display("bell\x07here"), "bell\u{FFFD}here");
         assert_eq!(sanitize_for_display("null\x00byte"), "null\u{FFFD}byte");
-    }
-
-    #[test]
-    fn warnings_mode_with_control_chars_are_sanitized() {
-        let project = new_project();
-        let raw = json!({
-            "status": "PENDING",
-            "round": 0,
-            "implementer": "a",
-            "reviewer": "b",
-            "mode": "evil\x1b[31m-mode",
-            "timestamp": "t"
-        });
-
-        let result = normalize_status_value_with_warnings(&raw, &project.config);
-        let mode_warning = result
-            .warnings
-            .iter()
-            .find(|w| w.contains("'mode'"))
-            .expect("should have mode warning");
-
-        // The ESC byte should be replaced with U+FFFD
-        assert!(
-            !mode_warning.contains('\x1b'),
-            "warning should not contain raw ESC, got: {mode_warning}"
-        );
-        assert!(
-            mode_warning.contains('\u{FFFD}'),
-            "warning should contain replacement char, got: {mode_warning}"
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -3601,7 +3376,8 @@ mod tests {
 
     #[test]
     fn init_creates_decisions_file_when_enabled() {
-        let project = new_project();
+        let mut project = new_project();
+        project.config.decisions_enabled = true;
         init("Task", &project.config, &[], WorkflowKind::Implement).unwrap();
         assert!(decisions_path(&project.config).exists());
     }
@@ -3657,7 +3433,10 @@ mod tests {
         };
         append_transcript_entry(&project.config, &meta, "prompt", None, "output");
         let path = project.config.state_dir.join("transcript.log");
-        assert!(!path.exists(), "transcript should not be created when disabled");
+        assert!(
+            !path.exists(),
+            "transcript should not be created when disabled"
+        );
     }
 
     #[test]
@@ -3785,7 +3564,10 @@ mod tests {
             agent_name: "claude".to_string(),
             session_hint: None,
         };
-        assert!(!meta.is_phase_tracked(), "fallback meta must not be tracked");
+        assert!(
+            !meta.is_phase_tracked(),
+            "fallback meta must not be tracked"
+        );
     }
 
     #[test]

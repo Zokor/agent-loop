@@ -292,7 +292,13 @@ mod tests {
         let args = claude_command("do stuff", None);
         assert_eq!(
             args,
-            vec!["-p", "do stuff", "--verbose", "--output-format", "stream-json"],
+            vec![
+                "-p",
+                "do stuff",
+                "--verbose",
+                "--output-format",
+                "stream-json"
+            ],
         );
     }
 
@@ -318,7 +324,14 @@ mod tests {
         let args = codex_command("do stuff", None);
         assert_eq!(
             args,
-            vec!["exec", "--skip-git-repo-check", "--json", "--color", "never", "do stuff"],
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--json",
+                "--color",
+                "never",
+                "do stuff"
+            ],
         );
     }
 

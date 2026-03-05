@@ -559,6 +559,34 @@ fn has_session_resume_error(raw_output: &str) -> bool {
 /// is typically in an event with `"type": "message"` and `"role": "assistant"`.
 /// Falls back to the raw output if no structured message is found.
 fn extract_codex_json_text(output: &str) -> Option<String> {
+    fn extract_text_field(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(content) => {
+                if content.trim().is_empty() {
+                    None
+                } else {
+                    Some(content.to_string())
+                }
+            }
+            serde_json::Value::Array(content_arr) => {
+                let mut text = String::new();
+                for block in content_arr {
+                    if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
+                        text.push_str(s);
+                    } else if let Some(s) = block.as_str() {
+                        text.push_str(s);
+                    }
+                }
+                if text.trim().is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            }
+            _ => None,
+        }
+    }
+
     let mut last_text = None;
 
     for line in output.lines() {
@@ -571,25 +599,45 @@ fn extract_codex_json_text(output: &str) -> Option<String> {
             continue;
         };
 
-        // Codex JSON events: look for message events with assistant content
-        if value.get("type").and_then(|v| v.as_str()) == Some("message") {
-            if let Some(content) = value.get("content").and_then(|v| v.as_str())
-                && !content.trim().is_empty()
-            {
-                last_text = Some(content.to_string());
+        let event_type = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Legacy/newer Codex JSON event with top-level assistant content.
+        if event_type == "message" {
+            if let Some(content) = value.get("content").and_then(extract_text_field) {
+                last_text = Some(content);
             }
-            // Some Codex versions nest content in an array
-            if let Some(content_arr) = value.get("content").and_then(|v| v.as_array()) {
-                let mut text = String::new();
-                for block in content_arr {
-                    if let Some(s) = block.get("text").and_then(|v| v.as_str()) {
-                        text.push_str(s);
-                    } else if let Some(s) = block.as_str() {
-                        text.push_str(s);
-                    }
+            continue;
+        }
+
+        // Current Codex NDJSON commonly emits item lifecycle events where the
+        // user-visible model reply is in:
+        // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+        if event_type.starts_with("item.")
+            && let Some(item) = value.get("item").and_then(|v| v.as_object())
+        {
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            if matches!(item_type, "agent_message" | "assistant_message" | "message") {
+                if let Some(text) = item
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                {
+                    last_text = Some(text.to_string());
+                    continue;
                 }
-                if !text.trim().is_empty() {
-                    last_text = Some(text);
+
+                if let Some(content) = item.get("content").and_then(extract_text_field) {
+                    last_text = Some(content);
+                    continue;
+                }
+
+                if let Some(content) = item
+                    .get("message")
+                    .and_then(|v| v.get("content"))
+                    .and_then(extract_text_field)
+                {
+                    last_text = Some(content);
                 }
             }
         }
@@ -733,7 +781,15 @@ pub fn run_agent_with_session(
     role: Option<AgentRole>,
     meta: Option<&AgentCallMeta>,
 ) -> Result<String, AgentLoopError> {
-    run_agent_inner(agent, prompt, config, system_prompt, session_key, role, meta)
+    run_agent_inner(
+        agent,
+        prompt,
+        config,
+        system_prompt,
+        session_key,
+        role,
+        meta,
+    )
 }
 
 /// Select the effective Claude effort level based on the agent's role.
@@ -1069,7 +1125,15 @@ fn run_agent_inner(
         clear_session_id(config, key);
 
         // Retry once without session resume.
-        return run_agent_inner(agent, prompt, config, system_prompt, session_key, role, caller_meta);
+        return run_agent_inner(
+            agent,
+            prompt,
+            config,
+            system_prompt,
+            session_key,
+            role,
+            caller_meta,
+        );
     }
 
     if !exit_status.success() {
@@ -1426,7 +1490,6 @@ mod tests {
         assert!(args.contains(&"--full-auto".to_string()));
         assert!(!args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
     }
-
 
     #[test]
     #[cfg(unix)]
@@ -1956,6 +2019,28 @@ mod tests {
         assert_eq!(extract_codex_json_text(output), None);
     }
 
+    #[test]
+    fn extract_codex_json_text_from_item_completed_agent_message() {
+        let output = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"reasoning\",\"text\":\"thinking\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final from codex\"}}\n",
+        );
+        assert_eq!(
+            extract_codex_json_text(output),
+            Some("final from codex".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_codex_json_text_ignores_non_json_diagnostics_when_agent_message_exists() {
+        let output = concat!(
+            "2026-02-25T09:23:36Z ERROR codex_core::auth: Failed to refresh token\n",
+            "{\"type\":\"turn.started\"}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"ok\"}}\n",
+        );
+        assert_eq!(extract_codex_json_text(output), Some("ok".to_string()));
+    }
+
     // -----------------------------------------------------------------------
     // Session resume error detection (output-signaled failures)
     // -----------------------------------------------------------------------
@@ -2395,10 +2480,7 @@ mod tests {
             transcript.contains(&format!("phase: {}", crate::state::FALLBACK_PHASE)),
             "fallback must use FALLBACK_PHASE constant, got: {transcript}"
         );
-        assert!(
-            transcript.contains("round: 0"),
-            "fallback has round 0"
-        );
+        assert!(transcript.contains("round: 0"), "fallback has round 0");
         // Untracked entries get a tracking line
         assert!(
             transcript.contains("tracking: untracked"),

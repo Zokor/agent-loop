@@ -14,7 +14,7 @@ use std::{
 use crate::config::{
     Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
     DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_PLANNING_MAX_ROUNDS,
-    DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_TIMEOUT_SECONDS,
     QualityCommand, RunMode,
 };
 
@@ -79,7 +79,7 @@ impl Default for TestConfigOptions {
             auto_test_cmd: None,
             quality_commands: Vec::new(),
             compound: true,
-            decisions_enabled: true,
+            decisions_enabled: false,
             decisions_auto_reference: true,
             decisions_max_lines: DEFAULT_DECISIONS_MAX_LINES,
             diff_max_lines: None,
@@ -414,6 +414,12 @@ impl TestProjectBuilder {
     #[allow(dead_code)]
     pub fn compound(mut self, value: bool) -> Self {
         self.options.compound = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn decisions_enabled(mut self, value: bool) -> Self {
+        self.options.decisions_enabled = value;
         self
     }
 

@@ -128,6 +128,31 @@ exit 0
     create_mock_agent(project_dir, "codex", codex_script);
 }
 
+#[cfg(unix)]
+fn create_resume_sensitive_agents(project_dir: &Path) {
+    let script = format!(
+        r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+{READ_TIMESTAMP_SNIPPET}
+TASK_FILE="$STATE_DIR/task.md"
+if [ -f "$TASK_FILE" ] && grep -q "Task 2: No resume leakage" "$TASK_FILE"; then
+    if printf '%s' "$ALL_ARGS" | grep -q -- "--resume"; then
+        : > "$STATE_DIR/resume_leak_detected"
+    fi
+fi
+printf '{{"round":1,"findings":[]}}' > "$FINDINGS_FILE"
+printf '{{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}}' "$CURRENT_TS" > "$STATUS_FILE"
+exit 0
+"#
+    );
+    create_mock_agent(project_dir, "claude", &script);
+    create_mock_agent(project_dir, "codex", &script);
+}
+
 fn test_path(project_dir: &Path) -> String {
     let bin_dir = project_dir.join("bin");
     format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin_dir.display())
@@ -255,6 +280,38 @@ fn implement_fail_fast_stops_after_first_failure_in_per_task_mode() {
     let tasks = status["tasks"].as_array().expect("tasks array");
     assert_eq!(tasks[0]["status"], "failed");
     assert_eq!(tasks[1]["status"], "pending");
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_per_task_clears_implementation_sessions_between_tasks() {
+    let project_dir = create_project_dir("per_task_session_isolation");
+    create_resume_sensitive_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Baseline\nA\n\n### Task 2: No resume leakage\nB\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &["--per-task"]);
+    assert!(
+        output.status.success(),
+        "implement should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let leak_marker = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join("resume_leak_detected");
+    assert!(
+        !leak_marker.exists(),
+        "per-task mode should not pass --resume into a new task's first round"
+    );
 
     let _ = fs::remove_dir_all(&project_dir);
 }

@@ -107,7 +107,7 @@ struct FileConfig {
     quality_commands: Option<Vec<QualityCommand>>,
     /// Run post-consensus compound phase to extract reusable learnings.
     compound: Option<bool>,
-    /// Master switch for the decisions subsystem (default true).
+    /// Master switch for the decisions subsystem (default false).
     decisions_enabled: Option<bool>,
     /// Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md (default true).
     decisions_auto_reference: Option<bool>,
@@ -280,7 +280,9 @@ pub struct Config {
     pub decisions_auto_reference: bool,
     pub decisions_max_lines: u32,
     pub diff_max_lines: Option<u32>,
+    #[allow(dead_code)]
     pub context_line_cap: Option<u32>,
+    #[allow(dead_code)]
     pub planning_context_excerpt_lines: Option<u32>,
     pub max_parallel: u32,
     pub batch_implement: bool,
@@ -351,6 +353,7 @@ impl Config {
         self.diff_max_lines.unwrap_or(DEFAULT_DIFF_MAX_LINES)
     }
 
+    #[allow(dead_code)]
     pub fn effective_context_line_cap(&self) -> u32 {
         match self.context_line_cap.unwrap_or(DEFAULT_CONTEXT_LINE_CAP) {
             0 => u32::MAX,
@@ -358,6 +361,7 @@ impl Config {
         }
     }
 
+    #[allow(dead_code)]
     pub fn effective_planning_context_excerpt_lines(&self) -> u32 {
         match self
             .planning_context_excerpt_lines
@@ -510,7 +514,7 @@ impl Config {
         let compound = env_bool("COMPOUND").or(file.compound).unwrap_or(true);
         let decisions_enabled = env_bool("DECISIONS_ENABLED")
             .or(file.decisions_enabled)
-            .unwrap_or(true);
+            .unwrap_or(false);
         let decisions_auto_reference = env_bool("DECISIONS_AUTO_REFERENCE")
             .or(file.decisions_auto_reference)
             .unwrap_or(true);
@@ -1005,7 +1009,12 @@ fn emit_config_warnings(
     let ci_set = std::env::var_os("CI").is_some();
     let is_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
 
-    if try_emit_missing_config_hint(config_file_found, ci_set, is_terminal, &MISSING_CONFIG_HINT_EMITTED) {
+    if try_emit_missing_config_hint(
+        config_file_found,
+        ci_set,
+        is_terminal,
+        &MISSING_CONFIG_HINT_EMITTED,
+    ) {
         eprintln!("Hint: no .agent-loop.toml found. Run 'agent-loop config init' to generate one.");
     }
 
@@ -1044,7 +1053,7 @@ pub fn generate_default_config_template() -> String {
 # auto_test = false
 # auto_test_cmd = ""
 # compound = true
-# decisions_enabled = true
+# decisions_enabled = false
 # decisions_auto_reference = true
 # decisions_max_lines = {decisions_max_lines}
 # diff_max_lines = {diff_max_lines}
@@ -2018,6 +2027,7 @@ batch_implement = true
     fn validate_rejects_zero_decisions_max_lines() {
         let _guard = env_lock();
         clear_env();
+        set_env("DECISIONS_ENABLED", "true");
         set_env("DECISIONS_MAX_LINES", "0");
 
         let dir = create_temp_project_root("cfg_zero_decisions_max_lines");
@@ -2197,10 +2207,7 @@ planning_context_excerpt_lines = 75
         // Effective helpers return defaults (0 = unlimited → u32::MAX)
         assert_eq!(config.effective_diff_max_lines(), DEFAULT_DIFF_MAX_LINES);
         assert_eq!(config.effective_context_line_cap(), u32::MAX);
-        assert_eq!(
-            config.effective_planning_context_excerpt_lines(),
-            u32::MAX
-        );
+        assert_eq!(config.effective_planning_context_excerpt_lines(), u32::MAX);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2798,8 +2805,8 @@ planning_context_excerpt_lines = 75
             ..Default::default()
         };
         let path = dir.join(CONFIG_FILE_NAME);
-        let err = validate_file_config(&config, &path)
-            .expect_err("max_rounds should fail validation");
+        let err =
+            validate_file_config(&config, &path).expect_err("max_rounds should fail validation");
         let msg = err.to_string();
         assert!(
             msg.contains("renamed to `review_max_rounds`"),
@@ -2819,8 +2826,14 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_full_access_default");
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
-        assert!(config.claude_full_access, "claude_full_access should default to true");
-        assert!(config.codex_full_access, "codex_full_access should default to true");
+        assert!(
+            config.claude_full_access,
+            "claude_full_access should default to true"
+        );
+        assert!(
+            config.codex_full_access,
+            "codex_full_access should default to true"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2830,7 +2843,10 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_full_access_toml");
-        write_toml(&dir, "claude_full_access = false\ncodex_full_access = false\n");
+        write_toml(
+            &dir,
+            "claude_full_access = false\ncodex_full_access = false\n",
+        );
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
         assert!(!config.claude_full_access);
         assert!(!config.codex_full_access);
@@ -2843,7 +2859,10 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_full_access_env");
-        write_toml(&dir, "claude_full_access = true\ncodex_full_access = true\n");
+        write_toml(
+            &dir,
+            "claude_full_access = true\ncodex_full_access = true\n",
+        );
         set_env("CLAUDE_FULL_ACCESS", "0");
         set_env("CODEX_FULL_ACCESS", "0");
         let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
@@ -3222,13 +3241,12 @@ planning_context_excerpt_lines = 75
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decisions_enabled_defaults_to_true() {
+    fn decisions_enabled_defaults_to_false() {
         let _guard = env_lock();
         clear_env();
         let dir = create_temp_project_root("cfg_decisions_default");
         let config = Config::from_cli(dir.clone(), false, false).unwrap();
-        assert!(config.decisions_enabled);
-        assert!(config.decisions_auto_reference);
+        assert!(!config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3236,12 +3254,11 @@ planning_context_excerpt_lines = 75
     fn decisions_enabled_env_override() {
         let _guard = env_lock();
         clear_env();
-        set_env("DECISIONS_ENABLED", "false");
-        set_env("DECISIONS_MAX_LINES", "50"); // avoid triggering validation
+        set_env("DECISIONS_ENABLED", "true");
 
         let dir = create_temp_project_root("cfg_decisions_env");
         let config = Config::from_cli(dir.clone(), false, false).unwrap();
-        assert!(!config.decisions_enabled);
+        assert!(config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3263,9 +3280,9 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_decisions_toml");
-        write_toml(&dir, "decisions_enabled = false\n");
+        write_toml(&dir, "decisions_enabled = true\n");
         let config = Config::from_cli(dir.clone(), false, false).unwrap();
-        assert!(!config.decisions_enabled);
+        assert!(config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3286,13 +3303,17 @@ planning_context_excerpt_lines = 75
     fn decisions_max_lines_zero_rejected_when_decisions_enabled() {
         let _guard = env_lock();
         clear_env();
+        set_env("DECISIONS_ENABLED", "true");
         set_env("DECISIONS_MAX_LINES", "0");
 
         let dir = create_temp_project_root("cfg_decisions_zero_err");
         let err = Config::from_cli(dir.clone(), false, false)
             .expect_err("decisions_max_lines=0 with decisions_enabled should fail");
         let msg = err.to_string();
-        assert!(msg.contains("decisions_max_lines must be > 0"), "got: {msg}");
+        assert!(
+            msg.contains("decisions_max_lines must be > 0"),
+            "got: {msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

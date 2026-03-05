@@ -30,8 +30,8 @@ use config::{
 };
 use error::AgentLoopError;
 use state::{
-    LoopStatus, Status, StatusPatch, TaskMetricsEntry, TaskMetricsFile, TaskRunStatus,
-    TaskStatusEntry, TaskStatusFile,
+    LoopStatus, PLANNING_FINDINGS_FILENAME, Status, StatusPatch, TASKS_FINDINGS_FILENAME,
+    TaskMetricsEntry, TaskMetricsFile, TaskRunStatus, TaskStatusEntry, TaskStatusFile,
 };
 
 const KNOWN_SUBCOMMANDS: [&str; 8] = [
@@ -833,9 +833,12 @@ fn reconcile_task_metrics(parsed_tasks: &[ParsedTask], config: &Config) -> Vec<T
 
 fn format_duration_ms(ms: u64) -> String {
     let total_seconds = ms / 1000;
-    let minutes = total_seconds / 60;
+    let hours = total_seconds / 3600;
+    let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
-    if minutes > 0 {
+    if hours > 0 {
+        format!("{hours}h {minutes}m {seconds}s")
+    } else if minutes > 0 {
         format!("{minutes}m {seconds}s")
     } else {
         format!("{seconds}s")
@@ -1163,6 +1166,31 @@ fn per_task_only_flags_present(args: &ImplementArgs) -> bool {
         || args.max_parallel.is_some()
         || args.max_retries != 2
         || args.round_step != 2
+}
+
+/// Remove persisted implementation session IDs in the active state directory.
+/// This prevents context leakage across independent per-task runs.
+fn clear_implementation_session_cache(config: &Config) -> Result<usize, AgentLoopError> {
+    if !config.state_dir.is_dir() {
+        return Ok(0);
+    }
+
+    let mut cleared = 0usize;
+    for entry in fs::read_dir(&config.state_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("implement-") && name.ends_with("_session_id") {
+            fs::remove_file(entry.path())?;
+            cleared += 1;
+        }
+    }
+
+    Ok(cleared)
 }
 
 fn implement_all_tasks_batch(
@@ -1752,6 +1780,15 @@ fn implement_all_tasks_per_task(
             }
         }
 
+        // Start untouched/skipped tasks with fresh implementation sessions so
+        // previous task context cannot leak via CLI --resume.
+        if entry_status == TaskRunStatus::Pending || entry_status == TaskRunStatus::Skipped {
+            let cleared = clear_implementation_session_cache(config)?;
+            if cleared > 0 {
+                println!("Cleared {cleared} cached implementation session(s).");
+            }
+        }
+
         // Mark as running and clear stale metrics for re-execution.
         task_statuses[index].status = TaskRunStatus::Running;
         let start_ts = state::timestamp();
@@ -2071,9 +2108,6 @@ fn status_command() -> Result<i32, AgentLoopError> {
     println!("reviewer: {}", current_status.reviewer);
     println!("mode: {}", current_status.mode);
     println!("lastRunTask: {}", current_status.last_run_task);
-    if let Some(rating) = current_status.rating {
-        println!("rating: {rating}");
-    }
     if let Some(reason) = current_status
         .reason
         .as_deref()
@@ -2145,8 +2179,8 @@ fn status_command() -> Result<i32, AgentLoopError> {
 
     // Planning artifacts.
     let planning_progress_path = config.state_dir.join("planning-progress.md");
-    let planning_findings_path = config.state_dir.join("planning_findings.json");
-    let tasks_findings_path = config.state_dir.join("tasks_findings.json");
+    let planning_findings_path = config.state_dir.join(PLANNING_FINDINGS_FILENAME);
+    let tasks_findings_path = config.state_dir.join(TASKS_FINDINGS_FILENAME);
     if planning_progress_path.exists()
         || planning_findings_path.exists()
         || tasks_findings_path.exists()
@@ -2473,7 +2507,6 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: String::new(),
             reason: None,
-            rating: None,
             timestamp: "2026-02-21T00:00:00.000Z".to_string(),
         }
     }

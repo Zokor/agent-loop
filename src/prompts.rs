@@ -2,7 +2,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
+use crate::state::{FINDINGS_FILENAME, QUALITY_CHECKS_FILENAME};
 
+#[allow(dead_code)]
 const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".agent-loop"];
 
 /// Build a project structure overview for injection into planning prompts.
@@ -13,6 +15,7 @@ const EXCLUDED_DIRS: &[&str] = &[".git", "target", "node_modules", ".agent-loop"
 ///
 /// `line_cap` and `excerpt_max_lines` correspond to the Config fields
 /// `context_line_cap` and `planning_context_excerpt_lines`.
+#[allow(dead_code)]
 pub(crate) fn gather_project_context(
     project_dir: &Path,
     line_cap: usize,
@@ -75,6 +78,7 @@ pub(crate) fn gather_project_context(
 /// Recursively collect directory entries into `lines` as an indented tree.
 /// `depth` starts at 0 for the project root's immediate children and goes up to 1
 /// (i.e. two levels below the project root).
+#[allow(dead_code)]
 fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>, line_cap: usize) {
     if lines.len() >= line_cap {
         return;
@@ -116,6 +120,7 @@ fn collect_tree(dir: &Path, depth: usize, lines: &mut Vec<String>, line_cap: usi
 
 /// Append the first `excerpt_max_lines` lines of a file as a labeled section.
 /// Lines count toward the global budget tracked by `lines.len()`.
+#[allow(dead_code)]
 fn append_file_excerpt(
     project_dir: &Path,
     filename: &str,
@@ -185,6 +190,7 @@ pub(crate) fn state_manifest(config: &Config) -> String {
         ("conversation.md", "round history"),
         ("plan.md", "agreed development plan"),
         ("tasks.md", "task breakdown"),
+        (QUALITY_CHECKS_FILENAME, "auto quality-check results"),
     ];
 
     for (filename, description) in state_files {
@@ -217,36 +223,37 @@ entry to `.agent-loop/decisions.md` with format:
 - [CATEGORY] description
 where CATEGORY is one of: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY";
 
-fn prior_decisions_section(decisions: &str) -> String {
-    if decisions.trim().is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nPRIOR DECISIONS & LEARNINGS (from previous sessions — respect these):\n{decisions}"
-        )
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PhasePaths {
     pub(crate) task_md: PathBuf,
     pub(crate) plan_md: PathBuf,
     pub(crate) tasks_md: PathBuf,
     pub(crate) changes_md: PathBuf,
+    pub(crate) quality_checks_md: PathBuf,
     pub(crate) review_md: PathBuf,
     pub(crate) findings_json: PathBuf,
+    pub(crate) planning_findings_json: PathBuf,
+    pub(crate) tasks_findings_json: PathBuf,
     pub(crate) status_json: PathBuf,
 }
 
-pub(crate) fn phase_paths(config: &Config) -> PhasePaths {
+/// State directory relative to the project root, used in prompt text.
+const STATE_REL: &str = ".agent-loop/state";
+
+pub(crate) fn phase_paths(_config: &Config) -> PhasePaths {
+    use crate::state::{PLANNING_FINDINGS_FILENAME, TASKS_FINDINGS_FILENAME};
+    let base = Path::new(STATE_REL);
     PhasePaths {
-        task_md: config.state_dir.join("task.md"),
-        plan_md: config.state_dir.join("plan.md"),
-        tasks_md: config.state_dir.join("tasks.md"),
-        changes_md: config.state_dir.join("changes.md"),
-        review_md: config.state_dir.join("review.md"),
-        findings_json: config.state_dir.join("findings.json"),
-        status_json: config.state_dir.join("status.json"),
+        task_md: base.join("task.md"),
+        plan_md: base.join("plan.md"),
+        tasks_md: base.join("tasks.md"),
+        changes_md: base.join("changes.md"),
+        quality_checks_md: base.join(QUALITY_CHECKS_FILENAME),
+        review_md: base.join("review.md"),
+        findings_json: base.join(FINDINGS_FILENAME),
+        planning_findings_json: base.join(PLANNING_FINDINGS_FILENAME),
+        tasks_findings_json: base.join(TASKS_FINDINGS_FILENAME),
+        status_json: base.join("status.json"),
     }
 }
 
@@ -254,12 +261,39 @@ fn path_text(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-pub(crate) fn single_agent_reviewer_preamble(config: &Config) -> String {
-    if !config.single_agent {
-        return String::new();
-    }
+/// Shared output instructions for implementation reviewer prompts (Gate A, Gate B,
+/// Gate B verification, Gate C). Generates the findings JSON + status JSON
+/// block so it isn't copy-pasted across every reviewer function.
+fn implementation_reviewer_output_block(
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "Write review to {review_md} and findings to {findings_json}.\n\
+        APPROVED: {{\"round\": {round}, \"findings\": []}}\n\
+        CHANGES NEEDED: {{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"...\", \"file_refs\": [\"file:line\"]}}]}}\n\n\
+        Write to {status_json}:\n\
+        APPROVED: {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\
+        CHANGES NEEDED: {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        review_md = path_text(&paths.review_md),
+        findings_json = path_text(&paths.findings_json),
+        status_json = path_text(&paths.status_json),
+    )
+}
 
-    SINGLE_AGENT_REVIEWER_PREAMBLE.to_string()
+/// Shared signoff block for consensus/disputed prompts.
+fn signoff_status_block(
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "Write to {status_json}:\n\
+        If you agree: {{\"status\": \"CONSENSUS\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\
+        If you disagree: {{\"status\": \"DISPUTED\", \"round\": {round}, \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        status_json = path_text(&paths.status_json),
+    )
 }
 
 /// Role-specific system prompt for `--append-system-prompt`.
@@ -297,18 +331,9 @@ pub(crate) fn system_prompt_for_role(role: AgentRole, config: &Config) -> String
 }
 
 pub(crate) fn planning_initial_prompt(
-    task: &str,
-    project_context: &str,
-    decisions: &str,
     paths: &PhasePaths,
     planner_plan_mode: bool,
 ) -> String {
-    let context_section = if project_context.is_empty() {
-        String::new()
-    } else {
-        format!("\n{project_context}\n")
-    };
-    let decisions_section = prior_decisions_section(decisions);
     let output_instruction = if planner_plan_mode {
         "Output your plan below between <plan> and </plan> markers.".to_string()
     } else {
@@ -316,17 +341,15 @@ pub(crate) fn planning_initial_prompt(
     };
 
     format!(
-        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nRead the task below and propose a detailed development plan.\n\nTASK:\n{task}{decisions_section}\n\n{output_instruction}\n\nYour plan should include:\n- Overview of approach\n- Step-by-step implementation strategy\n- Files to create/modify\n- Key technical decisions\n- Testing strategy"
+        "Read the task from {task_md} and propose a detailed development plan.\n\n\
+        Include: overview, step-by-step strategy, files to modify, key decisions, testing strategy.\n\n\
+        {output_instruction}",
+        task_md = path_text(&paths.task_md),
     )
 }
 
 /// Planning reviewer prompt parameters bundled to satisfy clippy::too_many_arguments.
 pub(crate) struct PlanningReviewerParams<'a> {
-    pub config: &'a Config,
-    pub task: &'a str,
-    pub plan: &'a str,
-    pub project_context: &'a str,
-    pub decisions: &'a str,
     pub round: u32,
     pub prompt_timestamp: &'a str,
     pub paths: &'a PhasePaths,
@@ -336,11 +359,6 @@ pub(crate) struct PlanningReviewerParams<'a> {
 
 pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> String {
     let PlanningReviewerParams {
-        config,
-        task,
-        plan,
-        project_context,
-        decisions,
         round,
         prompt_timestamp,
         paths,
@@ -358,213 +376,121 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
     let findings_section = if open_findings.is_empty() {
         String::new()
     } else {
-        format!("\n\nOPEN PLANNING FINDINGS (address or resolve each):\n{open_findings}")
-    };
-
-    let context_section = if project_context.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nPROJECT CONTEXT:\n{project_context}")
-    };
-
-    let decisions_section = if decisions.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nPRIOR DECISIONS & LEARNINGS:\n{decisions}")
+        format!(
+            "\n\nOPEN PLANNING FINDINGS (address or resolve each):\n{open_findings}\n\n\
+            IMPORTANT: For each open finding above, you MUST include a JSON findings block in your review \
+            showing its updated status. Use a fenced code block in your review like this:\n\
+            ```json\n\
+            [{{\"id\": \"F-001\", \"description\": \"brief description\", \"status\": \"resolved\"}}]\n\
+            ```\n\
+            Set status to \"resolved\" if the finding has been addressed, or \"open\" if it still needs work. \
+            Every open finding listed above MUST appear in your JSON block."
+        )
     };
 
     format!(
-        "{preamble}You are the REVIEWER in a collaborative development loop.\n\n\
-        Review this development plan against the original task.\n\n\
-        TASK:\n{task}\n\n\
-        PROPOSED PLAN:\n{plan}{context_section}{decisions_section}{concerns_section}{findings_section}\n\n\
-        Structure your review using these sections:\n\n\
-        ## Completeness\n\
-        Does the plan fully address all requirements in the task?\n\n\
-        ## Accuracy — Codebase Verification (CRITICAL)\n\
-        Use your available tools (Read, Grep, Glob) to verify plan claims against the actual codebase.\n\
-        Do NOT trust the plan at face value. For each major plan element, spot-check the source:\n\
-        - Verify referenced file paths exist and contain what the plan assumes\n\
-        - Verify routes/endpoints return the expected content type (HTML vs JSON vs redirect vs binary)\n\
-        - Verify database seeders/migrations have correct call chains and dependency order\n\
-        - Verify auth flows match actual validation rules (required fields, middleware)\n\
-        - Verify API payloads match controller/request validation requirements\n\
-        - Verify waiver/exclusion lists are complete (no missing endpoints)\n\n\
-        Flag any plan statement that contradicts what you find in the codebase.\n\n\
-        ## Feasibility\n\
-        Is the plan technically feasible? Are the proposed approaches sound?\n\n\
-        ## Risks\n\
-        What risks, gaps, or potential issues exist?\n\n\
-        ## Findings\n\
-        List specific issues as a JSON block (use IDs like P-001, P-002, ...):\n\
-        ```json\n\
-        [{{\"id\": \"P-001\", \"description\": \"issue description\", \"status\": \"open\", \"file_refs\": [\"src/file.rs:42\"]}}]\n\
-        ```\n\
-        Include file_refs citing the source file(s) that evidence each issue.\n\
-        Only id, description, and status are persisted across rounds; file_refs serve as inline evidence.\n\
-        Use `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. \
-        Use `\"status\": \"open\"` for issues that still need attention. \
-        Omit the block entirely if there are no findings at all.\n\n\
-        Write your complete review (all sections above) to {review_path}.\n\n\
-        ## Verdict\n\
-        End your review with exactly one of:\n  \
-        VERDICT: APPROVED\n  \
-        VERDICT: REVISE\n\n\
-        If you approve the plan, write this exact JSON to {status_path}:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n\
-        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"your reason here\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        preamble = single_agent_reviewer_preamble(config),
+        "Critically review the plan in {plan_md} against the actual codebase.\n\
+        The original task is in {task_md}.\n\n\
+        For every claim, file path, function name, and assumption in the plan, \
+        use your tools to verify it against the real code. \
+        Check for missing steps, wrong assumptions, breaking changes, dependency issues, \
+        and load-order or integration risks.{concerns_section}{findings_section}\n\n\
+        Write your review to {review_path}.\n\n\
+        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
+        If APPROVED, write to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If REVISE, write revised plan to {plan_path} and to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"your reason\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        impl_name = config.implementer,
-        rev_name = config.reviewer,
-        mode = config.run_mode,
         plan_path = path_text(&paths.plan_md),
         status_path2 = path_text(&paths.status_json),
-        impl_name2 = config.implementer,
-        rev_name2 = config.reviewer,
-        mode2 = config.run_mode,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn planning_adversarial_review_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    first_review: &str,
-    project_context: &str,
-    decisions: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
-    let context_section = if project_context.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nPROJECT CONTEXT:\n{project_context}")
-    };
-
-    let decisions_section = if decisions.is_empty() {
-        String::new()
-    } else {
-        format!("\n\nPRIOR DECISIONS & LEARNINGS:\n{decisions}")
-    };
-
     format!(
-        "{preamble}You are a SECOND REVIEWER performing an adversarial review of a development plan.\n\
-        A first reviewer has already approved this plan. Your job is to find what they missed.\n\n\
-        TASK:\n{task}\n\n\
-        PROPOSED PLAN:\n{plan}\n\n\
-        FIRST REVIEWER'S ASSESSMENT:\n{first_review}{context_section}{decisions_section}\n\n\
-        ADVERSARIAL REVIEW INSTRUCTIONS:\n\
-        Use your available tools (Read, Grep, Glob) to deeply verify the plan against the codebase.\n\
-        Focus on what the first reviewer did NOT check:\n\
-        - Route/endpoint content types (HTML page vs JSON vs redirect vs binary/image)\n\
-        - Seeder/migration call chains and dependency ordering\n\
-        - Auth flow requirements (required payload fields, middleware chains)\n\
-        - Missing endpoints, waivers, or edge cases\n\
-        - Inconsistencies between plan steps (e.g., seeder strategy contradicting itself)\n\
-        - Build/asset pipeline steps assumed but not specified\n\n\
-        IMPORTANT GUARDRAIL: If you find no meaningful issues after thorough analysis, then \
-        APPROVED is the correct verdict. Do not manufacture issues or nitpick.\n\n\
-        ## Findings\n\
-        Use IDs like PA-001, PA-002 (PA = Planning Adversarial):\n\
-        ```json\n\
-        [{{\"id\": \"PA-001\", \"description\": \"issue description\", \"status\": \"open\", \"file_refs\": [\"src/file.rs:42\"]}}]\n\
-        ```\n\
-        Include file_refs citing the source file(s) that evidence each issue.\n\
-        Only id, description, and status are persisted across rounds; file_refs serve as inline evidence.\n\
-        Omit the block entirely if there are no findings at all.\n\n\
-        Write your complete review to {review_path}.\n\n\
-        ## Verdict\n\
-        End your review with exactly one of:\n  \
-        VERDICT: APPROVED\n  \
-        VERDICT: REVISE\n\n\
-        If you approve the plan, write this exact JSON to {status_path}:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If changes are needed, write your revised plan to {plan_path} and write this JSON to {status_path2}:\n\
-        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        preamble = single_agent_reviewer_preamble(config),
+        "A first reviewer has already approved the plan in {plan_md}. Find what they missed.\n\n\
+        The original task is in {task_md}. The first review is in {review_md}.\n\
+        For every claim, file path, and assumption in the plan, use your tools to verify it against the real code. \
+        Look for breaking changes, missing migration paths, dependency gaps, and integration risks the first review overlooked.\n\
+        If you find no meaningful issues, APPROVED is the correct verdict.\n\n\
+        Write your review to {review_path}.\n\n\
+        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
+        If APPROVED, write to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If REVISE, write revised plan to {plan_path} and to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        review_md = path_text(&paths.review_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        impl_name = config.implementer,
-        rev_name = config.reviewer,
-        mode = config.run_mode,
         plan_path = path_text(&paths.plan_md),
         status_path2 = path_text(&paths.status_json),
-        impl_name2 = config.implementer,
-        rev_name2 = config.reviewer,
-        mode2 = config.run_mode,
     )
 }
 
 pub(crate) fn planning_implementer_revision_prompt(
-    config: &Config,
-    task: &str,
-    revised_plan: &str,
     reviewer_reason: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has revised your plan. Review their changes.\n\nORIGINAL TASK:\n{task}\n\nREVISED PLAN:\n{revised_plan}\n\nREVIEWER'S REASON:\n{reviewer_reason}\n\nIf you agree with the revisions, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to make further changes, revise the plan in {} and write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        path_text(&paths.plan_md),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "The reviewer has revised your plan. Read the task from {task_md} and the revised plan from {plan_md}.\n\n\
+        REVIEWER'S REASON:\n{reviewer_reason}\n\n\
+        {signoff_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        signoff_block = signoff_status_block(round, prompt_timestamp, paths),
     )
 }
 
-pub(crate) fn decomposition_initial_prompt(
-    task: &str,
-    plan: &str,
-    project_context: &str,
-    paths: &PhasePaths,
-) -> String {
-    let context_section = if project_context.is_empty() {
-        String::new()
-    } else {
-        format!("\n{project_context}\n")
-    };
-
+pub(crate) fn decomposition_initial_prompt(paths: &PhasePaths) -> String {
     format!(
-        "You are the IMPLEMENTER in a collaborative development loop.\n{context_section}\nBoth agents have agreed on the following development plan. Your job now is to break it down into discrete, implementable tasks.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCreate a task breakdown file at {} with the following structure:\n\n# Implementation Tasks\n\nFor each task, include:\n- Task number and title\n- Brief description (2-3 sentences)\n- Estimated complexity (Low/Medium/High)\n- Dependencies (which tasks must complete first)\n- Key deliverables\n- Testing requirements\n\nGuidelines:\n- Each task should be completable in a single implementation session (4-8 hours of work)\n- Break large features into smaller incremental tasks\n- Ensure tasks have clear success criteria\n- Order tasks by dependencies (foundational work first)\n- Include verification/testing as separate tasks if needed",
-        path_text(&paths.tasks_md)
+        "Read the task from {task_md} and the agreed plan from {plan_md}.\n\n\
+        Break down the plan into discrete, implementable tasks.\n\
+        Write the task breakdown to {tasks_md}.\n\n\
+        For each task include: number, title, description, complexity (Low/Medium/High), \
+        dependencies, deliverables, and testing requirements.\n\n\
+        IMPORTANT: Do NOT include revision history, changelogs, or round-by-round notes in {tasks_md2}. \
+        Keep the file clean — only task definitions. Revision tracking is handled externally.",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        tasks_md = path_text(&paths.tasks_md),
+        tasks_md2 = path_text(&paths.tasks_md),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn decomposition_revision_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    current_tasks: &str,
     reviewer_feedback: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "You are the IMPLEMENTER revising a task breakdown.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nCURRENT TASKS:\n{current_tasks}\n\nREVIEWER FEEDBACK:\n{reviewer_feedback}\n\nRevise {} to address all reviewer feedback while preserving clear dependencies and testing requirements.\n\nThen write this JSON to {}:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.tasks_md),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "Read the task from {task_md}, the plan from {plan_md}, and current tasks from {tasks_md}.\n\n\
+        REVIEWER FEEDBACK:\n{reviewer_feedback}\n\n\
+        Revise {tasks_md2} to address all feedback.\n\
+        Do NOT add revision history, changelogs, or round-by-round notes to the file — only task definitions.\n\n\
+        Then write to {status_json}:\n\
+        {{\"status\": \"DISPUTED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        tasks_md = path_text(&paths.tasks_md),
+        tasks_md2 = path_text(&paths.tasks_md),
+        status_json = path_text(&paths.status_json),
     )
 }
 
 pub(crate) fn decomposition_reviewer_prompt(
-    config: &Config,
-    plan: &str,
-    tasks: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
@@ -573,169 +499,121 @@ pub(crate) fn decomposition_reviewer_prompt(
     let findings_section = if open_findings.is_empty() {
         String::new()
     } else {
-        format!("\n\nOPEN TASKS FINDINGS (address or resolve each):\n{open_findings}")
+        format!(
+            "\n\nOPEN TASKS FINDINGS (address or resolve each):\n{open_findings}\n\n\
+            IMPORTANT: For each open finding above, you MUST include a JSON findings block in your review \
+            showing its updated status. Use a fenced code block in your review like this:\n\
+            ```json\n\
+            [{{\"id\": \"T-001\", \"description\": \"brief description\", \"status\": \"resolved\"}}]\n\
+            ```\n\
+            Set status to \"resolved\" if the finding has been addressed, or \"open\" if it still needs work. \
+            Every open finding listed above MUST appear in your JSON block."
+        )
     };
 
     format!(
-        "{preamble}You are the REVIEWER in a collaborative development loop.\n\nThe implementer has broken down the agreed plan into discrete tasks. Review the task breakdown for:\n\nAGREED PLAN:\n{plan}\n\nPROPOSED TASKS:\n{tasks}{findings_section}\n\nReview criteria:\n1. Does each task have clear scope and deliverables?\n2. Are task sizes reasonable (not too large, not too small)?\n3. Are dependencies correctly identified?\n4. Is the task order logical?\n5. Are there any missing tasks?\n6. Are testing/verification steps included?\n\n## Findings\nList specific issues as a JSON block in {review_path} (use IDs like T-001, T-002, ...):\n```json\n[{{\"id\": \"T-001\", \"description\": \"issue description\", \"status\": \"open\"}}]\n```\nUse `\"status\": \"resolved\"` for previously-raised issues that have been fully addressed. Use `\"status\": \"open\"` for issues that still need attention. Omit the block entirely if there are no findings at all.\n\nIf you approve the breakdown, write this JSON to {status_path}:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{impl_name}\", \"reviewer\": \"{rev_name}\", \"mode\": \"{mode}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf changes are needed, revise the task list in {tasks_path} and write:\n{{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"implementer\": \"{impl_name2}\", \"reviewer\": \"{rev_name2}\", \"mode\": \"{mode2}\", \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        preamble = single_agent_reviewer_preamble(config),
+        "Read the plan from {plan_md} and the proposed tasks from {tasks_md}.{findings_section}\n\n\
+        Review task scope, sizing, dependencies, ordering, completeness, and testing.\n\
+        Write your review to {review_path}.\n\n\
+        If APPROVED, write to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If changes needed, revise {tasks_path} and write to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        plan_md = path_text(&paths.plan_md),
+        tasks_md = path_text(&paths.tasks_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        impl_name = config.implementer,
-        rev_name = config.reviewer,
-        mode = config.run_mode,
         tasks_path = path_text(&paths.tasks_md),
-        impl_name2 = config.implementer,
-        rev_name2 = config.reviewer,
-        mode2 = config.run_mode,
+        status_path2 = path_text(&paths.status_json),
     )
 }
 
 pub(crate) fn decomposition_implementer_signoff_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    tasks: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has APPROVED the task breakdown. Review the tasks against the original plan and task.\n\nORIGINAL TASK:\n{task}\n\nAGREED PLAN:\n{plan}\n\nAPPROVED TASKS:\n{tasks}\n\nIf you agree with the task breakdown, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to request changes, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "The reviewer has APPROVED the task breakdown.\n\
+        Read the task from {task_md}, the plan from {plan_md}, and the tasks from {tasks_md}.\n\
+        Review the tasks against the original plan and task.\n\n\
+        {signoff_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        tasks_md = path_text(&paths.tasks_md),
+        signoff_block = signoff_status_block(round, prompt_timestamp, paths),
     )
 }
 
 pub(crate) fn planning_implementer_signoff_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has APPROVED your plan. Perform a final review before confirming.\n\nORIGINAL TASK:\n{task}\n\nAPPROVED PLAN:\n{plan}\n\nIf you agree with the plan, write this JSON to {}:\n{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf you want to request changes, write:\n{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"your concerns\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "The reviewer has APPROVED your plan. Read the task from {task_md} and the plan from {plan_md}.\n\
+        Perform a final review before confirming.\n\n\
+        {signoff_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        signoff_block = signoff_status_block(round, prompt_timestamp, paths),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_implementer_prompt(
     round: u32,
-    task: &str,
-    plan: &str,
-    previous_review: &str,
-    open_findings: &str,
-    decisions: &str,
     paths: &PhasePaths,
-    round_history: &str,
-    decisions_enabled: bool,
 ) -> String {
-    let review_section = if previous_review.trim().is_empty() {
+    let review_instruction = if round <= 1 {
         "This is the first implementation round.".to_string()
     } else {
-        format!("PREVIOUS REVIEW FEEDBACK (address all issues):\n{previous_review}")
-    };
-
-    let history_section = if round_history.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n\nROUND HISTORY:\n{round_history}")
-    };
-    let findings_section = if open_findings.trim().is_empty() {
-        "OPEN FINDINGS:\nNone.".to_string()
-    } else {
-        format!("OPEN FINDINGS (resolve every item before approval):\n{open_findings}")
-    };
-    let decisions_section = prior_decisions_section(decisions);
-
-    let decision_tail = if decisions_enabled {
-        format!("\n\n{DECISION_CAPTURE_INSTRUCTIONS}")
-    } else {
-        String::new()
+        format!(
+            "Address the reviewer's feedback in {}.",
+            path_text(&paths.review_md)
+        )
     };
 
     format!(
-        "You are the IMPLEMENTER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{history_section}{decisions_section}\n\n{review_section}\n\n{findings_section}\n\nImplement the plan. When done, write a summary of all changes to: {}\n\nFocus on:\n- Writing clean, well-structured code\n- Following the plan closely\n- Addressing all review feedback from previous rounds\n- Resolving every open finding ID\n- Adding tests where appropriate{decision_tail}",
-        path_text(&paths.changes_md)
+        "Read the task from {} and the plan from {}.\n\
+        {review_instruction}\n\n\
+        Implement ONLY the task in {}.\n\
+        Use {} strictly as supporting context; do not implement unrelated plan items.\n\
+        Write a summary of changes to {}.",
+        path_text(&paths.task_md),
+        path_text(&paths.plan_md),
+        path_text(&paths.task_md),
+        path_text(&paths.plan_md),
+        path_text(&paths.changes_md),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_reviewer_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    changes: &str,
-    diff: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
-    open_findings: &str,
-    quality_checks: Option<&str>,
-    decisions: &str,
-    round_history: &str,
-    decisions_enabled: bool,
+    auto_test: bool,
 ) -> String {
-    let quality_section = match quality_checks {
-        Some(checks) if !checks.trim().is_empty() => format!("\n\n{checks}"),
-        _ => String::new(),
-    };
-
-    let history_section = if round_history.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n\nROUND HISTORY:\n{round_history}")
-    };
-    let open_findings_section = if open_findings.trim().is_empty() {
-        String::new()
-    } else {
+    let quality_line = if auto_test {
         format!(
-            "\n\nOPEN FINDINGS FROM PREVIOUS ROUND (keep IDs for still-open issues):\n{open_findings}"
+            "\nReview automated check output from {}.",
+            path_text(&paths.quality_checks_md)
         )
-    };
-    let decisions_section = prior_decisions_section(decisions);
-
-    let decision_tail = if decisions_enabled {
-        format!("\n\n{DECISION_CAPTURE_INSTRUCTIONS}")
     } else {
         String::new()
     };
 
     format!(
-        "{}You are the REVIEWER in round {round} of a collaborative development loop.\n\nTASK:\n{task}\n\nPLAN:\n{plan}{decisions_section}\n\nCHANGES SUMMARY:\n{changes}\n\nACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{open_findings_section}\n\nReview the ACTUAL code changes shown in the diff above (not just the summary).\n\nStructure your review using these sections:\n\n## Correctness\nDoes the code match the plan? Are there bugs or edge cases?\n\n## Tests\nAre tests present, sufficient, and covering key scenarios?\n\n## Style\nIs the code clean, maintainable, and following project conventions?\n\n## Security\nAre there security concerns? Is error handling adequate?\n\n## Findings\nList unresolved issues using IDs like F-001, F-002. Include severity and file refs.\n\n## Verdict\nAPPROVE or REQUEST CHANGES — with a quality rating (1-5) and brief justification.\n\nWrite your detailed review to: {}\n\nAlso write structured findings JSON to {}:\n\nIf APPROVED (no unresolved issues):\n{{\"round\": {round}, \"findings\": []}}\n\nIf CHANGES NEEDED:\n{{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what is wrong\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\nRules for findings.json:\n- Include every unresolved issue in the findings array.\n- Keep IDs stable for issues that remain unresolved across rounds.\n- Do not mark APPROVED when findings is non-empty.\n\nInclude a quality rating from 1-5 in your status JSON:\n  1 = poor (major bugs, missing tests, does not follow plan)\n  2 = below average (significant issues or gaps)\n  3 = acceptable (works but has notable issues)\n  4 = good (solid implementation, minor issues only)\n  5 = excellent (clean, well-tested, follows plan precisely)\n\nThen write one of these to {}:\n\nIf APPROVED:\n{{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\nIf CHANGES NEEDED:\n{{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 2, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}{decision_tail}",
-        single_agent_reviewer_preamble(config),
-        path_text(&paths.review_md),
-        path_text(&paths.findings_json),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "Read the task from {task_md}, the plan from {plan_md}, and changes from {changes_md}.\n\
+        Read the changed files directly and review the implementation.{quality_line}\n\n\
+        {output_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        changes_md = path_text(&paths.changes_md),
+        output_block = implementation_reviewer_output_block(round, prompt_timestamp, paths),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_consensus_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    review: &str,
     open_findings: &str,
     round: u32,
     prompt_timestamp: &str,
@@ -748,187 +626,95 @@ pub(crate) fn implementation_consensus_prompt(
     };
 
     format!(
-        "The reviewer has APPROVED your implementation. Before confirming consensus,
-perform your own final review:
-
-1. Re-read the TASK requirements below — verify every requirement is met
-2. Check for edge cases, error handling gaps, or missing tests the reviewer may have overlooked
-3. Verify the code follows project conventions and the agreed plan
-4. Look for any regressions or unintended side effects
-
-TASK:
-{task}
-
-PLAN:
-{plan}
-
-REVIEW:
-{review}
-
-{findings_section}
-
-Write a brief summary of your self-review findings.
-
-If everything checks out, write CONSENSUS [JSON].
-If you find issues the reviewer missed, write DISPUTED [JSON] with specific
-details of what was missed.
-
-CONSENSUS [JSON] to {}:
-{{\"status\": \"CONSENSUS\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"timestamp\": \"{prompt_timestamp}\"}}
-
-DISPUTED [JSON] to {}:
-{{\"status\": \"DISPUTED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"what was missed\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "Read the task from {task_md}, the plan from {plan_md}, and the review from {review_md}. \
+        Review the implementation.\n\n\
+        {findings_section}\n\n\
+        {signoff_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        review_md = path_text(&paths.review_md),
+        signoff_block = signoff_status_block(round, prompt_timestamp, paths),
     )
 }
 
-pub(crate) fn compound_prompt(task: &str, plan: &str) -> String {
+pub(crate) fn compound_prompt(paths: &PhasePaths) -> String {
     format!(
-        "You are the IMPLEMENTER running a post-consensus compound reflection phase.
-
-Review the full session: task goals, plan, implementation rounds, review feedback,
-and any struggles encountered. Extract only reusable, cross-session learnings.
-Do not record one-off or session-specific details.
-
-TASK:
-{task}
-
-PLAN:
-{plan}
-
-Append each learning to `.agent-loop/decisions.md` using one line per entry:
-- [CATEGORY] description
-
-Allowed categories: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY."
+        "Post-consensus compound reflection phase.\n\n\
+        Read the task from {task_md} and the plan from {plan_md}.\n\
+        Review the full session: task goals, plan, implementation rounds, review feedback, \
+        and any struggles encountered. Extract only reusable, cross-session learnings.\n\
+        Do not record one-off or session-specific details.\n\n\
+        Append each learning to `.agent-loop/decisions.md` using one line per entry:\n\
+        - [CATEGORY] description\n\n\
+        Allowed categories: ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY.",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_fresh_context_reviewer_prompt(
-    config: &Config,
-    task: &str,
-    plan: &str,
-    changes: &str,
-    diff: &str,
-    first_review: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
-    open_findings: &str,
-    quality_checks: Option<&str>,
-    decisions: &str,
-    round_history: &str,
+    auto_test: bool,
 ) -> String {
-    let quality_section = match quality_checks {
-        Some(checks) if !checks.trim().is_empty() => format!("\n\n{checks}"),
-        _ => String::new(),
-    };
-    let findings_section = if open_findings.trim().is_empty() {
-        String::new()
-    } else {
+    let quality_line = if auto_test {
         format!(
-            "\n\nOPEN FINDINGS FROM PREVIOUS ROUND (keep IDs for still-open issues):\n{open_findings}"
+            "\nReview check output from {}.",
+            path_text(&paths.quality_checks_md)
         )
-    };
-    let history_section = if round_history.trim().is_empty() {
-        String::new()
     } else {
-        format!("\n\nROUND HISTORY:\n{round_history}")
+        String::new()
     };
-    let decisions_section = prior_decisions_section(decisions);
 
     format!(
-        "{}You are the REVIEWER in a mandatory fresh-context Gate B pass (round {round}).\n\n\
-        A same-context reviewer has already approved this round. Your role is independent verification \
-        from a fresh context.\n\n\
-        IMPORTANT GUARDRAIL: If you find no meaningful issues after thorough analysis, then \
-        APPROVED is the correct verdict. Do not manufacture issues.\n\n\
-        TASK:\n{task}\n\n\
-        PLAN:\n{plan}{decisions_section}\n\n\
-        CHANGES SUMMARY:\n{changes}\n\n\
-        ACTUAL CODE DIFF:\n{diff}{quality_section}{history_section}{findings_section}\n\n\
-        GATE A REVIEW (same-context reviewer):\n{first_review}\n\n\
-        Review the ACTUAL code changes shown in the diff above (not just the summary).\n\n\
-        Focus this fresh-context review on:\n\
-        1. Bugs or edge cases missed by Gate A\n\
-        2. Missing or insufficient tests\n\
-        3. Security weaknesses or unsafe patterns\n\
-        4. Plan deviations not previously flagged\n\
-        5. Error-handling gaps and silent failures\n\n\
-        Write your detailed review to: {}\n\n\
-        Also write structured findings JSON to {}:\n\
-        - If APPROVED: {{\"round\": {round}, \"findings\": []}}\n\
-        - If CHANGES NEEDED: {{\"round\": {round}, \"findings\": [{{\"id\": \"F-001\", \"severity\": \"HIGH\", \"summary\": \"what was missed\", \"file_refs\": [\"src/file.rs:42\"]}}]}}\n\
-        Keep finding IDs stable when issues remain unresolved.\n\n\
-        Include a quality rating from 1-5 in your status JSON:\n  \
-        1 = poor (major bugs, missing tests, does not follow plan)\n  \
-        2 = below average (significant issues or gaps)\n  \
-        3 = acceptable (works but has notable issues)\n  \
-        4 = good (solid implementation, minor issues only)\n  \
-        5 = excellent (clean, well-tested, follows plan precisely)\n\n\
-        Then write one of these to {}:\n\n\
-        If APPROVED:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If CHANGES NEEDED:\n\
-        {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 3, \"reason\": \"brief summary of missed issues\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        single_agent_reviewer_preamble(config),
-        path_text(&paths.review_md),
-        path_text(&paths.findings_json),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        "Read the task from {task_md}, the plan from {plan_md}, changes from {changes_md}. \
+        Review the implementation.{quality_line}\n\n\
+        {output_block}",
+        task_md = path_text(&paths.task_md),
+        plan_md = path_text(&paths.plan_md),
+        changes_md = path_text(&paths.changes_md),
+        output_block = implementation_reviewer_output_block(round, prompt_timestamp, paths),
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn implementation_gate_b_verification_prompt(
-    config: &Config,
-    task: &str,
-    findings_text: &str,
-    review_text: &str,
     round: u32,
     prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
         "You are the SAME fresh-context reviewer from Gate B (round {round}).\n\n\
-        You previously found the following issues. Re-examine each finding carefully \
-        against the actual code. For each finding, either CONFIRM it is a real issue \
-        or WITHDRAW it if you were mistaken.\n\n\
-        TASK:\n{task}\n\n\
-        YOUR PREVIOUS FINDINGS:\n{findings_text}\n\n\
-        YOUR PREVIOUS REVIEW:\n{review_text}\n\n\
-        Re-read the code for each finding. Be honest — if a finding was incorrect or \
-        based on a misunderstanding, withdraw it.\n\n\
-        If ALL findings are withdrawn, write APPROVED status.\n\
-        If ANY findings are confirmed, write NEEDS_CHANGES status.\n\n\
-        Update findings JSON at {}:\n\
-        - Keep only confirmed findings (remove withdrawn ones)\n\
-        - {{\"round\": {round}, \"findings\": [...confirmed only...]}}\n\n\
-        Write to {}:\n\n\
-        If all withdrawn (APPROVED):\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"rating\": 4, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If any confirmed (NEEDS_CHANGES):\n\
-        {{\"status\": \"NEEDS_CHANGES\", \"round\": {round}, \"implementer\": \"{}\", \"reviewer\": \"{}\", \"mode\": \"{}\", \"reason\": \"confirmed findings summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
-        path_text(&paths.findings_json),
-        path_text(&paths.status_json),
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
-        config.implementer,
-        config.reviewer,
-        config.run_mode,
+        You previously found issues. Re-examine each finding against the actual code.\n\
+        Read the task from {task_md}, your findings from {findings_json}, and your review from {review_md}.\n\
+        For each finding, CONFIRM it is real or WITHDRAW it if mistaken.\n\n\
+        If ALL withdrawn: write APPROVED. If ANY confirmed: write NEEDS_CHANGES.\n\n\
+        {output_block}",
+        task_md = path_text(&paths.task_md),
+        findings_json = path_text(&paths.findings_json),
+        review_md = path_text(&paths.review_md),
+        output_block = implementation_reviewer_output_block(round, prompt_timestamp, paths),
+    )
+}
+
+pub(crate) fn implementation_gate_c_late_findings_prompt(
+    dispute_reason: &str,
+    round: u32,
+    prompt_timestamp: &str,
+    paths: &PhasePaths,
+) -> String {
+    format!(
+        "You are the SAME fresh-context reviewer from Gate B (round {round}).\n\n\
+        The implementer has DISPUTED the consensus with late findings.\n\
+        Read the task from {task_md}, findings from {findings_json}, and review from {review_md}.\n\n\
+        IMPLEMENTER'S DISPUTE REASON:\n{dispute_reason}\n\n\
+        Verify each late finding against the code. If REJECTED: write APPROVED. \
+        If CONFIRMED: write NEEDS_CHANGES.\n\n\
+        {output_block}",
+        task_md = path_text(&paths.task_md),
+        findings_json = path_text(&paths.findings_json),
+        review_md = path_text(&paths.review_md),
+        output_block = implementation_reviewer_output_block(round, prompt_timestamp, paths),
     )
 }
 
@@ -1169,46 +955,17 @@ mod tests {
     }
 
     #[test]
-    fn planning_initial_prompt_includes_context_when_provided() {
-        let paths = PhasePaths {
-            task_md: PathBuf::from("/state/task.md"),
-            plan_md: PathBuf::from("/state/plan.md"),
-            tasks_md: PathBuf::from("/state/tasks.md"),
-            changes_md: PathBuf::from("/state/changes.md"),
-            review_md: PathBuf::from("/state/review.md"),
-            findings_json: PathBuf::from("/state/findings.json"),
-            status_json: PathBuf::from("/state/status.json"),
-        };
-
-        let with_context = planning_initial_prompt(
-            "My task",
-            "PROJECT STRUCTURE:\nsrc/\n  main.rs",
-            "",
-            &paths,
-            false,
-        );
-        let without_context = planning_initial_prompt("My task", "", "", &paths, false);
-
-        assert!(with_context.contains("PROJECT STRUCTURE:\nsrc/\n  main.rs"));
-        assert!(!without_context.contains("PROJECT STRUCTURE:"));
-        // Both should contain the task
-        assert!(with_context.contains("TASK:\nMy task"));
-        assert!(without_context.contains("TASK:\nMy task"));
-    }
-
-    #[test]
-    fn planning_initial_prompt_injects_prior_decisions_when_present() {
+    fn planning_initial_prompt_references_task_file() {
         let paths = test_phase_paths();
-        let prompt =
-            planning_initial_prompt("Task", "", "- [PATTERN] Reuse parser logic", &paths, false);
-        assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
-        assert!(prompt.contains("- [PATTERN] Reuse parser logic"));
+        let prompt = planning_initial_prompt(&paths, false);
+        assert!(prompt.contains("/state/task.md"));
+        assert!(prompt.contains("Write your plan to the file:"));
     }
 
     #[test]
     fn planning_initial_prompt_plan_mode_uses_plan_markers() {
         let paths = test_phase_paths();
-        let prompt = planning_initial_prompt("Task", "", "", &paths, true);
+        let prompt = planning_initial_prompt(&paths, true);
         assert!(prompt.contains("<plan>"));
         assert!(prompt.contains("</plan>"));
         assert!(!prompt.contains("Write your plan to the file:"));
@@ -1228,22 +985,19 @@ mod tests {
             plan_md: PathBuf::from("/state/plan.md"),
             tasks_md: PathBuf::from("/state/tasks.md"),
             changes_md: PathBuf::from("/state/changes.md"),
+            quality_checks_md: PathBuf::from("/state/quality_checks.md"),
             review_md: PathBuf::from("/state/review.md"),
             findings_json: PathBuf::from("/state/findings.json"),
+            planning_findings_json: PathBuf::from("/state/planning_findings.json"),
+            tasks_findings_json: PathBuf::from("/state/tasks_findings.json"),
             status_json: PathBuf::from("/state/status.json"),
         }
     }
 
     #[test]
     fn planning_reviewer_prompt_includes_concerns_when_dispute_reason_present() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1259,14 +1013,8 @@ mod tests {
 
     #[test]
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_absent() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1282,14 +1030,8 @@ mod tests {
 
     #[test]
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_is_empty() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 2,
             prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
@@ -1304,15 +1046,9 @@ mod tests {
     }
 
     #[test]
-    fn planning_reviewer_prompt_includes_context_and_decisions() {
-        let config = test_config_for_prompts();
+    fn planning_reviewer_prompt_references_task_and_plan_files() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "PROJECT STRUCTURE:\nsrc/main.rs",
-            decisions: "- [PATTERN] Use repository pattern",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1320,53 +1056,14 @@ mod tests {
             open_findings: "",
         });
 
-        assert!(
-            prompt.contains("PROJECT CONTEXT:\nPROJECT STRUCTURE:\nsrc/main.rs"),
-            "reviewer prompt should include project context"
-        );
-        assert!(
-            prompt.contains("PRIOR DECISIONS & LEARNINGS:\n- [PATTERN] Use repository pattern"),
-            "reviewer prompt should include decisions"
-        );
-    }
-
-    #[test]
-    fn planning_reviewer_prompt_omits_context_when_empty() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
-            paths: &paths,
-            dispute_reason: None,
-            open_findings: "",
-        });
-
-        assert!(
-            !prompt.contains("PROJECT CONTEXT:"),
-            "reviewer prompt should omit empty context"
-        );
-        assert!(
-            !prompt.contains("PRIOR DECISIONS"),
-            "reviewer prompt should omit empty decisions"
-        );
+        assert!(prompt.contains("/state/task.md"), "should reference task file");
+        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
     }
 
     #[test]
     fn planning_reviewer_prompt_includes_review_md_write_instruction() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1375,7 +1072,7 @@ mod tests {
         });
 
         assert!(
-            prompt.contains("Write your complete review"),
+            prompt.contains("Write your review"),
             "reviewer prompt should instruct writing to review.md"
         );
         assert!(
@@ -1384,349 +1081,47 @@ mod tests {
         );
     }
 
+
     #[test]
-    fn planning_reviewer_prompt_requires_file_refs_in_findings() {
-        let config = test_config_for_prompts();
+    fn decomposition_initial_prompt_references_files() {
         let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
-            paths: &paths,
-            dispute_reason: None,
-            open_findings: "",
-        });
-
-        assert!(
-            prompt.contains("file_refs"),
-            "reviewer prompt should require file_refs in findings"
-        );
+        let prompt = decomposition_initial_prompt(&paths);
+        assert!(prompt.contains("/state/task.md"));
+        assert!(prompt.contains("/state/plan.md"));
+        assert!(prompt.contains("/state/tasks.md"));
     }
 
     #[test]
-    fn planning_reviewer_prompt_includes_codebase_verification_section() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
-            paths: &paths,
-            dispute_reason: None,
-            open_findings: "",
-        });
-
-        assert!(
-            prompt.contains("Codebase Verification"),
-            "reviewer prompt should contain codebase verification section"
-        );
-        assert!(
-            prompt.contains("Do NOT trust the plan at face value"),
-            "reviewer prompt should instruct not trusting plan at face value"
-        );
-    }
-
-    #[test]
-    fn decomposition_initial_prompt_includes_context_when_provided() {
-        let paths = PhasePaths {
-            task_md: PathBuf::from("/state/task.md"),
-            plan_md: PathBuf::from("/state/plan.md"),
-            tasks_md: PathBuf::from("/state/tasks.md"),
-            changes_md: PathBuf::from("/state/changes.md"),
-            review_md: PathBuf::from("/state/review.md"),
-            findings_json: PathBuf::from("/state/findings.json"),
-            status_json: PathBuf::from("/state/status.json"),
-        };
-
-        let with_context =
-            decomposition_initial_prompt("My task", "The plan", "PROJECT STRUCTURE:\nsrc/", &paths);
-        let without_context = decomposition_initial_prompt("My task", "The plan", "", &paths);
-
-        assert!(with_context.contains("PROJECT STRUCTURE:\nsrc/"));
-        assert!(!without_context.contains("PROJECT STRUCTURE:"));
-        assert!(with_context.contains("ORIGINAL TASK:\nMy task"));
-        assert!(without_context.contains("ORIGINAL TASK:\nMy task"));
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_excludes_quality_checks_when_none() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "",
-            "",
-            true,
-        );
-
-        assert!(!prompt.contains("QUALITY CHECKS:"));
-        assert!(prompt.contains("ACTUAL CODE DIFF:\ndiff content"));
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_includes_quality_checks_when_provided() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let checks = "QUALITY CHECKS:\n\n--- cargo test [PASS] ---\nAll 42 tests passed.";
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            Some(checks),
-            "",
-            "",
-            true,
-        );
-
-        assert!(prompt.contains("QUALITY CHECKS:"));
-        assert!(prompt.contains("All 42 tests passed."));
-        // Quality checks should appear after the diff
-        let diff_pos = prompt.find("ACTUAL CODE DIFF:").unwrap();
-        let checks_pos = prompt.find("QUALITY CHECKS:").unwrap();
-        assert!(checks_pos > diff_pos);
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_ignores_empty_quality_checks() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            Some("   "),
-            "",
-            "",
-            true,
-        );
-
-        assert!(!prompt.contains("QUALITY CHECKS:"));
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_includes_round_history_when_provided() {
-        let paths = test_phase_paths();
-        let history = "Round 1 implementation: Added auth\nRound 1 review: NEEDS_CHANGES — missing validation";
-        let prompt = implementation_implementer_prompt(
-            2,
-            "Task",
-            "Plan",
-            "Fix validation",
-            "",
-            "",
-            &paths,
-            history,
-            true,
-        );
-
-        assert!(prompt.contains("ROUND HISTORY:\nRound 1 implementation: Added auth\nRound 1 review: NEEDS_CHANGES — missing validation"));
-        // History should appear after PLAN and before review feedback
-        let plan_pos = prompt.find("PLAN:\nPlan").unwrap();
-        let history_pos = prompt.find("ROUND HISTORY:").unwrap();
-        let review_pos = prompt.find("PREVIOUS REVIEW FEEDBACK").unwrap();
-        assert!(history_pos > plan_pos);
-        assert!(history_pos < review_pos);
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_omits_round_history_when_empty() {
-        let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "", true);
-
-        assert!(!prompt.contains("ROUND HISTORY:"));
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_omits_round_history_when_whitespace_only() {
-        let paths = test_phase_paths();
-        let prompt =
-            implementation_implementer_prompt(1, "Task", "Plan", "", "", "", &paths, "   \n  ", true);
-
-        assert!(!prompt.contains("ROUND HISTORY:"));
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_includes_open_findings_when_present() {
-        let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(
-            2,
-            "Task",
-            "Plan",
-            "Fix the previous issues",
-            "- F-001 [HIGH] Missing validation (src/lib.rs:10)",
-            "",
-            &paths,
-            "",
-            true,
-        );
-
-        assert!(prompt.contains("OPEN FINDINGS (resolve every item before approval):"));
-        assert!(prompt.contains("F-001 [HIGH] Missing validation"));
-    }
-
-    #[test]
-    fn implementation_prompts_include_decision_capture_categories() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-
-        let implementer = implementation_implementer_prompt(
-            1,
-            "Task",
-            "Plan",
-            "",
-            "",
-            "- [CONSTRAINT] Keep compatibility",
-            &paths,
-            "",
-            true,
-        );
-        assert!(implementer.contains("DECISION CAPTURE"));
-        assert!(implementer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
-        assert!(implementer.contains("PRIOR DECISIONS & LEARNINGS"));
-
-        let reviewer = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "- [GOTCHA] Handle stale status writes",
-            "",
-            true,
-        );
-        assert!(reviewer.contains("DECISION CAPTURE"));
-        assert!(reviewer.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
-        assert!(reviewer.contains("PRIOR DECISIONS & LEARNINGS"));
-    }
-
-    #[test]
-    fn implementation_consensus_prompt_includes_self_review_checklist_and_context() {
-        let config = test_config_for_prompts();
+    fn implementation_consensus_prompt_references_files_and_statuses() {
         let paths = test_phase_paths();
         let prompt = implementation_consensus_prompt(
-            &config,
-            "Task body",
-            "Plan body",
-            "Reviewer approved",
             "",
             2,
             "2026-02-15T00:00:00.000Z",
             &paths,
         );
 
-        assert!(prompt.contains("perform your own final review"));
-        assert!(prompt.contains("TASK:\nTask body"));
-        assert!(prompt.contains("PLAN:\nPlan body"));
-        assert!(prompt.contains("If everything checks out, write CONSENSUS [JSON]."));
-        assert!(prompt.contains("If you find issues the reviewer missed, write DISPUTED [JSON]"));
+        assert!(prompt.contains("Review the implementation"));
+        assert!(prompt.contains("/state/task.md"));
+        assert!(prompt.contains("/state/plan.md"));
+        assert!(prompt.contains("CONSENSUS"));
+        assert!(prompt.contains("DISPUTED"));
     }
 
     #[test]
-    fn compound_prompt_includes_categories_and_decisions_path() {
-        let prompt = compound_prompt("Task", "Plan");
+    fn compound_prompt_references_files_and_decisions_path() {
+        let paths = test_phase_paths();
+        let prompt = compound_prompt(&paths);
+        assert!(prompt.contains("/state/task.md"));
+        assert!(prompt.contains("/state/plan.md"));
         assert!(prompt.contains(".agent-loop/decisions.md"));
         assert!(prompt.contains("ARCHITECTURE, PATTERN, CONSTRAINT, GOTCHA, DEPENDENCY"));
     }
 
     #[test]
-    fn implementation_reviewer_prompt_includes_round_history_when_provided() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let history = "Round 1 implementation: Added auth\nRound 1 review: APPROVED";
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            2,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "",
-            history,
-            true,
-        );
-
-        assert!(prompt.contains(
-            "ROUND HISTORY:\nRound 1 implementation: Added auth\nRound 1 review: APPROVED"
-        ));
-        // History should appear after diff/quality-checks and before review criteria
-        let diff_pos = prompt.find("ACTUAL CODE DIFF:").unwrap();
-        let history_pos = prompt.find("ROUND HISTORY:").unwrap();
-        let review_pos = prompt.find("Review the ACTUAL code changes").unwrap();
-        assert!(history_pos > diff_pos);
-        assert!(history_pos < review_pos);
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_omits_round_history_when_empty() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "",
-            "",
-            true,
-        );
-
-        assert!(!prompt.contains("ROUND HISTORY:"));
-    }
-
-    #[test]
-    fn planning_reviewer_prompt_includes_structured_sections() {
-        let config = test_config_for_prompts();
+    fn planning_reviewer_prompt_references_files_and_verdict() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1734,60 +1129,48 @@ mod tests {
             open_findings: "",
         });
 
-        assert!(
-            prompt.contains("## Completeness"),
-            "missing Completeness section"
-        );
-        assert!(prompt.contains("## Accuracy"), "missing Accuracy section");
-        assert!(
-            prompt.contains("## Feasibility"),
-            "missing Feasibility section"
-        );
-        assert!(prompt.contains("## Risks"), "missing Risks section");
-        assert!(prompt.contains("## Verdict"), "missing Verdict section");
+        assert!(prompt.contains("/state/task.md"), "should reference task file");
+        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
+        assert!(prompt.contains("VERDICT"), "should contain verdict instruction");
     }
 
     #[test]
-    fn implementation_reviewer_prompt_includes_structured_sections() {
-        let config = test_config_for_prompts();
+    fn implementation_reviewer_prompt_references_files() {
         let paths = test_phase_paths();
         let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
-            "",
-            None,
-            "",
-            "",
-            true,
+            false,
         );
 
+        assert!(prompt.contains("/state/task.md"), "should reference task file");
+        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
+        assert!(prompt.contains("/state/changes.md"), "should reference changes file");
+        assert!(prompt.contains("/state/review.md"), "should reference review file");
+    }
+
+    #[test]
+    fn implementation_implementer_prompt_enforces_task_scope() {
+        let paths = test_phase_paths();
+        let prompt = implementation_implementer_prompt(1, &paths);
+
         assert!(
-            prompt.contains("## Correctness"),
-            "missing Correctness section"
+            prompt.contains("Implement ONLY the task"),
+            "implementer prompt should enforce task-only scope"
         );
-        assert!(prompt.contains("## Tests"), "missing Tests section");
-        assert!(prompt.contains("## Style"), "missing Style section");
-        assert!(prompt.contains("## Security"), "missing Security section");
-        assert!(prompt.contains("## Findings"), "missing Findings section");
-        assert!(prompt.contains("## Verdict"), "missing Verdict section");
+        assert!(
+            prompt.contains("do not implement unrelated plan items"),
+            "implementer prompt should explicitly forbid unrelated plan work"
+        );
+        assert!(prompt.contains("/state/task.md"), "should reference task file");
+        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
     }
 
     #[test]
     fn planning_reviewer_prompt_preserves_json_status_format() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            config: &config,
-            task: "Build feature X",
-            plan: "1. Implement it",
-            project_context: "",
-            decisions: "",
             round: 1,
             prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
@@ -1807,22 +1190,12 @@ mod tests {
 
     #[test]
     fn implementation_reviewer_prompt_preserves_json_status_format() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = implementation_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
-            "",
-            None,
-            "",
-            "",
-            true,
+            false,
         );
 
         assert!(
@@ -1833,10 +1206,7 @@ mod tests {
             prompt.contains("\"status\": \"NEEDS_CHANGES\""),
             "missing NEEDS_CHANGES JSON status"
         );
-        assert!(
-            prompt.contains("\"rating\":"),
-            "missing rating field in JSON status"
-        );
+
         assert!(
             prompt.contains("\"findings\":"),
             "missing findings JSON template"
@@ -1844,135 +1214,37 @@ mod tests {
     }
 
     #[test]
-    fn fresh_context_review_prompt_contains_diff_and_first_review() {
-        let config = test_config_for_prompts();
+    fn fresh_context_review_prompt_references_files_and_framing() {
         let paths = test_phase_paths();
         let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff --git a/file.rs\n+new code",
-            "First review: looks great!",
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
-            "",
-            None,
-            "",
-            "",
+            false,
         );
 
         assert!(
-            prompt.contains("diff --git a/file.rs\n+new code"),
-            "fresh-context prompt should contain the diff"
+            prompt.contains("/state/task.md"),
+            "fresh-context prompt should reference task file"
         );
         assert!(
-            prompt.contains("First review: looks great!"),
-            "fresh-context prompt should contain the first review"
-        );
-    }
-
-    #[test]
-    fn fresh_context_review_prompt_contains_guardrail_and_framing() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            "First review text",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "",
-            "",
-        );
-
-        assert!(
-            prompt.contains("mandatory fresh-context Gate B pass"),
-            "fresh-context prompt should contain gate framing"
+            prompt.contains("/state/plan.md"),
+            "fresh-context prompt should reference plan file"
         );
         assert!(
-            prompt.contains("no meaningful issues"),
-            "fresh-context prompt should contain guardrail text"
+            prompt.contains("Review the implementation"),
+            "fresh-context prompt should contain review instruction"
         );
-        assert!(
-            prompt.contains("Do not manufacture issues"),
-            "fresh-context prompt should discourage manufactured findings"
-        );
-    }
-
-    #[test]
-    fn fresh_context_review_prompt_includes_quality_checks_when_provided() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let checks = "QUALITY CHECKS:\n\n--- cargo test [PASS] ---\nAll 42 tests passed.";
-        let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            "First review text",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            Some(checks),
-            "",
-            "",
-        );
-
-        assert!(prompt.contains("QUALITY CHECKS:"));
-        assert!(prompt.contains("All 42 tests passed."));
-    }
-
-    #[test]
-    fn fresh_context_review_prompt_omits_quality_checks_when_none() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            "First review text",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            "",
-            None,
-            "",
-            "",
-        );
-
-        assert!(!prompt.contains("QUALITY CHECKS:"));
     }
 
     #[test]
     fn fresh_context_review_prompt_includes_json_status_templates() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            "First review text",
             2,
             "2026-02-15T12:00:00.000Z",
             &paths,
-            "",
-            None,
-            "",
-            "",
+            false,
         );
 
         assert!(
@@ -1983,10 +1255,7 @@ mod tests {
             prompt.contains("\"status\": \"NEEDS_CHANGES\""),
             "missing NEEDS_CHANGES JSON status"
         );
-        assert!(
-            prompt.contains("\"rating\":"),
-            "missing rating field in JSON status"
-        );
+
         assert!(
             prompt.contains("\"findings\":"),
             "missing findings JSON template"
@@ -2009,158 +1278,45 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fresh_context_review_prompt_includes_open_findings_history_and_decisions() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_fresh_context_reviewer_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "Changes",
-            "diff content",
-            "First review text",
-            3,
-            "2026-02-15T12:00:00.000Z",
-            &paths,
-            "- F-001 [HIGH] missing check (src/lib.rs:10)",
-            Some("QUALITY CHECKS:\nPASS"),
-            "- [PATTERN] keep IDs stable",
-            "Round 1 implementation: x\nRound 1 review: NEEDS_CHANGES",
-        );
-
-        assert!(prompt.contains("OPEN FINDINGS FROM PREVIOUS ROUND"));
-        assert!(prompt.contains("ROUND HISTORY:"));
-        assert!(prompt.contains("PRIOR DECISIONS & LEARNINGS"));
-    }
-
     // -----------------------------------------------------------------------
     // planning_adversarial_review_prompt
     // -----------------------------------------------------------------------
 
     #[test]
-    fn planning_adversarial_prompt_contains_task_plan_and_first_review() {
-        let config = test_config_for_prompts();
+    fn planning_adversarial_prompt_references_files_and_framing() {
         let paths = test_phase_paths();
         let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Build feature X",
-            "1. Implement it\n2. Test it",
-            "First review: plan looks solid",
-            "",
-            "",
             1,
             "2026-02-15T00:00:00.000Z",
             &paths,
         );
 
         assert!(
-            prompt.contains("Build feature X"),
-            "planning adversarial prompt should contain the task"
+            prompt.contains("/state/task.md"),
+            "planning adversarial prompt should reference task file"
         );
         assert!(
-            prompt.contains("1. Implement it\n2. Test it"),
-            "planning adversarial prompt should contain the plan"
+            prompt.contains("/state/plan.md"),
+            "planning adversarial prompt should reference plan file"
         );
         assert!(
-            prompt.contains("First review: plan looks solid"),
-            "planning adversarial prompt should contain the first review"
+            prompt.contains("/state/review.md"),
+            "planning adversarial prompt should reference review file"
         );
-    }
-
-    #[test]
-    fn planning_adversarial_prompt_contains_guardrail_and_framing() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "First review",
-            "",
-            "",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
-
         assert!(
-            prompt.contains("find what they missed"),
+            prompt.contains("Find what they missed"),
             "planning adversarial prompt should contain adversarial framing"
         );
         assert!(
-            prompt.contains("Do not manufacture issues"),
+            prompt.contains("no meaningful issues"),
             "planning adversarial prompt should contain guardrail text"
-        );
-        assert!(
-            prompt.contains("PA-001"),
-            "planning adversarial prompt should use PA-xxx finding IDs"
-        );
-    }
-
-    #[test]
-    fn planning_adversarial_prompt_includes_context_when_provided() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "First review",
-            "PROJECT STRUCTURE:\nsrc/main.rs",
-            "- [PATTERN] Use repository pattern",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
-
-        assert!(
-            prompt.contains("PROJECT CONTEXT:\nPROJECT STRUCTURE:\nsrc/main.rs"),
-            "planning adversarial prompt should include project context"
-        );
-        assert!(
-            prompt.contains("PRIOR DECISIONS & LEARNINGS:\n- [PATTERN] Use repository pattern"),
-            "planning adversarial prompt should include decisions"
-        );
-    }
-
-    #[test]
-    fn planning_adversarial_prompt_omits_context_when_empty() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "First review",
-            "",
-            "",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
-
-        assert!(
-            !prompt.contains("PROJECT CONTEXT:"),
-            "planning adversarial prompt should omit empty context"
-        );
-        assert!(
-            !prompt.contains("PRIOR DECISIONS"),
-            "planning adversarial prompt should omit empty decisions"
         );
     }
 
     #[test]
     fn planning_adversarial_prompt_includes_json_status_templates() {
-        let config = test_config_for_prompts();
         let paths = test_phase_paths();
         let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "First review",
-            "",
-            "",
             2,
             "2026-02-15T12:00:00.000Z",
             &paths,
@@ -2181,28 +1337,6 @@ mod tests {
         assert!(
             prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
             "missing timestamp in JSON status"
-        );
-    }
-
-    #[test]
-    fn planning_adversarial_prompt_requires_file_refs_in_findings() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            &config,
-            "Task",
-            "Plan",
-            "First review",
-            "",
-            "",
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
-
-        assert!(
-            prompt.contains("file_refs"),
-            "planning adversarial prompt should require file_refs in findings"
         );
     }
 
@@ -2228,7 +1362,7 @@ mod tests {
         let decisions_dir = dir.join(".agent-loop");
         fs::write(decisions_dir.join("decisions.md"), "decisions").unwrap();
 
-        let config = Config {
+        let mut config = Config {
             project_dir: dir.clone(),
             state_dir: state_dir.clone(),
             ..crate::test_support::make_test_config(
@@ -2236,6 +1370,7 @@ mod tests {
                 crate::test_support::TestConfigOptions::default(),
             )
         };
+        config.decisions_enabled = true;
 
         let manifest = state_manifest(&config);
 
@@ -2315,38 +1450,12 @@ mod tests {
 
     #[test]
     fn system_prompt_includes_decision_capture_when_enabled() {
-        let config = test_config_for_prompts();
-        assert!(config.decisions_enabled);
+        let mut config = test_config_for_prompts();
+        config.decisions_enabled = true;
         let prompt = system_prompt_for_role(AgentRole::Implementer, &config);
         assert!(
             prompt.contains("DECISION CAPTURE"),
             "decision capture should be present when decisions enabled"
-        );
-    }
-
-    #[test]
-    fn implementation_implementer_prompt_omits_decision_capture_when_disabled() {
-        let paths = test_phase_paths();
-        let prompt = implementation_implementer_prompt(
-            1, "Task", "Plan", "", "", "", &paths, "", false,
-        );
-        assert!(
-            !prompt.contains("DECISION CAPTURE"),
-            "decision capture should be absent in implementer prompt when disabled"
-        );
-    }
-
-    #[test]
-    fn implementation_reviewer_prompt_omits_decision_capture_when_disabled() {
-        let config = test_config_for_prompts();
-        let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            &config, "Task", "Plan", "Changes", "diff", 1,
-            "2026-02-15T00:00:00.000Z", &paths, "", None, "", "", false,
-        );
-        assert!(
-            !prompt.contains("DECISION CAPTURE"),
-            "decision capture should be absent in reviewer prompt when disabled"
         );
     }
 
@@ -2378,15 +1487,10 @@ mod tests {
     }
 
     #[test]
-    fn gate_b_verification_prompt_contains_findings_and_status_templates() {
-        let config = test_config_for_prompts();
+    fn gate_b_verification_prompt_references_files_and_status_templates() {
         let paths = test_phase_paths();
 
         let prompt = implementation_gate_b_verification_prompt(
-            &config,
-            "Implement auth",
-            "F-001: Race condition in pool.rs:42",
-            "NEEDS_CHANGES: race condition found",
             3,
             "2025-01-01T00:00:00Z",
             &paths,
@@ -2397,12 +1501,8 @@ mod tests {
             "prompt must ask for re-examination"
         );
         assert!(
-            prompt.contains("F-001: Race condition"),
-            "prompt must include the findings text"
-        );
-        assert!(
-            prompt.contains("NEEDS_CHANGES"),
-            "prompt must include previous review text"
+            prompt.contains("/state/review.md"),
+            "prompt must reference review file"
         );
         assert!(
             prompt.contains("APPROVED"),
@@ -2411,6 +1511,93 @@ mod tests {
         assert!(
             prompt.contains("\"round\": 3"),
             "prompt must include round number in JSON templates"
+        );
+    }
+
+    #[test]
+    fn phase_paths_includes_all_findings_files() {
+        let config = test_config_for_prompts();
+        let paths = phase_paths(&config);
+        assert_eq!(
+            paths.findings_json.parent(),
+            paths.planning_findings_json.parent(),
+            "findings and planning_findings should share parent dir"
+        );
+        assert_eq!(
+            paths.findings_json.parent(),
+            paths.tasks_findings_json.parent(),
+            "findings and tasks_findings should share parent dir"
+        );
+        assert!(
+            paths
+                .findings_json
+                .to_string_lossy()
+                .contains("findings.json"),
+            "findings_json path must be set"
+        );
+        assert!(
+            paths
+                .planning_findings_json
+                .to_string_lossy()
+                .contains("planning_findings.json"),
+            "planning_findings_json path must be set"
+        );
+        assert!(
+            paths
+                .tasks_findings_json
+                .to_string_lossy()
+                .contains("tasks_findings.json"),
+            "tasks_findings_json path must be set"
+        );
+        assert!(
+            paths
+                .quality_checks_md
+                .to_string_lossy()
+                .contains("quality_checks.md"),
+            "quality_checks_md path must be set"
+        );
+    }
+
+    #[test]
+    fn fresh_context_reviewer_prompt_includes_independent_verification() {
+        let paths = test_phase_paths();
+        let prompt = implementation_fresh_context_reviewer_prompt(
+            1,
+            "2025-01-01T00:00:00Z",
+            &paths,
+            false,
+        );
+        assert!(
+            prompt.contains("Review the implementation"),
+            "fresh context reviewer prompt must include review instruction"
+        );
+    }
+
+    #[test]
+    fn gate_c_late_findings_prompt_contains_dispute_and_status_templates() {
+        let paths = test_phase_paths();
+        let prompt = implementation_gate_c_late_findings_prompt(
+            "Missing error handling in auth.rs",
+            2,
+            "2025-01-01T00:00:00Z",
+            &paths,
+        );
+
+        assert!(
+            prompt.contains("Missing error handling in auth.rs"),
+            "prompt must include the dispute reason"
+        );
+        assert!(
+            prompt.contains("NEEDS_CHANGES"),
+            "prompt must have NEEDS_CHANGES template"
+        );
+        assert!(
+            prompt.contains("APPROVED"),
+            "prompt must have APPROVED template"
+        );
+        assert!(
+            prompt.contains("\"round\": 2"),
+            "prompt must include round number"
         );
     }
 }

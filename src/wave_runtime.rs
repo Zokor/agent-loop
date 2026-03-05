@@ -233,10 +233,7 @@ pub enum WaveProgressEvent {
 // ---------------------------------------------------------------------------
 
 /// Append a single `WaveProgressEvent` as one JSON line to the journal file.
-pub fn append_journal_event(
-    journal_path: &Path,
-    event: &WaveProgressEvent,
-) -> std::io::Result<()> {
+pub fn append_journal_event(journal_path: &Path, event: &WaveProgressEvent) -> std::io::Result<()> {
     let line = serde_json::to_string(event)?;
 
     if let Some(parent) = journal_path.parent() {
@@ -256,10 +253,7 @@ pub fn append_journal_event(
 ///
 /// Invalid lines are silently skipped.  If the file does not exist an empty
 /// `Vec` is returned.
-pub fn read_recent_events(
-    journal_path: &Path,
-    max_events: usize,
-) -> Vec<WaveProgressEvent> {
+pub fn read_recent_events(journal_path: &Path, max_events: usize) -> Vec<WaveProgressEvent> {
     let file = match fs::File::open(journal_path) {
         Ok(f) => f,
         Err(_) => return Vec::new(),
@@ -310,8 +304,7 @@ fn days_to_ymd(days_since_epoch: u64) -> (u64, u64, u64) {
     let z = days_since_epoch as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as u64; // day of era [0, 146096]
-    let yoe =
-        (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
     let y = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
     let mp = (5 * doy + 2) / 153; // [0, 11]
@@ -367,14 +360,20 @@ mod tests {
 
         // A second acquire by the same (alive) PID should fail.
         let err = WaveRunLock::acquire(lock_path.clone(), "wave", 4, 300);
-        assert!(err.is_err(), "second acquire should fail while lock is held");
+        assert!(
+            err.is_err(),
+            "second acquire should fail while lock is held"
+        );
         assert!(
             err.unwrap_err().contains("Wave run already in progress"),
             "error should mention the holding PID"
         );
 
         lock.release();
-        assert!(!lock_path.exists(), "lock file should be removed after release");
+        assert!(
+            !lock_path.exists(),
+            "lock file should be removed after release"
+        );
 
         // After release a new acquire should succeed.
         let lock2 = WaveRunLock::acquire(lock_path.clone(), "wave", 2, 300)

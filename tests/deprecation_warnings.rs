@@ -152,11 +152,8 @@ fn max_rounds_env_var_rejected_with_rename_guidance() {
 #[test]
 fn max_rounds_toml_key_rejected_with_rename_guidance() {
     let tmp = TempDir::new("max_rounds_toml");
-    fs::write(
-        tmp.path().join(".agent-loop.toml"),
-        "max_rounds = 10\n",
-    )
-    .expect("toml should be written");
+    fs::write(tmp.path().join(".agent-loop.toml"), "max_rounds = 10\n")
+        .expect("toml should be written");
 
     let output = run_in_tmp(&tmp, &["status"]);
     let stderr = String::from_utf8_lossy(&output.stderr);

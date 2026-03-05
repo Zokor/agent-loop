@@ -333,10 +333,7 @@ mod tests {
     #[test]
     fn display_self_reference() {
         let err = WaveError::SelfReference(3);
-        assert_eq!(
-            err.to_string(),
-            "self reference: task 3 depends on itself"
-        );
+        assert_eq!(err.to_string(), "self reference: task 3 depends on itself");
     }
 
     #[test]

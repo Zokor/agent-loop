@@ -490,7 +490,8 @@ mod tests {
         let mut config = project.config.clone();
 
         // Set a model on an agent that doesn't support it (gemini)
-        config.implementer = crate::config::Agent::known("gemini").with_model(Some("gpt-4".to_string()));
+        config.implementer =
+            crate::config::Agent::known("gemini").with_model(Some("gpt-4".to_string()));
         assert!(config.implementer.model().is_some());
 
         validate_model_support(&mut config);

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -11,19 +12,20 @@ use crate::{
     prompts::{
         AgentRole, PlanningReviewerParams, compound_prompt,
         decomposition_implementer_signoff_prompt, decomposition_initial_prompt,
-        decomposition_reviewer_prompt, decomposition_revision_prompt, gather_project_context,
+        decomposition_reviewer_prompt, decomposition_revision_prompt,
         implementation_consensus_prompt, implementation_fresh_context_reviewer_prompt,
-        implementation_gate_b_verification_prompt, implementation_implementer_prompt,
-        implementation_reviewer_prompt, phase_paths,
+        implementation_gate_b_verification_prompt, implementation_gate_c_late_findings_prompt,
+        implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
         planning_adversarial_review_prompt, planning_implementer_revision_prompt,
         planning_implementer_signoff_prompt, planning_initial_prompt, planning_reviewer_prompt,
-        state_manifest, system_prompt_for_role,
+        system_prompt_for_role,
     },
     state::{
-        AgentCallMeta, FindingEntry, FindingsFile, LoopStatus, Status, StatusPatch,
-        append_decision, is_status_stale, log, read_decisions, read_findings,
-        read_findings_with_warnings, read_state_file, read_status, summarize_task, timestamp,
-        write_findings, write_state_file, write_status,
+        AgentCallMeta, FINDINGS_FILENAME, FindingEntry, FindingsFile, LoopStatus,
+        QUALITY_CHECKS_FILENAME, Status, StatusPatch, TASKS_FINDINGS_FILENAME, append_decision,
+        is_status_stale, log, read_findings, read_findings_with_warnings,
+        read_state_file, read_status, summarize_task, timestamp, write_findings, write_state_file,
+        write_status,
     },
     stuck::{StuckDetector, StuckSignal},
 };
@@ -40,6 +42,7 @@ const IMPLEMENTATION_HIGH_WATERMARK_LOG: &str =
 const IMPLEMENT_GATE_SAME_CONTEXT: &str = "[gate:same-context]";
 const IMPLEMENT_GATE_FRESH_CONTEXT: &str = "[gate:fresh-context]";
 const IMPLEMENT_GATE_SIGNOFF: &str = "[gate:implementer-signoff]";
+const IMPLEMENT_GATE_C_BOUNCE: &str = "[gate:gate-c-bounce]";
 const PLANNING_GATE_SAME_CONTEXT: &str = "[gate:same-context]";
 const PLANNING_GATE_ADVERSARIAL: &str = "[gate:fresh-context]";
 const PLANNING_GATE_SIGNOFF: &str = "[gate:implementer-signoff]";
@@ -47,7 +50,6 @@ const CHECKPOINT_SUMMARY_MAX_LEN: usize = 80;
 const IMPLEMENTATION_CHECKPOINT_FALLBACK: &str = "implementation updates";
 const QUALITY_CHECK_TIMEOUT_SECS: u64 = 120;
 const QUALITY_CHECK_MAX_LINES: usize = 100;
-const FINDINGS_PATH_HINT: &str = ".agent-loop/state/findings.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlanningReviewerAction {
@@ -175,6 +177,22 @@ fn findings_for_prompt(findings: &FindingsFile) -> String {
     lines.join("\n")
 }
 
+/// Extracts the portion of a review starting from the first "Findings"
+/// heading ("## Findings" or a bare "Findings" line). Falls back to
+/// the full review text if no marker is found.
+#[cfg(test)]
+fn trim_review_to_findings(review: &str) -> &str {
+    let mut byte_offset = 0;
+    for line in review.split('\n') {
+        let trimmed = line.trim_start_matches('#').trim();
+        if trimmed.starts_with("Findings") {
+            return &review[byte_offset..];
+        }
+        byte_offset += line.len() + 1; // +1 for the \n
+    }
+    review // fallback: marker not found
+}
+
 fn reconcile_findings_after_review(
     round: u32,
     status: Status,
@@ -193,23 +211,23 @@ fn reconcile_findings_after_review(
                     round,
                     findings: previous_findings.findings.clone(),
                 };
-                Some(
-                    "Reviewer requested changes but findings.json was empty; carrying forward previous findings.".to_string(),
-                )
+                Some(format!(
+                    "Reviewer requested changes but {FINDINGS_FILENAME} was empty; carrying forward previous findings."
+                ))
             } else if normalized.findings.is_empty() {
                 normalized = FindingsFile {
                     round,
                     findings: vec![synthesize_finding(status_reason)],
                 };
-                Some(
-                    "Reviewer requested changes but findings.json was empty; synthesized F-001 from status reason.".to_string(),
-                )
+                Some(format!(
+                    "Reviewer requested changes but {FINDINGS_FILENAME} was empty; synthesized F-001 from status reason."
+                ))
             } else {
                 None
             };
 
             let reason = format!(
-                "Open findings: {}. See {FINDINGS_PATH_HINT}.",
+                "Open findings: {}. See .agent-loop/state/{FINDINGS_FILENAME}.",
                 findings_id_list(&normalized)
             );
 
@@ -230,7 +248,7 @@ fn reconcile_findings_after_review(
                 }
             } else {
                 let reason = format!(
-                    "Cannot approve with unresolved findings: {}. See {FINDINGS_PATH_HINT}.",
+                    "Cannot approve with unresolved findings: {}. See .agent-loop/state/{FINDINGS_FILENAME}.",
                     findings_id_list(&normalized)
                 );
                 FindingsReconcileResult {
@@ -685,8 +703,7 @@ fn record_struggle_signal(task: &str, issue: &str, round: u32, config: &Config) 
 }
 
 fn run_compound_phase_with_runner<FRunAgent, FLog>(
-    task: &str,
-    plan: &str,
+    paths: &crate::prompts::PhasePaths,
     config: &Config,
     round: u32,
     run_agent_fn: &mut FRunAgent,
@@ -719,7 +736,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
     if let Err(err) = run_agent_fn(
         &config.implementer,
         AgentRole::Implementer,
-        &compound_prompt(task, plan),
+        &compound_prompt(paths),
         None,
         config,
         Some(&meta),
@@ -734,10 +751,10 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
 }
 
 #[allow(dead_code)]
-pub fn compound_phase(task: &str, plan: &str, round: u32, config: &Config) {
+pub fn compound_phase(round: u32, config: &Config) {
+    let paths = phase_paths(config);
     run_compound_phase_with_runner(
-        task,
-        plan,
+        &paths,
         config,
         round,
         &mut |agent: &crate::config::Agent,
@@ -824,12 +841,7 @@ fn transition_label(patch: &StatusPatch) -> &'static str {
             Status::Error => "ERROR",
             Status::Interrupted => "INTERRUPTED",
         },
-        None => {
-            if patch.rating.is_some() {
-                return "rating-update";
-            }
-            "status-update"
-        }
+        None => "status-update",
     }
 }
 
@@ -837,14 +849,12 @@ fn finalize_phase_consensus(
     config: &Config,
     round: u32,
     reason: Option<String>,
-    rating: Option<u32>,
 ) -> Result<(), AgentLoopError> {
     write_status(
         StatusPatch {
             status: Some(Status::Consensus),
             round: Some(round),
             reason,
-            rating,
             ..StatusPatch::default()
         },
         config,
@@ -1000,21 +1010,16 @@ enum PlanningRevisionOutcome {
 fn run_planning_implementer_revision(
     config: &Config,
     planner_agent: &Agent,
-    task: &str,
     reviewer_reason: &str,
     round: u32,
     paths: &crate::prompts::PhasePaths,
 ) -> PlanningRevisionOutcome {
     let _ = log("🔍 Implementer reviewing revised plan...", config);
-    let revised_plan = read_state_file("plan.md", config);
     let implementer_prompt_timestamp = timestamp();
     if !run_agent_or_record_error(
         config,
         planner_agent,
         &planning_implementer_revision_prompt(
-            config,
-            task,
-            &revised_plan,
             reviewer_reason,
             round,
             &implementer_prompt_timestamp,
@@ -1229,6 +1234,7 @@ struct CheckResult {
     success: bool,
     timed_out: bool,
     remediation: Option<String>,
+    output_truncated: bool,
     output: String,
 }
 
@@ -1375,6 +1381,7 @@ fn run_single_check_with_timeout(
                 success: false,
                 timed_out: false,
                 remediation: check.remediation.clone(),
+                output_truncated: false,
                 output: format!("Failed to spawn: {err}"),
             };
         }
@@ -1442,19 +1449,23 @@ fn run_single_check_with_timeout(
 
     // Combine stdout and stderr, then apply final truncation.
     let mut combined = String::new();
+    let mut output_truncated = false;
     if let Some(buf) = stdout_buf {
-        let (text, _) = buf.into_output();
+        let (text, truncated) = buf.into_output();
+        output_truncated |= truncated;
         combined.push_str(&text);
     }
     if let Some(buf) = stderr_buf {
-        let (text, _) = buf.into_output();
+        let (text, truncated) = buf.into_output();
+        output_truncated |= truncated;
         if !combined.is_empty() && !text.is_empty() {
             combined.push('\n');
         }
         combined.push_str(&text);
     }
 
-    let (output, _truncated) = truncate_output(&combined, QUALITY_CHECK_MAX_LINES);
+    let (output, final_truncated) = truncate_output(&combined, QUALITY_CHECK_MAX_LINES);
+    output_truncated |= final_truncated;
 
     let success = if timed_out {
         false
@@ -1467,6 +1478,7 @@ fn run_single_check_with_timeout(
         success,
         timed_out,
         remediation: check.remediation.clone(),
+        output_truncated,
         output,
     }
 }
@@ -1553,7 +1565,18 @@ fn format_quality_checks(results: &[CheckResult]) -> String {
             "FAIL"
         };
 
+        // For passing checks, emit only a summary line to save tokens.
+        if result.success && !result.timed_out {
+            lines.push(format!("{} [PASS]", result.label));
+            continue;
+        }
+
         lines.push(format!("\n--- {} [{}] ---", result.label, status_label));
+        if result.output_truncated {
+            lines.push(format!(
+                "NOTE: output truncated to last {QUALITY_CHECK_MAX_LINES} lines."
+            ));
+        }
         let remediation = result
             .remediation
             .as_deref()
@@ -1630,10 +1653,6 @@ fn format_summary_block(status: &LoopStatus) -> String {
         format!("  Last Task:   {task_summary}"),
     ];
 
-    if let Some(rating) = status.rating {
-        lines.push(format!("  Rating:      {rating}/5"));
-    }
-
     if let Some(reason) = status.reason.as_ref().filter(|value| !value.is_empty()) {
         lines.push(format!("  Note:        {reason}"));
     }
@@ -1641,7 +1660,9 @@ fn format_summary_block(status: &LoopStatus) -> String {
     lines.push(border);
     lines.push("\n📁 State files in: .agent-loop/state/".to_string());
     lines.push(
-        "   - task.md, plan.md, tasks.md, changes.md, review.md, findings.json, status.json, log.txt".to_string(),
+        format!(
+            "   - task.md, plan.md, tasks.md, changes.md, {QUALITY_CHECKS_FILENAME}, review.md, {FINDINGS_FILENAME}, status.json, log.txt"
+        ),
     );
     lines.push(String::new());
 
@@ -1688,24 +1709,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         config,
     );
 
-    let task = read_state_file("task.md", config);
     let paths = phase_paths(config);
-    let (project_context, decisions) = if config.progressive_context {
-        let _ = log(
-            "📋 Progressive context mode — agents will explore on-demand",
-            config,
-        );
-        (state_manifest(config), String::new())
-    } else {
-        (
-            gather_project_context(
-                &config.project_dir,
-                config.effective_context_line_cap() as usize,
-                config.effective_planning_context_excerpt_lines() as usize,
-            ),
-            read_decisions(config),
-        )
-    };
 
     let planner_agent = config.planner.clone();
     let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
@@ -1715,9 +1719,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
         config,
         &planner_agent,
         &planning_initial_prompt(
-            &task,
-            &project_context,
-            &decisions,
             &paths,
             planner_plan_mode,
         ),
@@ -1779,8 +1780,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             config,
         );
 
-        let plan = read_state_file("plan.md", config);
-
         // Read open planning findings for the reviewer prompt.
         let planning_findings = crate::state::read_planning_findings(config);
         let open_findings_text =
@@ -1796,11 +1795,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             config,
             &config.reviewer,
             &planning_reviewer_prompt(&PlanningReviewerParams {
-                config,
-                task: &task,
-                plan: &plan,
-                project_context: &project_context,
-                decisions: &decisions,
                 round: planning_round,
                 prompt_timestamp: &reviewer_prompt_timestamp,
                 paths: &paths,
@@ -1907,7 +1901,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 match run_planning_implementer_revision(
                     config,
                     &planner_agent,
-                    &task,
                     review_status
                         .reason
                         .as_deref()
@@ -1929,21 +1922,15 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 if requires_dual_agent_signoff(config) {
                     // --- Adversarial planning review (dual-agent only) ---
                     if planning_adversarial_enabled(config) {
-                        let first_review = read_state_file("review.md", config);
                         let _ = log("🔍 Running adversarial second review of plan...", config);
 
+                        let adversarial_timestamp = timestamp();
                         let adversarial_output = match run_agent_with_output_or_record_error(
                             config,
                             &config.implementer,
                             &planning_adversarial_review_prompt(
-                                config,
-                                &task,
-                                &read_state_file("plan.md", config),
-                                &first_review,
-                                &project_context,
-                                &decisions,
                                 planning_round,
-                                &timestamp(),
+                                &adversarial_timestamp,
                                 &paths,
                             ),
                             Some(planning_round),
@@ -1998,7 +1985,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                             match run_planning_implementer_revision(
                                 config,
                                 &planner_agent,
-                                &task,
                                 "Adversarial review found issues the first reviewer missed",
                                 planning_round,
                                 &paths,
@@ -2027,15 +2013,11 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
                     // Dual-agent: require implementer signoff before finalizing.
                     let _ = log("🔍 Implementer reviewing approved plan...", config);
-                    let approved_plan = read_state_file("plan.md", config);
                     let signoff_timestamp = timestamp();
                     if !run_agent_or_record_error(
                         config,
                         &planner_agent,
                         &planning_implementer_signoff_prompt(
-                            config,
-                            &task,
-                            &approved_plan,
                             planning_round,
                             &signoff_timestamp,
                             &paths,
@@ -2108,7 +2090,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 } else {
                     // Single-agent: system converts APPROVED -> CONSENSUS.
                     let _ = log("✅ Reviewer approved the plan!", config);
-                    if let Err(err) = finalize_phase_consensus(config, planning_round, None, None) {
+                    if let Err(err) = finalize_phase_consensus(config, planning_round, None) {
                         write_error_status(config, Some(planning_round), err.to_string());
                         return false;
                     }
@@ -2183,7 +2165,6 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     let _ = log("━━━ Task Decomposition Phase ━━━", config);
 
     let task = read_state_file("task.md", config);
-    let plan = read_state_file("plan.md", config);
     let paths = phase_paths(config);
 
     // Clear tasks_findings.json on fresh runs; preserve on resume.
@@ -2258,19 +2239,10 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
 
         if round == 1 {
             let _ = log("📋 Implementer breaking down plan into tasks...", config);
-            let project_context = if config.progressive_context {
-                state_manifest(config)
-            } else {
-                gather_project_context(
-                    &config.project_dir,
-                    config.effective_context_line_cap() as usize,
-                    config.effective_planning_context_excerpt_lines() as usize,
-                )
-            };
             if !run_agent_or_record_error(
                 config,
                 &config.implementer,
-                &decomposition_initial_prompt(&task, &plan, &project_context, &paths),
+                &decomposition_initial_prompt(&paths),
                 Some(round),
                 AgentRole::Implementer,
                 "decompose",
@@ -2279,7 +2251,6 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 return false;
             }
         } else {
-            let current_tasks = read_state_file("tasks.md", config);
             let _ = log(
                 &format!(
                     "📝 Implementer revising task breakdown (round {})...",
@@ -2293,10 +2264,6 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 config,
                 &config.implementer,
                 &decomposition_revision_prompt(
-                    config,
-                    &task,
-                    &plan,
-                    &current_tasks,
                     previous_status
                         .reason
                         .as_deref()
@@ -2341,7 +2308,6 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             ),
             config,
         );
-        let tasks_text = read_state_file("tasks.md", config);
 
         // Read open tasks findings for the reviewer prompt.
         let tasks_findings = crate::state::read_tasks_findings(config);
@@ -2353,9 +2319,6 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             config,
             &config.reviewer,
             &decomposition_reviewer_prompt(
-                config,
-                &plan,
-                &tasks_text,
                 round,
                 &reviewer_prompt_timestamp,
                 &paths,
@@ -2405,7 +2368,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         // Persist updated tasks findings — propagate errors instead of ignoring.
         if let Err(e) = crate::state::write_tasks_findings(&updated_findings, config) {
             let _ = log(
-                &format!("⚠️ Failed to persist tasks_findings.json: {e}"),
+                &format!("⚠️ Failed to persist {TASKS_FINDINGS_FILENAME}: {e}"),
                 config,
             );
         }
@@ -2439,16 +2402,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                         "🔍 Implementer reviewing approved task breakdown...",
                         config,
                     );
-                    let signoff_tasks = read_state_file("tasks.md", config);
                     let signoff_timestamp = timestamp();
                     if !run_agent_or_record_error(
                         config,
                         &config.implementer,
                         &decomposition_implementer_signoff_prompt(
-                            config,
-                            &task,
-                            &plan,
-                            &signoff_tasks,
                             round,
                             &signoff_timestamp,
                             &paths,
@@ -2511,7 +2469,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 } else {
                     // Single-agent: system converts APPROVED -> CONSENSUS (no self-review).
                     let _ = log("✅ Task breakdown approved!", config);
-                    if let Err(err) = finalize_phase_consensus(config, round, None, None) {
+                    if let Err(err) = finalize_phase_consensus(config, round, None) {
                         write_error_status(config, Some(round), err.to_string());
                         return false;
                     }
@@ -2584,8 +2542,6 @@ pub fn task_decomposition_phase_resume(config: &Config) -> bool {
     task_decomposition_phase_internal(config, true)
 }
 
-const HISTORY_MAX_LINES: usize = 20;
-
 #[allow(clippy::too_many_arguments)]
 fn implementation_loop_internal<
     FRunAgent,
@@ -2609,7 +2565,7 @@ fn implementation_loop_internal<
     mut read_status_fn: FReadStatus,
     mut git_diff_for_review_fn: FDiffForReview,
     mut timestamp_fn: FTimestamp,
-    mut read_history_fn: FReadHistory,
+    _read_history_fn: FReadHistory,
     mut append_history_fn: FAppendHistory,
     resume: bool,
 ) -> bool
@@ -2633,13 +2589,6 @@ where
     FAppendHistory: FnMut(u32, &str, &str, &Config),
 {
     let paths = phase_paths(config);
-    // When progressive context is enabled, skip front-loaded decisions/history;
-    // the state manifest is injected per-round so agents can fetch context on-demand.
-    let phase_decisions = if config.progressive_context {
-        String::new()
-    } else {
-        read_decisions(config)
-    };
 
     let start_round = if resume {
         let previous = read_status_fn(config);
@@ -2719,22 +2668,12 @@ where
         let pre_impl_head = git_rev_parse_head(config);
 
         let task = read_state_file_fn("task.md", config);
-        let plan = read_state_file_fn("plan.md", config);
-        let previous_review = read_state_file_fn("review.md", config);
         let previous_findings_result = read_findings_with_warnings(config);
         for warning in &previous_findings_result.warnings {
-            log_fn(&format!("⚠ findings.json: {warning}"), config);
+            log_fn(&format!("⚠ {FINDINGS_FILENAME}: {warning}"), config);
         }
         let findings_before_review =
             normalize_findings_for_round(previous_findings_result.findings_file, round);
-        let open_findings_for_prompt = findings_for_prompt(&findings_before_review);
-
-        let impl_history = if config.progressive_context {
-            String::new()
-        } else {
-            read_history_fn(config, HISTORY_MAX_LINES)
-        };
-
         log_fn("🔨 Implementer working...", config);
         let impl_meta = AgentCallMeta {
             workflow: "implement".to_string(),
@@ -2749,14 +2688,7 @@ where
             AgentRole::Implementer,
             &implementation_implementer_prompt(
                 round,
-                &task,
-                &plan,
-                &previous_review,
-                &open_findings_for_prompt,
-                &phase_decisions,
                 &paths,
-                &impl_history,
-                config.decisions_enabled,
             ),
             None,
             config,
@@ -2839,12 +2771,16 @@ where
         }
 
         let quality_checks_output = run_quality_checks(config);
-
-        let reviewer_history = if config.progressive_context {
-            String::new()
+        if let Some(content) = quality_checks_output.as_deref() {
+            if let Err(err) = write_state_file(QUALITY_CHECKS_FILENAME, content, config) {
+                log_fn(
+                    &format!("WARN: failed to write {QUALITY_CHECKS_FILENAME}: {err}"),
+                    config,
+                );
+            }
         } else {
-            read_history_fn(config, HISTORY_MAX_LINES)
-        };
+            let _ = fs::remove_file(config.state_dir.join(QUALITY_CHECKS_FILENAME));
+        }
 
         write_status_fn(
             StatusPatch {
@@ -2873,19 +2809,10 @@ where
             &config.reviewer,
             AgentRole::Reviewer,
             &implementation_reviewer_prompt(
-                config,
-                &task,
-                &plan,
-                &changes,
-                &diff,
                 round,
                 &reviewer_prompt_timestamp,
                 &paths,
-                &open_findings_for_prompt,
-                quality_checks_output.as_deref(),
-                &phase_decisions,
-                &reviewer_history,
-                config.decisions_enabled,
+                config.auto_test,
             ),
             None,
             config,
@@ -2930,7 +2857,7 @@ where
 
         let reviewer_findings_result = read_findings_with_warnings(config);
         for warning in &reviewer_findings_result.warnings {
-            log_fn(&format!("⚠ findings.json: {warning}"), config);
+            log_fn(&format!("⚠ {FINDINGS_FILENAME}: {warning}"), config);
         }
         let reviewer_findings = reconcile_findings_after_review(
             round,
@@ -2945,7 +2872,7 @@ where
         if matches!(status.status, Status::NeedsChanges | Status::Approved) {
             if let Err(err) = write_findings(&reviewer_findings.findings, config) {
                 log_fn(
-                    &format!("WARN: failed to write findings.json: {err}"),
+                    &format!("WARN: failed to write {FINDINGS_FILENAME}: {err}"),
                     config,
                 );
             }
@@ -2984,44 +2911,12 @@ where
 
         match implementation_reviewer_decision(status.status) {
             ImplementationReviewerDecision::Approved => {
-                let reviewer_rating = status.rating;
-                let is_perfect_score = reviewer_rating == Some(5);
-
-                if is_perfect_score && config.single_agent {
-                    // === BRANCH 1: Single-agent 5/5 — auto-consensus ===
-                    log_fn("🎉 Single-agent 5/5 — auto-consensus", config);
-                    write_status_fn(
-                        StatusPatch {
-                            status: Some(Status::Consensus),
-                            round: Some(round),
-                            rating: reviewer_rating,
-                            ..StatusPatch::default()
-                        },
-                        config,
-                    );
-                    append_history_fn(
-                        round,
-                        "consensus",
-                        "AUTO-CONSENSUS (single-agent 5/5)",
-                        config,
-                    );
-                    git_checkpoint_fn(&format!("consensus-round-{round}"), config, baseline_files);
-                    run_compound_phase_with_runner(
-                        &task,
-                        &plan,
-                        config,
-                        round,
-                        &mut run_agent_fn,
-                        &mut log_fn,
-                    );
-                    return true;
-                } else if !config.single_agent {
+                if !config.single_agent {
                     // === BRANCH 2: Dual-agent — mandatory fresh-context reviewer gate ===
                     log_fn("🔍 Gate B: running fresh-context reviewer pass...", config);
-                    let first_review = read_state_file_fn("review.md", config);
                     let findings_before_adversarial_result = read_findings_with_warnings(config);
                     for warning in &findings_before_adversarial_result.warnings {
-                        log_fn(&format!("⚠ findings.json: {warning}"), config);
+                        log_fn(&format!("⚠ {FINDINGS_FILENAME}: {warning}"), config);
                     }
                     let findings_before_adversarial = normalize_findings_for_round(
                         findings_before_adversarial_result.findings_file,
@@ -3057,19 +2952,10 @@ where
                         &config.reviewer,
                         AgentRole::Reviewer,
                         &implementation_fresh_context_reviewer_prompt(
-                            config,
-                            &task,
-                            &plan,
-                            &changes,
-                            &diff,
-                            &first_review,
                             round,
                             &adversarial_timestamp,
                             &paths,
-                            &open_findings_for_prompt,
-                            quality_checks_output.as_deref(),
-                            &phase_decisions,
-                            &reviewer_history,
+                            config.auto_test,
                         ),
                         Some(fresh_session_hint.as_str()),
                         config,
@@ -3116,7 +3002,7 @@ where
 
                     let adversarial_findings_result = read_findings_with_warnings(config);
                     for warning in &adversarial_findings_result.warnings {
-                        log_fn(&format!("⚠ findings.json: {warning}"), config);
+                        log_fn(&format!("⚠ {FINDINGS_FILENAME}: {warning}"), config);
                     }
                     let adversarial_findings = reconcile_findings_after_review(
                         round,
@@ -3134,7 +3020,7 @@ where
                     ) {
                         if let Err(err) = write_findings(&adversarial_findings.findings, config) {
                             log_fn(
-                                &format!("WARN: failed to write findings.json: {err}"),
+                                &format!("WARN: failed to write {FINDINGS_FILENAME}: {err}"),
                                 config,
                             );
                         }
@@ -3173,7 +3059,9 @@ where
 
                     // Determine gate-B outcome: Approved, NeedsChanges (with
                     // verification), or Error.
-                    let gate_b_approved = match implementation_reviewer_decision(adversarial_status.status) {
+                    let gate_b_approved = match implementation_reviewer_decision(
+                        adversarial_status.status,
+                    ) {
                         ImplementationReviewerDecision::Approved => true,
                         ImplementationReviewerDecision::NeedsChanges => {
                             // --- Confirmation loop: ask SAME fresh-context reviewer to verify ---
@@ -3188,11 +3076,6 @@ where
                                 config,
                             );
 
-                            let verify_findings = findings_for_prompt(&normalize_findings_for_round(
-                                read_findings(config),
-                                round,
-                            ));
-                            let verify_review = read_state_file_fn("review.md", config);
                             let verify_timestamp = timestamp_fn();
                             write_status_fn(
                                 StatusPatch {
@@ -3218,10 +3101,6 @@ where
                                 &config.reviewer,
                                 AgentRole::Reviewer,
                                 &implementation_gate_b_verification_prompt(
-                                    config,
-                                    &task,
-                                    &verify_findings,
-                                    &verify_review,
                                     round,
                                     &verify_timestamp,
                                     &paths,
@@ -3269,10 +3148,12 @@ where
                                 verify_status = read_status_fn(config);
                             }
 
-                            append_history_fn(round, "gate-b-verify", &format!(
-                                "{} (verification)",
-                                verify_status.status,
-                            ), config);
+                            append_history_fn(
+                                round,
+                                "gate-b-verify",
+                                &format!("{} (verification)", verify_status.status,),
+                                config,
+                            );
 
                             match implementation_reviewer_decision(verify_status.status) {
                                 ImplementationReviewerDecision::Approved => {
@@ -3330,7 +3211,6 @@ where
                             config,
                         );
 
-                        let review = read_state_file_fn("review.md", config);
                         let open_findings = findings_for_prompt(&normalize_findings_for_round(
                             read_findings(config),
                             round,
@@ -3361,10 +3241,6 @@ where
                             &config.implementer,
                             AgentRole::Implementer,
                             &implementation_consensus_prompt(
-                                config,
-                                &task,
-                                &plan,
-                                &review,
                                 &open_findings,
                                 round,
                                 &consensus_prompt_timestamp,
@@ -3413,18 +3289,6 @@ where
                             final_status = read_status_fn(config);
                         }
 
-                        if final_status.rating.is_none()
-                            && let Some(r) = reviewer_rating
-                        {
-                            write_status_fn(
-                                StatusPatch {
-                                    rating: Some(r),
-                                    ..StatusPatch::default()
-                                },
-                                config,
-                            );
-                        }
-
                         let consensus_summary = match final_status.status {
                             Status::Consensus => "CONSENSUS".to_string(),
                             Status::Disputed => {
@@ -3449,8 +3313,7 @@ where
                                     baseline_files,
                                 );
                                 run_compound_phase_with_runner(
-                                    &task,
-                                    &plan,
+                                    &paths,
                                     config,
                                     round,
                                     &mut run_agent_fn,
@@ -3458,15 +3321,170 @@ where
                                 );
                                 return true;
                             }
-                            ImplementationConsensusDecision::Disputed
-                            | ImplementationConsensusDecision::Continue => {
+                            ImplementationConsensusDecision::Disputed => {
+                                let dispute_reason = final_status
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("see status.json")
+                                    .to_string();
                                 log_fn(
                                     &format!(
-                                        "⚠ Implementer disputed: {}",
-                                        final_status
-                                            .reason
-                                            .as_deref()
-                                            .unwrap_or("see status.json")
+                                        "⚠ Implementer disputed: {dispute_reason} — bouncing to Gate B reviewer..."
+                                    ),
+                                    config,
+                                );
+
+                                let bounce_timestamp = timestamp_fn();
+                                write_status_fn(
+                                    StatusPatch {
+                                        status: Some(Status::Reviewing),
+                                        round: Some(round),
+                                        reason: Some(gate_reason(
+                                            IMPLEMENT_GATE_C_BOUNCE,
+                                            "Verifying late findings from implementer dispute",
+                                        )),
+                                        ..StatusPatch::default()
+                                    },
+                                    config,
+                                );
+                                let bounce_meta = AgentCallMeta {
+                                    workflow: "implement".to_string(),
+                                    phase: "gate-c-bounce".to_string(),
+                                    round,
+                                    role: "reviewer".to_string(),
+                                    agent_name: config.reviewer.name().to_string(),
+                                    session_hint: Some(fresh_session_hint.clone()),
+                                };
+                                if let Err(err) = run_agent_fn(
+                                    &config.reviewer,
+                                    AgentRole::Reviewer,
+                                    &implementation_gate_c_late_findings_prompt(
+                                        &dispute_reason,
+                                        round,
+                                        &bounce_timestamp,
+                                        &paths,
+                                    ),
+                                    Some(fresh_session_hint.as_str()),
+                                    config,
+                                    Some(&bounce_meta),
+                                ) {
+                                    let status = status_for_error(&err);
+                                    let reason = err.to_string();
+                                    log_fn(&format!("❌ {reason}"), config);
+                                    write_status_fn(
+                                        StatusPatch {
+                                            status: Some(status),
+                                            round: Some(round),
+                                            reason: Some(reason),
+                                            ..StatusPatch::default()
+                                        },
+                                        config,
+                                    );
+                                    record_struggle_signal(&task, &err.to_string(), round, config);
+                                    return false;
+                                }
+
+                                let mut bounce_status = read_status_fn(config);
+                                if bounce_status.status != Status::Error
+                                    && is_status_stale(&bounce_timestamp, &bounce_status)
+                                {
+                                    log_fn(
+                                        "⚠️ Stale status after gate-C bounce — writing NeedsChanges fallback",
+                                        config,
+                                    );
+                                    write_status_fn(
+                                        StatusPatch {
+                                            status: Some(Status::NeedsChanges),
+                                            round: Some(round),
+                                            reason: Some(gate_reason(
+                                                IMPLEMENT_GATE_C_BOUNCE,
+                                                STALE_TIMESTAMP_REASON,
+                                            )),
+                                            ..StatusPatch::default()
+                                        },
+                                        config,
+                                    );
+                                    bounce_status = read_status_fn(config);
+                                }
+
+                                append_history_fn(
+                                    round,
+                                    "gate-c-bounce",
+                                    &format!(
+                                        "{} (late findings verification)",
+                                        bounce_status.status,
+                                    ),
+                                    config,
+                                );
+
+                                match implementation_reviewer_decision(bounce_status.status) {
+                                    ImplementationReviewerDecision::Approved => {
+                                        // Late findings rejected — consensus holds
+                                        log_fn(
+                                            "✅ Late findings rejected by reviewer — CONSENSUS (dispute overruled)",
+                                            config,
+                                        );
+                                        write_status_fn(
+                                            StatusPatch {
+                                                status: Some(Status::Consensus),
+                                                round: Some(round),
+                                                reason: Some(
+                                                    "CONSENSUS: late findings rejected by reviewer"
+                                                        .to_string(),
+                                                ),
+                                                ..StatusPatch::default()
+                                            },
+                                            config,
+                                        );
+                                        append_history_fn(
+                                            round,
+                                            "consensus",
+                                            "CONSENSUS (late findings rejected)",
+                                            config,
+                                        );
+                                        git_checkpoint_fn(
+                                            &format!("consensus-round-{round}"),
+                                            config,
+                                            baseline_files,
+                                        );
+                                        run_compound_phase_with_runner(
+                                            &paths,
+                                            config,
+                                            round,
+                                            &mut run_agent_fn,
+                                            &mut log_fn,
+                                        );
+                                        return true;
+                                    }
+                                    ImplementationReviewerDecision::NeedsChanges => {
+                                        // Late findings confirmed — loop back
+                                        log_fn(
+                                            "⚠ Late findings confirmed — returning to implementation loop",
+                                            config,
+                                        );
+                                    }
+                                    ImplementationReviewerDecision::Error => {
+                                        let reason = status_error_reason(&bounce_status);
+                                        log_fn(&format!("❌ {reason}"), config);
+                                        write_status_fn(
+                                            StatusPatch {
+                                                status: Some(Status::Error),
+                                                round: Some(round),
+                                                reason: Some(reason.clone()),
+                                                ..StatusPatch::default()
+                                            },
+                                            config,
+                                        );
+                                        record_struggle_signal(&task, &reason, round, config);
+                                        return false;
+                                    }
+                                }
+                            }
+                            ImplementationConsensusDecision::Continue => {
+                                log_fn(
+                                    &format!(
+                                        "⚠ Unexpected status after signoff: {}",
+                                        final_status.reason.as_deref().unwrap_or("see status.json")
                                     ),
                                     config,
                                 );
@@ -3490,18 +3508,17 @@ where
                     }
                     // gate_b_approved == false: findings confirmed, loop continues
                 } else if config.single_agent {
-                    // === BRANCH 3a: Single-agent non-5/5 — auto-consensus ===
+                    // === Single-agent auto-consensus ===
                     // Same model self-reviewing adds latency without signal.
                     // After findings reconciliation, system converts APPROVED -> CONSENSUS.
                     log_fn(
-                        "🎉 Single-agent approved — auto-consensus (non-5/5)",
+                        "🎉 Single-agent approved — auto-consensus",
                         config,
                     );
                     write_status_fn(
                         StatusPatch {
                             status: Some(Status::Consensus),
                             round: Some(round),
-                            rating: reviewer_rating,
                             ..StatusPatch::default()
                         },
                         config,
@@ -3509,13 +3526,12 @@ where
                     append_history_fn(
                         round,
                         "consensus",
-                        "AUTO-CONSENSUS (single-agent non-5/5)",
+                        "AUTO-CONSENSUS (single-agent)",
                         config,
                     );
                     git_checkpoint_fn(&format!("consensus-round-{round}"), config, baseline_files);
                     run_compound_phase_with_runner(
-                        &task,
-                        &plan,
+                        &paths,
                         config,
                         round,
                         &mut run_agent_fn,
@@ -3786,6 +3802,7 @@ mod tests {
             success: false,
             timed_out: false,
             remediation: Some("Run cargo clippy --fix first.".to_string()),
+            output_truncated: false,
             output: "warning: dead_code".to_string(),
         }];
 
@@ -3795,25 +3812,40 @@ mod tests {
     }
 
     #[test]
+    fn format_quality_checks_includes_truncation_note_when_truncated() {
+        let checks = vec![CheckResult {
+            label: "custom".to_string(),
+            success: false,
+            timed_out: false,
+            remediation: None,
+            output_truncated: true,
+            output: "line 1\nline 2".to_string(),
+        }];
+
+        let rendered = format_quality_checks(&checks);
+        assert!(rendered.contains("NOTE: output truncated to last 100 lines."));
+        assert!(rendered.contains("line 1"));
+    }
+
+    #[test]
     fn compound_phase_respects_compound_flag() {
+        use crate::prompts::phase_paths;
+
         let mut enabled = test_config();
         enabled.compound = true;
+        enabled.decisions_enabled = true;
+        let enabled_paths = phase_paths(&enabled);
 
         let mut disabled = test_config();
         disabled.compound = false;
+        let disabled_paths = phase_paths(&disabled);
 
         let mut enabled_calls = 0u32;
         run_compound_phase_with_runner(
-            "Task",
-            "Plan",
+            &enabled_paths,
             &enabled,
             1,
-            &mut |_agent: &crate::config::Agent,
-                  _role: AgentRole,
-                  _prompt,
-                  _session_hint,
-                  _config,
-                  _meta: Option<&AgentCallMeta>| {
+            &mut |_agent, _role, _prompt, _session_hint, _config, _meta: Option<&AgentCallMeta>| {
                 enabled_calls += 1;
                 Ok(())
             },
@@ -3823,16 +3855,10 @@ mod tests {
 
         let mut disabled_calls = 0u32;
         run_compound_phase_with_runner(
-            "Task",
-            "Plan",
+            &disabled_paths,
             &disabled,
             1,
-            &mut |_agent: &crate::config::Agent,
-                  _role: AgentRole,
-                  _prompt,
-                  _session_hint,
-                  _config,
-                  _meta: Option<&AgentCallMeta>| {
+            &mut |_agent, _role, _prompt, _session_hint, _config, _meta: Option<&AgentCallMeta>| {
                 disabled_calls += 1;
                 Ok(())
             },
@@ -3846,7 +3872,8 @@ mod tests {
 
     #[test]
     fn record_struggle_signal_appends_expected_shape() {
-        let config = test_config();
+        let mut config = test_config();
+        config.decisions_enabled = true;
         record_struggle_signal("Task 7: Handle retries", "timeout", 3, &config);
 
         let content = crate::state::read_decisions(&config);
@@ -3912,6 +3939,25 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Cannot approve with unresolved findings: F-002")
         );
+    }
+
+    #[test]
+    fn trim_review_extracts_from_markdown_heading() {
+        let review =
+            "## Correctness\nAll good.\n## Findings\nF-001 missing test\n## Verdict\nAPPROVED";
+        assert!(trim_review_to_findings(review).starts_with("## Findings"));
+    }
+
+    #[test]
+    fn trim_review_extracts_from_bare_findings_line() {
+        let review = "Correctness\nAll good.\nFindings\nF-001 missing test";
+        assert!(trim_review_to_findings(review).starts_with("Findings"));
+    }
+
+    #[test]
+    fn trim_review_falls_back_when_no_marker() {
+        let review = "Just prose with no findings section here.";
+        assert_eq!(trim_review_to_findings(review), review);
     }
 
     #[test]
@@ -4027,7 +4073,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: Some("The error handling section needs work".to_string()),
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4073,7 +4119,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: None,
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4113,7 +4159,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: None,
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4148,7 +4194,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: Some("Needs work".to_string()),
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4579,7 +4625,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: Some("Adversarial review found issues".to_string()),
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4626,7 +4672,7 @@ mod tests {
             mode: "dual-agent".to_string(),
             last_run_task: "plan".to_string(),
             reason: None,
-            rating: None,
+
             timestamp: String::new(),
         };
 
@@ -4654,9 +4700,6 @@ mod tests {
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
         let prompt = decomposition_reviewer_prompt(
-            &config,
-            "plan",
-            "tasks",
             1,
             "2026-01-01T00:00:00.000Z",
             &paths,
@@ -4760,21 +4803,20 @@ More text.
                 status: Some(Status::Approved),
                 round: Some(1),
                 reason: Some("seed".to_string()),
-                rating: Some(2),
+
                 ..crate::state::StatusPatch::default()
             },
             &config,
         )
         .expect("seed status should be written");
 
-        finalize_phase_consensus(&config, 3, Some("finalized".to_string()), Some(4))
+        finalize_phase_consensus(&config, 3, Some("finalized".to_string()))
             .expect("finalize_phase_consensus should succeed");
 
         let status = crate::state::read_status(&config);
         assert_eq!(status.status, Status::Consensus);
         assert_eq!(status.round, 3);
         assert_eq!(status.reason.as_deref(), Some("finalized"));
-        assert_eq!(status.rating, Some(4));
     }
 
     // -----------------------------------------------------------------------
@@ -4815,18 +4857,14 @@ More text.
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
         let prompt = decomposition_reviewer_prompt(
-            &config,
-            "plan",
-            "tasks",
             1,
             "2026-01-01T00:00:00.000Z",
             &paths,
             "",
         );
-        // Should request structured findings with T- prefix IDs
-        assert!(prompt.contains("T-001"));
-        assert!(prompt.contains("\"status\": \"open\""));
-        assert!(prompt.contains("\"status\": \"resolved\""));
+        // Should reference tasks file and have review/status instructions
+        assert!(prompt.contains("/state/tasks.md"));
+        assert!(prompt.contains("\"status\": \"APPROVED\""));
     }
 
     // -----------------------------------------------------------------------
@@ -4852,9 +4890,9 @@ More text.
         let mut agent_calls: Vec<(String, String)> = Vec::new();
         let baseline = HashSet::new();
 
-        // Simulate: implementer produces changes, reviewer approves with rating 3 (non-5/5).
+        // Simulate: implementer produces changes, reviewer approves.
         let status_sequence = std::cell::RefCell::new(vec![
-            // read_status after reviewer: Approved, rating 3
+            // read_status after reviewer: Approved
             LoopStatus {
                 status: Status::Approved,
                 round: 1,
@@ -4863,8 +4901,10 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(3),
-                timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+
+                // Deliberately differs from prompt timestamp; verdict statuses
+                // should not be treated as stale.
+                timestamp: "2026-01-01T00:00:01.000Z".to_string(),
             },
         ]);
 
@@ -4903,8 +4943,8 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(3),
-                        timestamp: "now".to_string(),
+        
+                        timestamp: "2026-01-01T00:00:02.000Z".to_string(),
                     }
                 }
             },
@@ -4919,6 +4959,100 @@ More text.
         // No third consensus call should happen.
         let role_names: Vec<&str> = agent_calls.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(role_names, vec!["Implementer", "Reviewer"]);
+    }
+
+    #[test]
+    fn implementation_loop_writes_quality_checks_and_reviewer_prompt_points_to_file() {
+        let root = create_temp_project_root("phases_impl_quality_checks_cycle");
+        let config = make_test_config(
+            &root,
+            TestConfigOptions {
+                single_agent: true,
+                review_max_rounds: 1,
+                auto_test: true,
+                auto_test_cmd: Some("echo quality-ok".to_string()),
+                compound: false,
+                decisions_enabled: false,
+                ..Default::default()
+            },
+        );
+        let baseline: HashSet<String> = HashSet::new();
+        let baseline_files: Vec<String> = Vec::new();
+        crate::state::init(
+            "Implement quality checks flow",
+            &config,
+            &baseline_files,
+            crate::state::WorkflowKind::Implement,
+        )
+        .expect("state init should succeed");
+
+        let quality_path = config.state_dir.join(QUALITY_CHECKS_FILENAME);
+        let reviewer_seen = std::cell::Cell::new(false);
+        let status_call_count = std::cell::RefCell::new(0usize);
+
+        let reached = implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, role, prompt, _session_hint, _cfg, _meta| {
+                if matches!(role, AgentRole::Reviewer) {
+                    assert!(
+                        prompt.contains("Review automated check output from"),
+                        "reviewer prompt should reference quality checks"
+                    );
+                    assert!(
+                        prompt.contains("quality_checks.md"),
+                        "reviewer prompt should include quality checks file path"
+                    );
+                    let checks = std::fs::read_to_string(&quality_path)
+                        .expect("quality checks output should be written before review");
+                    assert!(checks.contains("QUALITY CHECKS:"));
+                    assert!(checks.contains("custom [PASS]"));
+                    reviewer_seen.set(true);
+                }
+                Ok(())
+            },
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |_patch, _cfg| {},
+            |name, cfg| crate::state::read_state_file(name, cfg),
+            |_cfg| {
+                let mut idx = status_call_count.borrow_mut();
+                let status = match *idx {
+                    0 => LoopStatus {
+                        status: Status::Approved,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "claude".to_string(),
+                        mode: "single-agent".to_string(),
+                        last_run_task: "Implement quality checks flow".to_string(),
+                        reason: None,
+        
+                        timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                    },
+                    _ => LoopStatus {
+                        status: Status::Consensus,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "claude".to_string(),
+                        mode: "single-agent".to_string(),
+                        last_run_task: "Implement quality checks flow".to_string(),
+                        reason: None,
+        
+                        timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+                    },
+                };
+                *idx += 1;
+                status
+            },
+            |_head, _cfg| String::new(),
+            || "2026-01-01T00:00:00.000Z".to_string(),
+            |_cfg, _max| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        assert!(reached, "loop should reach consensus");
+        assert!(reviewer_seen.get(), "reviewer call should have occurred");
     }
 
     #[test]
@@ -4968,7 +5102,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(3),
+        
                         timestamp: "ts".to_string(),
                     },
                     1 => LoopStatus {
@@ -4979,7 +5113,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(4),
+        
                         timestamp: "ts".to_string(),
                     },
                     _ => LoopStatus {
@@ -4990,7 +5124,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(4),
+        
                         timestamp: "ts".to_string(),
                     },
                 };
@@ -5072,7 +5206,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(3),
+        
                         timestamp: "ts".to_string(),
                     }
                 } else {
@@ -5087,7 +5221,7 @@ More text.
                             "[gate:fresh-context] Open findings: F-001. See .agent-loop/state/findings.json."
                                 .to_string(),
                         ),
-                        rating: Some(3),
+        
                         timestamp: "ts".to_string(),
                     }
                 };
@@ -5230,23 +5364,20 @@ More text.
 
     #[test]
     fn compound_phase_skips_when_decisions_disabled() {
+        use crate::prompts::phase_paths;
+
         let root = create_temp_project_root("phases_compound_decisions_off");
         let mut config = make_test_config(&root, TestConfigOptions::default());
         config.compound = true;
         config.decisions_enabled = false;
+        let paths = phase_paths(&config);
 
         let mut calls = 0u32;
         run_compound_phase_with_runner(
-            "Task",
-            "Plan",
+            &paths,
             &config,
             1,
-            &mut |_agent: &crate::config::Agent,
-                  _role: AgentRole,
-                  _prompt,
-                  _session_hint,
-                  _config,
-                  _meta: Option<&AgentCallMeta>| {
+            &mut |_agent, _role, _prompt, _session_hint, _config, _meta: Option<&AgentCallMeta>| {
                 calls += 1;
                 Ok(())
             },
@@ -5264,22 +5395,20 @@ More text.
 
     #[test]
     fn compound_phase_passes_metadata_with_workflow_and_phase() {
+        use crate::prompts::phase_paths;
+
         let mut config = test_config();
         config.compound = true;
+        config.decisions_enabled = true;
+        let paths = phase_paths(&config);
 
         let captured_meta: std::cell::RefCell<Option<AgentCallMeta>> =
             std::cell::RefCell::new(None);
         run_compound_phase_with_runner(
-            "Task",
-            "Plan",
+            &paths,
             &config,
             1,
-            &mut |_agent: &crate::config::Agent,
-                  _role: AgentRole,
-                  _prompt,
-                  _session_hint,
-                  _config,
-                  meta: Option<&AgentCallMeta>| {
+            &mut |_agent, _role, _prompt, _session_hint, _config, meta: Option<&AgentCallMeta>| {
                 *captured_meta.borrow_mut() = meta.cloned();
                 Ok(())
             },
@@ -5287,7 +5416,9 @@ More text.
         );
 
         let meta = captured_meta.borrow();
-        let meta = meta.as_ref().expect("meta should be passed to run_agent_fn");
+        let meta = meta
+            .as_ref()
+            .expect("meta should be passed to run_agent_fn");
         assert_eq!(meta.workflow, "implement");
         assert_eq!(meta.phase, "compound");
         assert_eq!(meta.role, "implementer");
@@ -5315,7 +5446,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: None,
+    
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5326,7 +5457,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5337,7 +5468,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -5377,7 +5508,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(4),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5446,7 +5577,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: None,
+    
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5457,7 +5588,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Open findings: F-001".to_string()),
-                rating: Some(3),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -5506,7 +5637,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-001".to_string()),
-                        rating: Some(3),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5540,17 +5671,6 @@ More text.
             transcript.contains("round: 1"),
             "transcript should contain round: 1"
         );
-
-        // Verify reviewer findings are visible in the prompt captured in transcript.
-        // The reviewer prompt includes open findings text containing F-001.
-        assert!(
-            transcript.contains("F-001"),
-            "transcript should contain open finding ID F-001 from reviewer prompt"
-        );
-        assert!(
-            transcript.contains("Missing error handling"),
-            "transcript should contain finding summary from reviewer prompt"
-        );
     }
 
     /// F-002: Dual-agent implementation loop populates distinct metadata for
@@ -5582,7 +5702,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // After gate-b fresh-context reviewer: Approved
@@ -5594,7 +5714,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // After implementer signoff: Consensus
@@ -5606,7 +5726,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -5654,7 +5774,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(4),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5726,8 +5846,8 @@ More text.
 
         // Also verify transcript file contains all phase labels and session_hints
         let transcript_path = config.state_dir.join("transcript.log");
-        let transcript = std::fs::read_to_string(&transcript_path)
-            .expect("transcript.log should exist");
+        let transcript =
+            std::fs::read_to_string(&transcript_path).expect("transcript.log should exist");
         assert!(transcript.contains("phase: implementer"));
         assert!(transcript.contains("phase: gate-a-review"));
         assert!(transcript.contains("phase: gate-b-review"));
@@ -5782,7 +5902,12 @@ More text.
         assert_eq!(meta.round, 3);
         assert_eq!(meta.role, "reviewer");
         assert!(!meta.agent_name.is_empty());
-        assert!(meta.session_hint.as_ref().unwrap().starts_with("plan-reviewer-"));
+        assert!(
+            meta.session_hint
+                .as_ref()
+                .unwrap()
+                .starts_with("plan-reviewer-")
+        );
     }
 
     /// F-002: Parse individual transcript entries and verify per-entry metadata
@@ -5818,7 +5943,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: None,
+    
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5829,7 +5954,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Open findings: F-001".to_string()),
-                rating: Some(2),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -5875,7 +6000,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-001".to_string()),
-                        rating: Some(2),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5889,8 +6014,8 @@ More text.
 
         // Parse the transcript into individual entries
         let transcript_path = config.state_dir.join("transcript.log");
-        let transcript = std::fs::read_to_string(&transcript_path)
-            .expect("transcript.log must exist");
+        let transcript =
+            std::fs::read_to_string(&transcript_path).expect("transcript.log must exist");
 
         // Split into individual entries by the delimiter
         let entries: Vec<&str> = transcript
@@ -5943,19 +6068,9 @@ More text.
             "reviewer entry must have role: reviewer"
         );
 
-        // The reviewer prompt (captured in USER PROMPT section) must contain
-        // the open findings — this proves findings flow is visible in transcript.
         assert!(
             review_entry.contains("--- USER PROMPT ---"),
             "reviewer entry must have USER PROMPT section"
-        );
-        assert!(
-            review_entry.contains("F-001"),
-            "reviewer entry prompt must contain finding ID F-001"
-        );
-        assert!(
-            review_entry.contains("Null pointer in parser"),
-            "reviewer entry prompt must contain finding summary"
         );
     }
 
@@ -5984,7 +6099,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5995,7 +6110,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -6006,7 +6121,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(5),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -6041,7 +6156,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(5),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6072,14 +6187,8 @@ More text.
                 !m.workflow.is_empty(),
                 "meta[{i}] must have non-empty workflow"
             );
-            assert!(
-                !m.phase.is_empty(),
-                "meta[{i}] must have non-empty phase"
-            );
-            assert!(
-                m.round > 0,
-                "meta[{i}] must have round > 0 from the loop"
-            );
+            assert!(!m.phase.is_empty(), "meta[{i}] must have non-empty phase");
+            assert!(m.round > 0, "meta[{i}] must have round > 0 from the loop");
         }
 
         // Contrast: a fallback meta must NOT be phase-tracked
@@ -6094,11 +6203,10 @@ More text.
         );
     }
 
-    /// F-002: Fresh-context reviewer transcript entry contains open-findings
-    /// text when findings are present, proving end-to-end findings flow
-    /// through the gate-b reviewer prompt into the transcript.
+    /// F-002: Fresh-context reviewer transcript entry contains expected metadata
+    /// (session hint, workflow, round, role) when findings are present.
     #[test]
-    fn fresh_context_reviewer_transcript_contains_open_findings() {
+    fn fresh_context_reviewer_transcript_contains_gate_b_metadata() {
         let root = create_temp_project_root("phases_fresh_ctx_findings");
         let mut config = make_test_config(&root, TestConfigOptions::default());
         config.single_agent = false;
@@ -6137,7 +6245,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // 2. Findings reconciliation re-read (open findings force rewrite):
@@ -6150,7 +6258,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // 3. After gate-b fresh-context: NeedsChanges (loop exits on max_rounds=1)
@@ -6162,7 +6270,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Open findings: F-042".to_string()),
-                rating: Some(2),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -6208,7 +6316,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-042".to_string()),
-                        rating: Some(2),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6222,8 +6330,8 @@ More text.
 
         // Parse transcript entries
         let transcript_path = config.state_dir.join("transcript.log");
-        let transcript = std::fs::read_to_string(&transcript_path)
-            .expect("transcript.log must exist");
+        let transcript =
+            std::fs::read_to_string(&transcript_path).expect("transcript.log must exist");
 
         let entries: Vec<&str> = transcript
             .split("=== AGENT CALL [")
@@ -6243,15 +6351,7 @@ More text.
             .find(|e| e.contains("phase: gate-b-review"))
             .expect("transcript must have a gate-b-review entry");
 
-        // Verify fresh-context reviewer entry has open findings text
-        assert!(
-            gate_b.contains("F-042"),
-            "gate-b entry must contain finding ID F-042 in prompt"
-        );
-        assert!(
-            gate_b.contains("Race condition in worker pool"),
-            "gate-b entry must contain finding summary in prompt"
-        );
+        // Verify fresh-context reviewer entry has correct session hint and metadata
         assert!(
             gate_b.contains("session_hint: fresh-context-review-r1"),
             "gate-b entry must have fresh-context session_hint"
@@ -6312,7 +6412,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // 2. gate-b: NeedsChanges
@@ -6324,7 +6424,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Found issues".to_string()),
-                rating: Some(3),
+
                 timestamp: "now".to_string(),
             },
             // 3. gate-b findings reconciliation re-read (reason changed)
@@ -6336,7 +6436,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Open findings: F-001".to_string()),
-                rating: Some(3),
+
                 timestamp: "now".to_string(),
             },
             // 4. gate-b verification: Approved (withdrawn)
@@ -6348,7 +6448,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // 5. signoff: Consensus
@@ -6360,7 +6460,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(5),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -6396,7 +6496,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-                        rating: Some(5),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6421,13 +6521,21 @@ More text.
 
         // The verification call (index 3) should reuse the same fresh-context session
         assert!(
-            roles[3].1.as_deref().unwrap_or("").starts_with("fresh-context-review-r"),
+            roles[3]
+                .1
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-review-r"),
             "gate-b verify should reuse fresh-context session, got: {:?}",
             roles[3].1
         );
         // The signoff call (index 4) should have a fresh signoff session
         assert!(
-            roles[4].1.as_deref().unwrap_or("").starts_with("fresh-context-signoff-r"),
+            roles[4]
+                .1
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-signoff-r"),
             "signoff should have fresh session, got: {:?}",
             roles[4].1
         );
@@ -6463,7 +6571,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-                rating: Some(4),
+
                 timestamp: "now".to_string(),
             },
             // 2. gate-b
@@ -6475,7 +6583,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Found issues".to_string()),
-                rating: Some(2),
+
                 timestamp: "now".to_string(),
             },
             // 3. gate-b findings reconciliation re-read
@@ -6487,7 +6595,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Open findings: F-001".to_string()),
-                rating: Some(2),
+
                 timestamp: "now".to_string(),
             },
             // 4. gate-b verification: confirmed
@@ -6499,7 +6607,7 @@ More text.
                 mode: "dual-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: Some("Issues confirmed".to_string()),
-                rating: Some(2),
+
                 timestamp: "now".to_string(),
             },
         ]);
@@ -6532,7 +6640,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("issues".to_string()),
-                        rating: Some(2),
+        
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6555,6 +6663,303 @@ More text.
         assert_eq!(
             calls, 4,
             "expected 4 agent calls (impl, gate-a, gate-b, verify), got {calls}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Gate C bounce tests
+    // -----------------------------------------------------------------------
+
+    /// When signoff returns Disputed and the gate-C bounce reviewer returns
+    /// Approved (late findings rejected), the loop should reach CONSENSUS.
+    #[test]
+    fn gate_c_bounce_rejected_reaches_consensus() {
+        let root = create_temp_project_root("phases_gate_c_bounce_rejected");
+        let mut config = make_test_config(&root, TestConfigOptions::default());
+        config.single_agent = false;
+        config.compound = false;
+        std::fs::create_dir_all(&config.state_dir).expect("create state dir");
+
+        let baseline = HashSet::new();
+        let observed_roles: std::cell::RefCell<Vec<(String, Option<String>)>> =
+            std::cell::RefCell::new(Vec::new());
+        let observed_status_writes: std::cell::RefCell<Vec<StatusPatch>> =
+            std::cell::RefCell::new(Vec::new());
+
+        // Status sequence for dual-agent:
+        // 1. After gate-a reviewer: Approved
+        // 2. After gate-b reviewer: Approved
+        // 3. After implementer signoff: Disputed
+        // 4. After gate-c bounce reviewer: Approved (late findings rejected)
+        let status_sequence = std::cell::RefCell::new(vec![
+            // 1. gate-a: Approved
+            LoopStatus {
+                status: Status::Approved,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+
+                timestamp: "now".to_string(),
+            },
+            // 2. gate-b: Approved
+            LoopStatus {
+                status: Status::Approved,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+
+                timestamp: "now".to_string(),
+            },
+            // 3. signoff: Disputed
+            LoopStatus {
+                status: Status::Disputed,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: Some("Late finding: missing edge case".to_string()),
+
+                timestamp: "now".to_string(),
+            },
+            // 4. gate-c-bounce: Approved (late findings rejected)
+            LoopStatus {
+                status: Status::Approved,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+
+                timestamp: "now".to_string(),
+            },
+        ]);
+        let status_call_count = std::cell::RefCell::new(0usize);
+
+        let result = implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, role, _prompt, session_hint, _cfg, _meta| {
+                let role_name = format!("{role:?}");
+                observed_roles
+                    .borrow_mut()
+                    .push((role_name, session_hint.map(|s| s.to_string())));
+                Ok(())
+            },
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |patch, _cfg| {
+                observed_status_writes.borrow_mut().push(patch);
+            },
+            |_name, _cfg| String::new(),
+            |_cfg| {
+                let mut count = status_call_count.borrow_mut();
+                let seq = status_sequence.borrow();
+                if *count < seq.len() {
+                    let result = seq[*count].clone();
+                    *count += 1;
+                    result
+                } else {
+                    LoopStatus {
+                        status: Status::Consensus,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "claude".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: None,
+        
+                        timestamp: "now".to_string(),
+                    }
+                }
+            },
+            |_head, _cfg| String::new(),
+            || "now".to_string(),
+            |_cfg, _n| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        assert!(
+            result,
+            "loop should reach consensus after gate-c bounce rejects late findings"
+        );
+
+        let roles = observed_roles.borrow();
+        // Expected: implementer, gate-a reviewer, gate-b reviewer,
+        //           signoff implementer, gate-c-bounce reviewer
+        assert!(
+            roles.len() >= 5,
+            "expected 5 agent calls (impl, gate-a, gate-b, signoff, gate-c-bounce), got {}",
+            roles.len()
+        );
+
+        // The gate-c bounce call (index 4) should reuse the same fresh-context session hint
+        assert!(
+            roles[4]
+                .1
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-review-r"),
+            "gate-c bounce should reuse fresh-context session, got: {:?}",
+            roles[4].1
+        );
+
+        // Verify a CONSENSUS status write was made
+        let writes = observed_status_writes.borrow();
+        let has_consensus = writes
+            .iter()
+            .any(|p| p.status == Some(Status::Consensus));
+        assert!(
+            has_consensus,
+            "CONSENSUS status write must be present"
+        );
+    }
+
+    /// When signoff returns Disputed and the gate-C bounce reviewer returns
+    /// NeedsChanges (late findings confirmed), the loop should continue.
+    #[test]
+    fn gate_c_bounce_confirmed_loops_back() {
+        let root = create_temp_project_root("phases_gate_c_bounce_confirmed");
+        let mut config = make_test_config(&root, TestConfigOptions::default());
+        config.single_agent = false;
+        config.compound = false;
+        config.review_max_rounds = 1;
+        std::fs::create_dir_all(&config.state_dir).expect("create state dir");
+
+        let baseline = HashSet::new();
+        let observed_roles: std::cell::RefCell<Vec<(String, Option<String>)>> =
+            std::cell::RefCell::new(Vec::new());
+
+        // Status sequence:
+        // 1. gate-a: Approved
+        // 2. gate-b: Approved
+        // 3. signoff: Disputed
+        // 4. gate-c-bounce: NeedsChanges (late findings confirmed)
+        // Loop exits on max_rounds=1
+        let status_sequence = std::cell::RefCell::new(vec![
+            // 1. gate-a: Approved
+            LoopStatus {
+                status: Status::Approved,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+
+                timestamp: "now".to_string(),
+            },
+            // 2. gate-b: Approved
+            LoopStatus {
+                status: Status::Approved,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: None,
+
+                timestamp: "now".to_string(),
+            },
+            // 3. signoff: Disputed
+            LoopStatus {
+                status: Status::Disputed,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: Some("Late finding: missing tests".to_string()),
+
+                timestamp: "now".to_string(),
+            },
+            // 4. gate-c-bounce: NeedsChanges (confirmed)
+            LoopStatus {
+                status: Status::NeedsChanges,
+                round: 1,
+                implementer: "claude".to_string(),
+                reviewer: "claude".to_string(),
+                mode: "dual-agent".to_string(),
+                last_run_task: "test".to_string(),
+                reason: Some("Late findings confirmed".to_string()),
+
+                timestamp: "now".to_string(),
+            },
+        ]);
+        let status_call_count = std::cell::RefCell::new(0usize);
+
+        let result = implementation_loop_internal(
+            &config,
+            &baseline,
+            |_agent, role, _prompt, session_hint, _cfg, _meta| {
+                let role_name = format!("{role:?}");
+                observed_roles
+                    .borrow_mut()
+                    .push((role_name, session_hint.map(|s| s.to_string())));
+                Ok(())
+            },
+            |_msg, _cfg, _bf| {},
+            |_msg, _cfg| {},
+            |_patch, _cfg| {},
+            |_name, _cfg| String::new(),
+            |_cfg| {
+                let mut count = status_call_count.borrow_mut();
+                let seq = status_sequence.borrow();
+                if *count < seq.len() {
+                    let result = seq[*count].clone();
+                    *count += 1;
+                    result
+                } else {
+                    LoopStatus {
+                        status: Status::NeedsChanges,
+                        round: 1,
+                        implementer: "claude".to_string(),
+                        reviewer: "claude".to_string(),
+                        mode: "dual-agent".to_string(),
+                        last_run_task: "test".to_string(),
+                        reason: Some("issues".to_string()),
+        
+                        timestamp: "now".to_string(),
+                    }
+                }
+            },
+            |_head, _cfg| String::new(),
+            || "now".to_string(),
+            |_cfg, _n| String::new(),
+            |_round, _phase, _summary, _cfg| {},
+            false,
+        );
+
+        assert!(
+            !result,
+            "loop should NOT reach consensus (late findings confirmed, max_rounds=1)"
+        );
+
+        let roles = observed_roles.borrow();
+        // Expected: implementer, gate-a, gate-b, signoff, gate-c-bounce = 5
+        assert!(
+            roles.len() >= 5,
+            "expected 5 agent calls (impl, gate-a, gate-b, signoff, gate-c-bounce), got {}",
+            roles.len()
+        );
+
+        // The gate-c bounce call (index 4) should reuse the same fresh-context session hint
+        assert!(
+            roles[4]
+                .1
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("fresh-context-review-r"),
+            "gate-c bounce should reuse fresh-context session, got: {:?}",
+            roles[4].1
         );
     }
 
