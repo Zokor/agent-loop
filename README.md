@@ -28,6 +28,14 @@ Experimental agents emit a warning at startup:
 Warning: 'gemini' is experimental and may not work correctly.
 ```
 
+Agent capabilities vary by registry entry:
+
+| Capability | claude | codex | Experimental |
+|---|---|---|---|
+| Model flag | Yes (`--model`) | Yes (`-m`) | No (cleared with warning) |
+| Session resume | Yes | Yes | No |
+| Output format | ClaudeStreamJson | JSON | PlainText |
+
 ## Commands
 
 ### `plan`
@@ -37,6 +45,7 @@ Plan only. No decomposition and no implementation rounds.
 ```bash
 agent-loop plan <task>
 agent-loop plan --file <path>
+agent-loop plan --single-agent <task>
 ```
 
 ### `tasks`
@@ -47,7 +56,10 @@ Decompose only. Uses `.agent-loop/state/plan.md` by default.
 agent-loop tasks
 agent-loop tasks --resume
 agent-loop tasks --file <path-to-plan.md>
+agent-loop tasks --single-agent
 ```
+
+`--file` loads a plan from a custom path instead of `.agent-loop/state/plan.md`.
 
 If no plan exists, it errors with:
 
@@ -62,9 +74,14 @@ Implementation only.
 ```bash
 agent-loop implement
 agent-loop implement --per-task
+agent-loop implement --per-task --max-retries 3 --round-step 3
+agent-loop implement --per-task --continue-on-fail
+agent-loop implement --per-task --fail-fast
 agent-loop implement --wave
+agent-loop implement --wave --max-parallel 4
 agent-loop implement --wave --fail-fast
 agent-loop implement --wave --resume
+agent-loop implement --single-agent
 agent-loop implement --task "Task 1: ..."
 agent-loop implement --file <task.md>
 agent-loop implement --resume
@@ -77,6 +94,35 @@ agent-loop implement --resume
 Use `agent-loop implement --per-task` for legacy one-task-at-a-time execution.
 Use `agent-loop implement --wave` for dependency-aware parallel execution (see Wave Mode below).
 When `batch_implement = false` (or `--per-task` / `--wave` is used), `tasks.md` is mandatory and plan fallback is disabled.
+
+Per-task and wave mode flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-retries <N>` | 2 | Maximum retry attempts per task |
+| `--round-step <N>` | 2 | Increment `REVIEW_MAX_ROUNDS` per retry |
+| `--continue-on-fail` | off | Skip failed tasks and continue to next |
+| `--fail-fast` | off | Stop all execution on first failure |
+| `--max-parallel <N>` | from config | Max concurrent tasks in wave mode |
+
+`--continue-on-fail` and `--fail-fast` are mutually exclusive.
+
+### Flag Validation Rules
+
+The following combinations are rejected at parse time:
+
+- `--task` and `--file` cannot be used together
+- `--resume` cannot be combined with `--task` or `--file`
+- `--per-task` cannot be combined with `--task`, `--file`, or `--resume`
+- `--wave` and `--per-task` cannot be used together
+- `--wave` cannot be combined with `--task` or `--file`
+- `--continue-on-fail` and `--fail-fast` cannot be used together
+- `--round-step` must be at least 1
+- `--max-parallel` must be at least 1
+
+`--wave --resume` is valid and resumes wave execution from `task_status.json`:
+- `Done` tasks are preserved and skipped
+- Non-`Done` tasks are re-evaluated and re-run as needed
 
 If both `tasks.md` and `plan.md` are unavailable in plain batch mode, it errors with:
 
@@ -99,6 +145,15 @@ Output:
 State cleared. decisions.md preserved.
 ```
 
+### `config init`
+
+Generate a default `.agent-loop.toml` configuration file in the project root.
+
+```bash
+agent-loop config init
+agent-loop config init --force   # overwrite existing file
+```
+
 ### Other
 
 ```bash
@@ -106,6 +161,19 @@ agent-loop status
 agent-loop version
 agent-loop help
 ```
+
+### Deprecated Commands
+
+The following subcommands have been removed. Using them produces a parse error:
+
+| Old Command | Replacement |
+|---|---|
+| `run` | `agent-loop implement` |
+| `run-tasks` | `agent-loop implement --per-task` |
+| `init` | `agent-loop config init` |
+| `resume` | `agent-loop implement --resume` or `agent-loop tasks --resume` |
+
+`tasks --tasks-file` produces a specific migration error directing users to `--file`.
 
 ## Workflow
 
@@ -123,8 +191,7 @@ Plan/tasks dual-agent:
   reviewer APPROVED -> implementer signoff (CONSENSUS or DISPUTED)
 
 Implement single-agent:
-  reviewer APPROVED -> system finalizes CONSENSUS
-  (5/5 remains auto-consensus)
+  reviewer APPROVED -> system finalizes CONSENSUS (auto-consensus)
 
 Implement dual-agent:
   reviewer APPROVED (same-context gate)
@@ -156,7 +223,7 @@ Features:
 - Git checkpoints at wave boundaries only (serialized by main thread)
 - Failure propagation: failed tasks cause transitive dependents to be skipped
 - `--fail-fast`: stop all execution on first failure
-- `--resume`: skip done tasks, re-run pending/running, re-evaluate skipped
+- `--resume` support: reuse completed task state and continue remaining work
 - Wave lock prevents concurrent wave runs (stale lock detection via PID liveness)
 - Progress journal (`wave-progress.jsonl`) records all wave events
 
@@ -187,16 +254,19 @@ Model flags are agent-specific: Claude uses `--model`, Codex uses `-m`. Agents w
 
 ## Reviewer Sandbox
 
-By default, the reviewer agent runs with read-only tools: `Read,Grep,Glob,WebFetch`. This prevents reviewers from modifying the codebase during review.
+When full-access mode is disabled (`claude_full_access = false`), the reviewer agent runs with read-only tools by default: `Read,Grep,Glob,WebFetch`. This prevents reviewers from modifying the codebase during review.
 
-Override via TOML or env:
+> **Important**: Since `claude_full_access` defaults to `true`, the reviewer sandbox is **not active by default**. To enable it, set `claude_full_access = false` — the reviewer will then use `reviewer_allowed_tools` while the implementer uses `claude_allowed_tools`.
+
+Override the reviewer tool list via TOML or env:
 
 ```toml
-reviewer_allowed_tools = "Read,Grep,Glob,WebFetch,Bash"
+claude_full_access = false
+reviewer_allowed_tools = "Read,Grep,Glob,WebFetch"
 ```
 
 ```bash
-REVIEWER_ALLOWED_TOOLS="Read,Grep,Glob" agent-loop implement
+CLAUDE_FULL_ACCESS=0 REVIEWER_ALLOWED_TOOLS="Read,Grep,Glob" agent-loop implement
 ```
 
 ## Permission Mode Defaults
@@ -238,6 +308,28 @@ When enabled, replaces front-loaded project context (README, decisions, history)
 PROGRESSIVE_CONTEXT=1 agent-loop implement
 ```
 
+## Git Integration
+
+Git is required when `auto_commit = true` or when a `.git` directory exists. A 5-second preflight check runs `git --version` at startup.
+
+### Auto-Commit Checkpoints
+
+When `auto_commit = true`, git checkpoints are created:
+- After each implementation round: `round-{N}-implementation: {summary}` (summary capped at 80 chars)
+- After consensus: `consensus-round-{N}`
+- After max rounds exhausted: `max-rounds-reached`
+
+Files under `.agent-loop/state/` are excluded from commits.
+
+### Diff Generation
+
+Diffs for reviewer prompts are generated with a fallback chain:
+1. Committed diff (`git diff baseline..HEAD`) if baseline ref exists and HEAD advanced
+2. Working tree diff (`git diff HEAD` + untracked files)
+3. Staging area diff (`git diff --cached` + `git diff` + untracked files)
+
+Output is truncated at `diff_max_lines` (configurable, default 500 lines).
+
 ## Stuck Detection
 
 Detects implementation loops that are not making progress:
@@ -250,14 +342,14 @@ stuck_action = "warn"           # abort | warn | retry
 ```
 
 Detection methods:
-- **No-diff tracking**: counts consecutive rounds with empty diffs
-- **Oscillation detection**: FNV-1a hashing detects when the same diff repeats every 2 rounds
+- **No-diff tracking**: counts consecutive rounds with empty diffs; resets on any non-empty diff
+- **Oscillation detection**: FNV-1a hashing of diffs detects when the same change pattern repeats every 2 rounds (A -> B -> A cycles)
 - **Time threshold**: wall-clock elapsed time since loop start
 
 Actions:
 - `abort`: record struggle signal, write `Status::Stuck`, terminate loop
 - `warn`: record struggle signal, log warning, continue
-- `retry`: skip reviewer for this round, continue to next implementer round
+- `retry`: record struggle signal, skip the reviewer for this round, and continue directly to the next implementer round
 
 ## Planning Loop Reliability
 
@@ -277,11 +369,20 @@ Session persistence is capability-based via the agent registry:
 - On resume failure, the stale session file is cleared and a fresh session is started (retry-once pattern)
 - Codex session resume extracts `session_id` from JSON output and resumes via `codex exec resume <id>`
 - Agents without session support (`supports_session_resume=false`) skip session persistence
+- In per-task mode, cached session IDs are cleared between tasks to prevent context leakage
 
 ```toml
 claude_session_persistence = true
 codex_session_persistence = true
 ```
+
+### Resume Behavior
+
+`agent-loop implement --resume` (non-wave) validates that workflow is `implement` and resumes the implementation loop from `status.json`. If the previous status is already `CONSENSUS`, it logs success and returns immediately. The starting round is calculated from the previous status (`previous_round + 1`).
+
+`agent-loop implement --wave --resume` uses wave resume semantics from `task_status.json` (completed tasks are kept; remaining tasks continue).
+
+For non-wave resume, if the state directory is missing or `status.json` is not found, resume returns an error.
 
 ## Review Process
 
@@ -321,19 +422,37 @@ After plan consensus, the decomposition reviewer validates the task breakdown:
 
 ### Implementation Review
 
-After each implementation round, Gate A reviewer evaluates:
+After each implementation round, the review process uses a multi-gate system.
+`REVIEW_MAX_ROUNDS` is shared across the full implementation loop (all gates and signoff), not per gate.
+
+**Gate A — Same-Context Review** (all modes):
+
+The reviewer evaluates the implementation in the same conversation context:
 - **Correctness** — code matches plan, no bugs or edge cases
 - **Tests** — present, sufficient, covering key scenarios
 - **Style** — clean, maintainable, follows project conventions
 - **Security** — vulnerabilities, error handling adequacy
 
-In dual-agent mode, every Gate A approval triggers a mandatory Gate B fresh-context
-reviewer pass using the same findings protocol (`F-xxx` IDs with severity and
-`file_refs` evidence). Only when both reviewer gates approve does implementer
-signoff run.
+If `auto_test = true`, quality check results are included in the review prompt.
 
-`REVIEW_MAX_ROUNDS` is shared across the full implementation loop (implementer work,
-Gate A review, Gate B review, and signoff), not per gate.
+In single-agent mode, Gate A approval triggers auto-consensus (no further gates).
+
+**Gate B — Fresh-Context Review** (dual-agent only):
+
+Every Gate A approval triggers a mandatory fresh-context reviewer pass using a new session. This prevents the reviewer from rubber-stamping based on familiarity with prior rounds. Uses `F-xxx` finding IDs with severity and `file_refs` evidence.
+
+If Gate B finds issues, a **verification loop** runs: the same fresh-context reviewer re-examines each finding against the actual code and either confirms or withdraws it. If all findings are withdrawn, the review proceeds to signoff. If any are confirmed, the loop returns to the implementer.
+
+**Gate C — Late Findings Bounce** (dual-agent only):
+
+If the implementer disputes at signoff (returns DISPUTED with late findings), Gate C re-engages the fresh-context reviewer to verify the implementer's claims:
+- If the reviewer rejects the late findings → CONSENSUS (late findings dismissed)
+- If the reviewer confirms them → loop continues with NEEDS_CHANGES
+
+**Safety nets**:
+- Stale timestamp detection: if an agent doesn't write `status.json`, the system defaults to NEEDS_CHANGES (or DISPUTED for signoff)
+- Approved-with-unresolved-findings: if a reviewer returns APPROVED but `findings.json` has open issues, the system forces NEEDS_CHANGES
+- Empty findings on NEEDS_CHANGES: carries forward prior round findings or synthesizes `F-001` from the status reason
 
 ## Decisions And Compound
 
@@ -381,7 +500,9 @@ decisions_auto_reference = false
 
 ### Compound phase
 
-After implementation consensus, `agent-loop` can run a best-effort compound reflection phase to extract reusable learnings into `decisions.md`.
+After implementation consensus, `agent-loop` can run a best-effort compound reflection phase to extract reusable learnings into `decisions.md`. The compound phase is non-blocking: if it fails, a warning is logged but the loop completes successfully.
+
+Requires both `compound = true` and `decisions_enabled = true` to run.
 
 Enable/disable:
 
@@ -429,7 +550,7 @@ auto_test = false
 auto_test_cmd = "cargo test"
 
 compound = true
-decisions_enabled = true
+decisions_enabled = false          # default: disabled; set true to enable decisions subsystem
 decisions_auto_reference = true
 decisions_max_lines = 50
 
@@ -490,6 +611,24 @@ Priority:
 2. `auto_test_cmd`
 3. auto-detection by project type
 
+### Quality Check Auto-Detection
+
+When `auto_test = true` and no explicit `quality_commands` or `auto_test_cmd` is configured, checks are auto-detected by project type:
+
+**Rust** (detected by `Cargo.toml`):
+- `cargo build`
+- `cargo test`
+- `cargo clippy -- -D warnings` (only if clippy is installed)
+
+**JavaScript/TypeScript** (detected by `package.json`):
+- Scans `package.json` `scripts` for: `build`, `test`, `lint`
+- Filters out npm stubs (empty scripts, "no test specified", echo+exit patterns)
+- Generates `npm run <script>` commands
+
+**Other projects**: no auto-detection — configure explicitly.
+
+Each check runs with a 120-second timeout. Output is capped at 100 lines via a ring buffer. Results are written to `.agent-loop/state/quality_checks.md` and included in the reviewer prompt.
+
 ## Environment Variables
 
 Core:
@@ -505,7 +644,7 @@ Core:
 - `AUTO_TEST` (default: 0)
 - `AUTO_TEST_CMD`
 - `COMPOUND` (default: 1)
-- `DECISIONS_ENABLED` (default: 1)
+- `DECISIONS_ENABLED` (default: 0)
 - `DECISIONS_AUTO_REFERENCE` (default: 1)
 - `DECISIONS_MAX_LINES` (default: 50)
 - `DIFF_MAX_LINES`
@@ -530,11 +669,11 @@ Claude CLI tuning:
 - `CLAUDE_ALLOWED_TOOLS` (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)
 - `REVIEWER_ALLOWED_TOOLS` (default: Read,Grep,Glob,WebFetch)
 - `CLAUDE_SESSION_PERSISTENCE` (default: 1)
-- `CLAUDE_EFFORT_LEVEL`
-- `CLAUDE_MAX_OUTPUT_TOKENS`
-- `CLAUDE_MAX_THINKING_TOKENS`
-- `IMPLEMENTER_EFFORT_LEVEL`
-- `REVIEWER_EFFORT_LEVEL`
+- `CLAUDE_EFFORT_LEVEL` (low | medium | high)
+- `CLAUDE_MAX_OUTPUT_TOKENS` (1-64000)
+- `CLAUDE_MAX_THINKING_TOKENS` (extended thinking token budget)
+- `IMPLEMENTER_EFFORT_LEVEL` (overrides CLAUDE_EFFORT_LEVEL for implementer role)
+- `REVIEWER_EFFORT_LEVEL` (overrides CLAUDE_EFFORT_LEVEL for reviewer role)
 
 Codex CLI tuning:
 - `CODEX_FULL_ACCESS` (default: 1)
@@ -558,6 +697,8 @@ Wave runtime:
 ```text
 .agent-loop/
   decisions.md
+  wave.lock                              # wave run lock (survives reset)
+  wave-progress.jsonl                    # wave event journal (survives reset)
   state/
     task.md
     plan.md
@@ -565,17 +706,19 @@ Wave runtime:
     changes.md
     review.md
     status.json
+    findings.json                        # implementation reviewer findings
+    planning_findings.json               # planning phase findings
+    tasks_findings.json                  # task decomposition findings
+    quality_checks.md                    # auto-test / quality check results
     workflow.txt
     log.txt
-    conversation.md
+    conversation.md                      # accumulated context (capped at 200 lines)
+    data.json                            # reserved for workflow persistence
     task_status.json
     task_metrics.json
-    planning_findings.json
     planning-progress.md
-    wave.lock
-    wave-progress.jsonl
-    transcript.log         # agent I/O transcript (when transcript_enabled=true)
-    task-{index}/          # per-task state dirs (wave mode)
+    transcript.log                       # agent I/O transcript (when transcript_enabled=true)
+    task-{index}/                        # per-task state dirs (wave mode)
 ```
 
 `reset` only clears `state/`; `decisions.md` is preserved.
@@ -591,6 +734,33 @@ When building planning context, `agent-loop` reads these files if present (withi
 5. `AGENTS.md`
 
 In progressive context mode (`PROGRESSIVE_CONTEXT=1`), these are listed as file pointers in a manifest instead of being embedded inline.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | Success |
+| 1 | Failure |
+| 130 | Interrupted by signal (Ctrl+C) |
+
+## Internal Limits
+
+These constants are not configurable but affect runtime behavior:
+
+| Limit | Value | Description |
+|-------|-------|-------------|
+| Quality check timeout | 120s | Per-command timeout for auto-test checks |
+| Quality check output cap | 100 lines | Ring buffer truncation per check |
+| Transcript max lines | 10,000 | Auto-rotates keeping last 5,000 lines |
+| Conversation context cap | 200 lines | Accumulated context truncation |
+| Response block cap | 500 lines | Agent output truncation with warning |
+| Checkpoint summary | 80 chars | Commit message summary length |
+| Status task text | 500 chars | Task text truncation in status.json |
+| High watermark | round 50 | Warning emitted at round 50, then every 25 rounds (unlimited mode) |
+
+## Planner Permission Mode
+
+When `planner_permission_mode = "plan"` (or `PLANNER_PERMISSION_MODE=plan`), the planner agent runs with Claude's `--permission-mode plan` flag. In this mode the planner's output is expected to contain `<plan>...</plan>` markers, and the plan content is extracted from within those tags.
 
 ## Migration Notes
 

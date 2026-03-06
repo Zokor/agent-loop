@@ -1042,7 +1042,10 @@ fn implementation_resume_with_review_max_rounds(
 fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
     args.validate()?;
 
-    if args.resume {
+    // `--wave --resume` is handled by the wave/per-task command path, which
+    // resumes from task_status.json semantics. Plain `--resume` keeps the
+    // implementation-loop resume behavior.
+    if args.resume && !args.wave {
         return implementation_resume_with_review_max_rounds(args.single_agent, None);
     }
 

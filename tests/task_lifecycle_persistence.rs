@@ -565,3 +565,27 @@ fn implement_resume_skips_plan_fallback_path() {
 
     let _ = fs::remove_dir_all(&project_dir);
 }
+
+#[cfg(unix)]
+#[test]
+fn implement_wave_resume_routes_to_wave_mode_without_resume_state() {
+    let project_dir = create_project_dir("wave_resume_routes_to_wave_mode");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Wave resume route\nA\n");
+
+    let output = run_implement_cmd(&project_dir, &["--wave", "--resume"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stdout.contains("Wave mode:"),
+        "--wave --resume should route into wave mode: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Cannot resume:"),
+        "--wave --resume should not use generic resume preconditions: stderr={stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
