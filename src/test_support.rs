@@ -14,7 +14,8 @@ use std::{
 use crate::config::{
     Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
     DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_PLANNING_MAX_ROUNDS,
-    DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS, DEFAULT_TIMEOUT_SECONDS,
+    DEFAULT_PLANNING_ROLE_SWAP_AFTER, DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS,
+    DEFAULT_TIMEOUT_SECONDS,
     QualityCommand, RunMode,
 };
 
@@ -43,6 +44,7 @@ pub struct TestConfigOptions {
     pub verbose: bool,
     pub progressive_context: bool,
     pub planning_adversarial_review: bool,
+    pub planning_role_swap_after: u32,
     pub stuck_detection_enabled: bool,
     pub stuck_no_diff_rounds: u32,
     pub stuck_threshold_minutes: u64,
@@ -90,6 +92,7 @@ impl Default for TestConfigOptions {
             verbose: false,
             progressive_context: false,
             planning_adversarial_review: true,
+            planning_role_swap_after: DEFAULT_PLANNING_ROLE_SWAP_AFTER,
             stuck_detection_enabled: false,
             stuck_no_diff_rounds: crate::config::DEFAULT_STUCK_NO_DIFF_ROUNDS,
             stuck_threshold_minutes: crate::config::DEFAULT_STUCK_THRESHOLD_MINUTES,
@@ -160,6 +163,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         verbose: options.verbose,
         progressive_context: options.progressive_context,
         planning_adversarial_review: options.planning_adversarial_review,
+        planning_role_swap_after: options.planning_role_swap_after,
         stuck_detection_enabled: options.stuck_detection_enabled,
         stuck_no_diff_rounds: options.stuck_no_diff_rounds,
         stuck_threshold_minutes: options.stuck_threshold_minutes,

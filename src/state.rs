@@ -1022,6 +1022,23 @@ pub fn next_planning_finding_id(findings: &PlanningFindingsFile) -> String {
     format!("P-{:03}", max_num + 1)
 }
 
+/// Returns descriptions of findings that have been open for `threshold` or more rounds.
+pub fn stuck_planning_finding_descriptions(
+    findings: &PlanningFindingsFile,
+    current_round: u32,
+    threshold: u32,
+) -> Vec<String> {
+    findings
+        .findings
+        .iter()
+        .filter(|f| {
+            f.status == PlanningFindingStatus::Open
+                && current_round.saturating_sub(f.round_introduced) >= threshold
+        })
+        .map(|f| format!("{}: {}", f.id, f.description))
+        .collect()
+}
+
 pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {
     let progress_path = config.state_dir.join("planning-progress.md");
     let entry = format!("\n## Round {round}\n{summary}\n");

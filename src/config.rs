@@ -25,6 +25,9 @@ pub const DEFAULT_CLAUDE_ALLOWED_TOOLS: &str = "Bash,Read,Edit,Write,Grep,Glob,W
 pub const DEFAULT_REVIEWER_ALLOWED_TOOLS: &str = "Read,Grep,Glob,WebFetch";
 pub const DEFAULT_STUCK_NO_DIFF_ROUNDS: u32 = 3;
 pub const DEFAULT_STUCK_THRESHOLD_MINUTES: u64 = 10;
+/// Rounds a planning finding stays open before triggering a role swap
+/// (reviewer fixes, implementer reviews). `0` = disabled.
+pub const DEFAULT_PLANNING_ROLE_SWAP_AFTER: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StuckAction {
@@ -129,6 +132,9 @@ struct FileConfig {
 
     /// Run an adversarial second review of plans (dual-agent only, default true).
     planning_adversarial_review: Option<bool>,
+
+    /// Rounds a planning finding stays open before swapping roles (0 = disabled).
+    planning_role_swap_after: Option<u32>,
 
     // ── Stuck detection ─────────────────────────────────────────────
     /// Enable stuck detection in the implementation loop.
@@ -296,6 +302,10 @@ pub struct Config {
     // ── Planning adversarial review ──────────────────────────────
     /// Run an adversarial second review of plans (dual-agent only).
     pub planning_adversarial_review: bool,
+
+    // ── Planning role swap ─────────────────────────────────────
+    /// Rounds a finding stays open before swapping roles (0 = disabled).
+    pub planning_role_swap_after: u32,
 
     // ── Stuck detection ─────────────────────────────────────────────
     /// Enable stuck detection in the implementation loop.
@@ -541,6 +551,9 @@ impl Config {
         let planning_adversarial_review = env_bool("PLANNING_ADVERSARIAL_REVIEW")
             .or(file.planning_adversarial_review)
             .unwrap_or(true);
+        let planning_role_swap_after = parse_env("PLANNING_ROLE_SWAP_AFTER")
+            .or(file.planning_role_swap_after)
+            .unwrap_or(DEFAULT_PLANNING_ROLE_SWAP_AFTER);
 
         // --- stuck detection: env > TOML > default ---
         let stuck_detection_enabled = env_bool("STUCK_DETECTION_ENABLED")
@@ -637,6 +650,7 @@ impl Config {
             verbose,
             progressive_context,
             planning_adversarial_review,
+            planning_role_swap_after,
             stuck_detection_enabled,
             stuck_no_diff_rounds,
             stuck_threshold_minutes,
@@ -1062,6 +1076,7 @@ pub fn generate_default_config_template() -> String {
 # batch_implement = true
 # progressive_context = false
 # planning_adversarial_review = true      # adversarial second review of plans (dual-agent only)
+# planning_role_swap_after = {planning_role_swap_after}       # rounds before swapping reviewer/implementer on stuck findings (0 = disabled)
 
 # ── Agents ───────────────────────────────────────────────────────────────────
 # implementer = "claude"
@@ -1129,6 +1144,7 @@ pub fn generate_default_config_template() -> String {
         stuck_no_diff_rounds = DEFAULT_STUCK_NO_DIFF_ROUNDS,
         stuck_threshold_minutes = DEFAULT_STUCK_THRESHOLD_MINUTES,
         max_parallel = DEFAULT_MAX_PARALLEL,
+        planning_role_swap_after = DEFAULT_PLANNING_ROLE_SWAP_AFTER,
     )
 }
 

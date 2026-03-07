@@ -21,6 +21,7 @@
 # batch_implement = true
 # progressive_context = false
 # planning_adversarial_review = true      # adversarial second review of plans (dual-agent only)
+# planning_role_swap_after = 3       # rounds before swapping reviewer/implementer on stuck findings (0 = disabled)
 
 # ── Agents ───────────────────────────────────────────────────────────────────
 # implementer = "claude"

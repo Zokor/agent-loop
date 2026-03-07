@@ -445,6 +445,53 @@ pub(crate) fn planning_implementer_revision_prompt(
     )
 }
 
+/// Prompt for the reviewer to fix stuck findings in the plan directly.
+/// Used during role-swap when the implementer has failed to resolve findings after N rounds.
+pub(crate) fn planning_reviewer_fix_prompt(
+    paths: &PhasePaths,
+    stuck_findings: &[String],
+) -> String {
+    let findings_list = stuck_findings.join("\n- ");
+    format!(
+        "The implementer has been unable to resolve the following findings after multiple rounds. \
+        You originally identified these issues, so you understand them best.\n\n\
+        Stuck findings:\n- {findings_list}\n\n\
+        Read the plan in {plan_md}, the task in {task_md}, and the review in {review_md}.\n\
+        Use your tools to verify against the actual codebase, then directly revise the plan in {plan_md2} \
+        to fix these findings.\n\n\
+        Do NOT just describe what should change — actually edit the plan with correct file paths, \
+        function names, and integration details verified against the real code.",
+        plan_md = path_text(&paths.plan_md),
+        plan_md2 = path_text(&paths.plan_md),
+        task_md = path_text(&paths.task_md),
+        review_md = path_text(&paths.review_md),
+    )
+}
+
+/// Prompt for the implementer to review the reviewer's fix.
+pub(crate) fn planning_implementer_review_fix_prompt(
+    paths: &PhasePaths,
+    round: u32,
+    prompt_timestamp: &str,
+) -> String {
+    let status_path = path_text(&paths.status_json);
+    let status_path2 = path_text(&paths.status_json);
+    format!(
+        "The reviewer has directly revised the plan in {plan_md} to fix findings that were stuck \
+        for multiple rounds. Review the changes against the task in {task_md} and the codebase.\n\n\
+        Check that the reviewer's fixes are correct, complete, and don't introduce new issues.\n\n\
+        Write your review to {review_md}.\n\n\
+        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
+        If APPROVED, write to {status_path}:\n\
+        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
+        If REVISE, write to {status_path2}:\n\
+        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"your reason\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        plan_md = path_text(&paths.plan_md),
+        task_md = path_text(&paths.task_md),
+        review_md = path_text(&paths.review_md),
+    )
+}
+
 pub(crate) fn decomposition_initial_prompt(paths: &PhasePaths) -> String {
     format!(
         "Read the task from {task_md} and the agreed plan from {plan_md}.\n\n\

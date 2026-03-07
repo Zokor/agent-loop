@@ -16,8 +16,9 @@ use crate::{
         implementation_consensus_prompt, implementation_fresh_context_reviewer_prompt,
         implementation_gate_b_verification_prompt, implementation_gate_c_late_findings_prompt,
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
-        planning_adversarial_review_prompt, planning_implementer_revision_prompt,
-        planning_implementer_signoff_prompt, planning_initial_prompt, planning_reviewer_prompt,
+        planning_adversarial_review_prompt, planning_implementer_review_fix_prompt,
+        planning_implementer_revision_prompt, planning_implementer_signoff_prompt,
+        planning_initial_prompt, planning_reviewer_fix_prompt, planning_reviewer_prompt,
         system_prompt_for_role,
     },
     state::{
@@ -1795,6 +1796,73 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     config,
                 );
 
+                // Check for stuck findings — if any finding has been open for
+                // planning_role_swap_after rounds, swap roles: reviewer fixes, implementer reviews.
+                let swap_threshold = config.planning_role_swap_after;
+                let stuck_descriptions = crate::state::stuck_planning_finding_descriptions(
+                    &updated_findings,
+                    planning_round,
+                    swap_threshold,
+                );
+
+                if !stuck_descriptions.is_empty() {
+                    let _ = log(
+                        &format!(
+                            "🔄 Role swap: {} finding(s) stuck for {}+ rounds — reviewer will fix, implementer will review",
+                            stuck_descriptions.len(),
+                            swap_threshold,
+                        ),
+                        config,
+                    );
+
+                    crate::state::append_planning_progress(
+                        planning_round,
+                        &format!("Role swap triggered: stuck findings — {}", stuck_descriptions.join(", ")),
+                        config,
+                    );
+
+                    // Step 1: Reviewer fixes the plan directly
+                    let _ = log("🔧 Reviewer fixing plan...", config);
+                    if !run_agent_or_record_error(
+                        config,
+                        &config.reviewer,
+                        &planning_reviewer_fix_prompt(&paths, &stuck_descriptions),
+                        Some(planning_round),
+                        AgentRole::Reviewer,
+                        "plan",
+                        "reviewer-fix",
+                    ) {
+                        return false;
+                    }
+
+                    // Step 2: Implementer reviews the reviewer's fix
+                    let _ = log("🔍 Implementer reviewing reviewer's fix...", config);
+                    let fix_review_timestamp = timestamp();
+                    let _ = write_state_file("review.md", "", config);
+                    if !run_agent_or_record_error(
+                        config,
+                        &planner_agent,
+                        &planning_implementer_review_fix_prompt(
+                            &paths,
+                            planning_round,
+                            &fix_review_timestamp,
+                        ),
+                        Some(planning_round),
+                        AgentRole::Implementer,
+                        "plan",
+                        "implementer-review-fix",
+                    ) {
+                        return false;
+                    }
+
+                    // The next iteration of the loop will pick up the implementer's
+                    // verdict via the normal reviewer path. If the implementer approved,
+                    // the reviewer will verify in the next round. If not, normal revision continues.
+                    dispute_reason = None;
+                    continue;
+                }
+
+                // Normal path: implementer revises
                 let _ = log("📝 Implementer revising plan...", config);
                 if !run_agent_or_record_error(
                     config,
