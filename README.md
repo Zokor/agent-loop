@@ -363,12 +363,11 @@ Actions:
 
 ## Planning Loop Reliability
 
-The planning phase uses a structured findings protocol:
+The planning phase uses a lightweight verdict protocol:
 
-- Reviewer emits `VERDICT: APPROVED` or `VERDICT: REVISE` with a JSON findings block
-- Findings are tracked in `planning_findings.json` with IDs (`P-001`, `P-002`, ...)
-- Open findings from prior rounds are fed back into the next planning round
-- Safety nets: `REVISE` with empty findings synthesizes `P-001`; `APPROVED` with open findings forces `NEEDS_REVISION`
+- Reviewer ends their review with the exact phrase "no findings" (case-insensitive) to approve, or describes issues otherwise
+- The system checks the review text for this phrase — no JSON parsing or structured findings needed
+- Role swap: if the reviewer keeps finding issues for `planning_role_swap_after` consecutive rounds (default 3), roles swap — the reviewer fixes the plan directly and the implementer reviews
 - Progress tracked in `planning-progress.md`
 
 ## Session Resume
@@ -412,19 +411,16 @@ After the planner creates a plan, the reviewer validates it:
    - Verify API payloads match controller/request validation requirements
    - Verify waiver/exclusion lists are complete
 
-   If the reviewer returns REVISE, the implementer revises `plan.md` to address the
-   review findings, then the reviewer re-reviews. This loop continues until the
-   reviewer approves or the round limit is reached.
+   If the reviewer finds issues, the implementer revises `plan.md` to address them,
+   then the reviewer re-reviews. This loop continues until the reviewer ends with
+   "no findings" or the round limit is reached. If findings persist for
+   `planning_role_swap_after` rounds, roles swap.
 
 2. **Adversarial review** (dual-agent only) — After the first reviewer approves, the
    implementer agent performs an adversarial pass focused on what the first reviewer
-   missed. Uses `PA-xxx` finding IDs. If the adversarial review returns REVISE, the
-   implementer revises and the loop returns to the primary reviewer.
+   missed. If the adversarial review finds issues, the implementer revises and the
+   loop returns to the primary reviewer.
    Skipped in single-agent mode or when `planning_adversarial_review = false`.
-
-Findings are tracked in `planning_findings.json` with IDs (`P-001`, `PA-001`, ...).
-Reviewers must cite `file_refs` in their review to evidence each issue.
-Consensus requires all findings to be resolved.
 
 ### Task Decomposition Review
 
@@ -724,7 +720,7 @@ Wave runtime:
     review.md
     status.json
     findings.json                        # implementation reviewer findings
-    planning_findings.json               # planning phase findings
+    planning-progress.md                 # planning phase progress log
     tasks_findings.json                  # task decomposition findings
     quality_checks.md                    # auto-test / quality check results
     workflow.txt

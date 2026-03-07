@@ -232,7 +232,6 @@ pub(crate) struct PhasePaths {
     pub(crate) quality_checks_md: PathBuf,
     pub(crate) review_md: PathBuf,
     pub(crate) findings_json: PathBuf,
-    pub(crate) planning_findings_json: PathBuf,
     pub(crate) tasks_findings_json: PathBuf,
     pub(crate) status_json: PathBuf,
 }
@@ -241,7 +240,7 @@ pub(crate) struct PhasePaths {
 const STATE_REL: &str = ".agent-loop/state";
 
 pub(crate) fn phase_paths(_config: &Config) -> PhasePaths {
-    use crate::state::{PLANNING_FINDINGS_FILENAME, TASKS_FINDINGS_FILENAME};
+    use crate::state::TASKS_FINDINGS_FILENAME;
     let base = Path::new(STATE_REL);
     PhasePaths {
         task_md: base.join("task.md"),
@@ -251,7 +250,6 @@ pub(crate) fn phase_paths(_config: &Config) -> PhasePaths {
         quality_checks_md: base.join(QUALITY_CHECKS_FILENAME),
         review_md: base.join("review.md"),
         findings_json: base.join(FINDINGS_FILENAME),
-        planning_findings_json: base.join(PLANNING_FINDINGS_FILENAME),
         tasks_findings_json: base.join(TASKS_FINDINGS_FILENAME),
         status_json: base.join("status.json"),
     }
@@ -350,20 +348,14 @@ pub(crate) fn planning_initial_prompt(
 
 /// Planning reviewer prompt parameters bundled to satisfy clippy::too_many_arguments.
 pub(crate) struct PlanningReviewerParams<'a> {
-    pub round: u32,
-    pub prompt_timestamp: &'a str,
     pub paths: &'a PhasePaths,
     pub dispute_reason: Option<&'a str>,
-    pub open_findings: &'a str,
 }
 
 pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> String {
     let PlanningReviewerParams {
-        round,
-        prompt_timestamp,
         paths,
         dispute_reason,
-        open_findings,
     } = params;
 
     let concerns_section = match dispute_reason {
@@ -373,65 +365,37 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
         _ => String::new(),
     };
 
-    let findings_section = if open_findings.is_empty() {
-        String::new()
-    } else {
-        format!(
-            "\n\nOPEN PLANNING FINDINGS (address or resolve each):\n{open_findings}\n\n\
-            IMPORTANT: For each open finding above, you MUST include a JSON findings block in your review \
-            showing its updated status. Use a fenced code block in your review like this:\n\
-            ```json\n\
-            [{{\"id\": \"F-001\", \"description\": \"brief description\", \"status\": \"resolved\"}}]\n\
-            ```\n\
-            Set status to \"resolved\" if the finding has been addressed, or \"open\" if it still needs work. \
-            Every open finding listed above MUST appear in your JSON block."
-        )
-    };
-
     format!(
         "Critically review the plan in {plan_md} against the actual codebase.\n\
         The original task is in {task_md}.\n\n\
         For every claim, file path, function name, and assumption in the plan, \
         use your tools to verify it against the real code. \
         Check for missing steps, wrong assumptions, breaking changes, dependency issues, \
-        and load-order or integration risks.{concerns_section}{findings_section}\n\n\
+        and load-order or integration risks.{concerns_section}\n\n\
         Write your review to {review_path}.\n\n\
-        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
-        If APPROVED, write to {status_path}:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If REVISE, write to {status_path2}:\n\
-        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"your reason\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        If everything is correct and you have no findings, end your review with the exact phrase: no findings\n\
+        Otherwise, describe the issues that need to be addressed.",
         task_md = path_text(&paths.task_md),
         plan_md = path_text(&paths.plan_md),
         review_path = path_text(&paths.review_md),
-        status_path = path_text(&paths.status_json),
-        status_path2 = path_text(&paths.status_json),
     )
 }
 
 pub(crate) fn planning_adversarial_review_prompt(
-    round: u32,
-    prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
         "A first reviewer has already approved the plan in {plan_md}. Find what they missed.\n\n\
         The original task is in {task_md}. The first review is in {review_md}.\n\
         For every claim, file path, and assumption in the plan, use your tools to verify it against the real code. \
-        Look for breaking changes, missing migration paths, dependency gaps, and integration risks the first review overlooked.\n\
-        If you find no meaningful issues, APPROVED is the correct verdict.\n\n\
+        Look for breaking changes, missing migration paths, dependency gaps, and integration risks the first review overlooked.\n\n\
         Write your review to {review_path}.\n\n\
-        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
-        If APPROVED, write to {status_path}:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If REVISE, write to {status_path2}:\n\
-        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        If you find no meaningful issues, end your review with the exact phrase: no findings\n\
+        Otherwise, describe the issues that need to be addressed.",
         task_md = path_text(&paths.task_md),
         plan_md = path_text(&paths.plan_md),
         review_md = path_text(&paths.review_md),
         review_path = path_text(&paths.review_md),
-        status_path = path_text(&paths.status_json),
-        status_path2 = path_text(&paths.status_json),
     )
 }
 
@@ -445,20 +409,17 @@ pub(crate) fn planning_implementer_revision_prompt(
     )
 }
 
-/// Prompt for the reviewer to fix stuck findings in the plan directly.
-/// Used during role-swap when the implementer has failed to resolve findings after N rounds.
+/// Prompt for the reviewer to fix the plan directly during role swap.
+/// Used when the implementer has failed to resolve issues after N consecutive rounds.
 pub(crate) fn planning_reviewer_fix_prompt(
     paths: &PhasePaths,
-    stuck_findings: &[String],
 ) -> String {
-    let findings_list = stuck_findings.join("\n- ");
     format!(
-        "The implementer has been unable to resolve the following findings after multiple rounds. \
+        "The implementer has been unable to resolve your review findings after multiple rounds. \
         You originally identified these issues, so you understand them best.\n\n\
-        Stuck findings:\n- {findings_list}\n\n\
-        Read the plan in {plan_md}, the task in {task_md}, and the review in {review_md}.\n\
+        Read the plan in {plan_md}, the task in {task_md}, and your last review in {review_md}.\n\
         Use your tools to verify against the actual codebase, then directly revise the plan in {plan_md2} \
-        to fix these findings.\n\n\
+        to fix the issues.\n\n\
         Do NOT just describe what should change — actually edit the plan with correct file paths, \
         function names, and integration details verified against the real code.",
         plan_md = path_text(&paths.plan_md),
@@ -468,24 +429,17 @@ pub(crate) fn planning_reviewer_fix_prompt(
     )
 }
 
-/// Prompt for the implementer to review the reviewer's fix.
+/// Prompt for the implementer to review the reviewer's fix during role swap.
 pub(crate) fn planning_implementer_review_fix_prompt(
     paths: &PhasePaths,
-    round: u32,
-    prompt_timestamp: &str,
 ) -> String {
-    let status_path = path_text(&paths.status_json);
-    let status_path2 = path_text(&paths.status_json);
     format!(
-        "The reviewer has directly revised the plan in {plan_md} to fix findings that were stuck \
+        "The reviewer has directly revised the plan in {plan_md} to fix issues that were stuck \
         for multiple rounds. Review the changes against the task in {task_md} and the codebase.\n\n\
         Check that the reviewer's fixes are correct, complete, and don't introduce new issues.\n\n\
         Write your review to {review_md}.\n\n\
-        End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
-        If APPROVED, write to {status_path}:\n\
-        {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If REVISE, write to {status_path2}:\n\
-        {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"your reason\", \"timestamp\": \"{prompt_timestamp}\"}}",
+        If everything is correct and you have no findings, end your review with the exact phrase: no findings\n\
+        Otherwise, describe the issues that need to be addressed.",
         plan_md = path_text(&paths.plan_md),
         task_md = path_text(&paths.task_md),
         review_md = path_text(&paths.review_md),
@@ -1016,7 +970,6 @@ mod tests {
             quality_checks_md: PathBuf::from("/state/quality_checks.md"),
             review_md: PathBuf::from("/state/review.md"),
             findings_json: PathBuf::from("/state/findings.json"),
-            planning_findings_json: PathBuf::from("/state/planning_findings.json"),
             tasks_findings_json: PathBuf::from("/state/tasks_findings.json"),
             status_json: PathBuf::from("/state/status.json"),
         }
@@ -1026,11 +979,8 @@ mod tests {
     fn planning_reviewer_prompt_includes_concerns_when_dispute_reason_present() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 2,
-            prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
             dispute_reason: Some("I disagree with the rollback plan"),
-            open_findings: "",
         });
 
         assert!(
@@ -1043,11 +993,8 @@ mod tests {
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_absent() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 2,
-            prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
             dispute_reason: None,
-            open_findings: "",
         });
 
         assert!(
@@ -1060,11 +1007,8 @@ mod tests {
     fn planning_reviewer_prompt_omits_concerns_when_dispute_reason_is_empty() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 2,
-            prompt_timestamp: "2026-02-14T10:00:00.000Z",
             paths: &paths,
             dispute_reason: Some("   "),
-            open_findings: "",
         });
 
         assert!(
@@ -1077,11 +1021,8 @@ mod tests {
     fn planning_reviewer_prompt_references_task_and_plan_files() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
             dispute_reason: None,
-            open_findings: "",
         });
 
         assert!(prompt.contains("/state/task.md"), "should reference task file");
@@ -1092,11 +1033,8 @@ mod tests {
     fn planning_reviewer_prompt_includes_review_md_write_instruction() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
             dispute_reason: None,
-            open_findings: "",
         });
 
         assert!(
@@ -1150,16 +1088,13 @@ mod tests {
     fn planning_reviewer_prompt_references_files_and_verdict() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
             dispute_reason: None,
-            open_findings: "",
         });
 
         assert!(prompt.contains("/state/task.md"), "should reference task file");
         assert!(prompt.contains("/state/plan.md"), "should reference plan file");
-        assert!(prompt.contains("VERDICT"), "should contain verdict instruction");
+        assert!(prompt.contains("no findings"), "should contain 'no findings' instruction");
     }
 
     #[test]
@@ -1196,23 +1131,24 @@ mod tests {
     }
 
     #[test]
-    fn planning_reviewer_prompt_preserves_json_status_format() {
+    fn planning_reviewer_prompt_uses_no_findings_verdict() {
         let paths = test_phase_paths();
         let prompt = planning_reviewer_prompt(&PlanningReviewerParams {
-            round: 1,
-            prompt_timestamp: "2026-02-15T00:00:00.000Z",
             paths: &paths,
             dispute_reason: None,
-            open_findings: "",
         });
 
         assert!(
-            prompt.contains("\"status\": \"APPROVED\""),
-            "missing APPROVED JSON status"
+            prompt.contains("no findings"),
+            "planning reviewer prompt should instruct 'no findings' for approval"
         );
         assert!(
-            prompt.contains("\"status\": \"NEEDS_REVISION\""),
-            "missing NEEDS_REVISION JSON status"
+            !prompt.contains("VERDICT"),
+            "planning reviewer prompt should NOT contain VERDICT instruction"
+        );
+        assert!(
+            !prompt.contains("status.json"),
+            "planning reviewer prompt should NOT reference status.json"
         );
     }
 
@@ -1313,11 +1249,7 @@ mod tests {
     #[test]
     fn planning_adversarial_prompt_references_files_and_framing() {
         let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
+        let prompt = planning_adversarial_review_prompt(&paths);
 
         assert!(
             prompt.contains("/state/task.md"),
@@ -1342,29 +1274,13 @@ mod tests {
     }
 
     #[test]
-    fn planning_adversarial_prompt_includes_json_status_templates() {
+    fn planning_adversarial_prompt_uses_no_findings_verdict() {
         let paths = test_phase_paths();
-        let prompt = planning_adversarial_review_prompt(
-            2,
-            "2026-02-15T12:00:00.000Z",
-            &paths,
-        );
+        let prompt = planning_adversarial_review_prompt(&paths);
 
         assert!(
-            prompt.contains("\"status\": \"APPROVED\""),
-            "missing APPROVED JSON status"
-        );
-        assert!(
-            prompt.contains("\"status\": \"NEEDS_REVISION\""),
-            "missing NEEDS_REVISION JSON status"
-        );
-        assert!(
-            prompt.contains("\"round\": 2"),
-            "missing round in JSON status"
-        );
-        assert!(
-            prompt.contains("\"timestamp\": \"2026-02-15T12:00:00.000Z\""),
-            "missing timestamp in JSON status"
+            prompt.to_lowercase().contains("no findings"),
+            "adversarial prompt should use 'no findings' verdict"
         );
     }
 
@@ -1548,11 +1464,6 @@ mod tests {
         let paths = phase_paths(&config);
         assert_eq!(
             paths.findings_json.parent(),
-            paths.planning_findings_json.parent(),
-            "findings and planning_findings should share parent dir"
-        );
-        assert_eq!(
-            paths.findings_json.parent(),
             paths.tasks_findings_json.parent(),
             "findings and tasks_findings should share parent dir"
         );
@@ -1562,13 +1473,6 @@ mod tests {
                 .to_string_lossy()
                 .contains("findings.json"),
             "findings_json path must be set"
-        );
-        assert!(
-            paths
-                .planning_findings_json
-                .to_string_lossy()
-                .contains("planning_findings.json"),
-            "planning_findings_json path must be set"
         );
         assert!(
             paths

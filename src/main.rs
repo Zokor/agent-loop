@@ -30,7 +30,7 @@ use config::{
 };
 use error::AgentLoopError;
 use state::{
-    LoopStatus, PLANNING_FINDINGS_FILENAME, Status, StatusPatch, TASKS_FINDINGS_FILENAME,
+    LoopStatus, Status, StatusPatch, TASKS_FINDINGS_FILENAME,
     TaskMetricsEntry, TaskMetricsFile, TaskRunStatus, TaskStatusEntry, TaskStatusFile,
 };
 
@@ -2182,19 +2182,14 @@ fn status_command() -> Result<i32, AgentLoopError> {
 
     // Planning artifacts.
     let planning_progress_path = config.state_dir.join("planning-progress.md");
-    let planning_findings_path = config.state_dir.join(PLANNING_FINDINGS_FILENAME);
     let tasks_findings_path = config.state_dir.join(TASKS_FINDINGS_FILENAME);
     if planning_progress_path.exists()
-        || planning_findings_path.exists()
         || tasks_findings_path.exists()
     {
         println!();
         println!("Planning artifacts:");
         if planning_progress_path.exists() {
             println!("  - {}", planning_progress_path.display());
-        }
-        if planning_findings_path.exists() {
-            println!("  - {}", planning_findings_path.display());
         }
         if tasks_findings_path.exists() {
             println!("  - {}", tasks_findings_path.display());

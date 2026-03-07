@@ -13,7 +13,6 @@ use serde_json::Value;
 use crate::config::Config;
 
 pub const FINDINGS_FILENAME: &str = "findings.json";
-pub const PLANNING_FINDINGS_FILENAME: &str = "planning_findings.json";
 pub const TASKS_FINDINGS_FILENAME: &str = "tasks_findings.json";
 pub const QUALITY_CHECKS_FILENAME: &str = "quality_checks.md";
 
@@ -956,87 +955,15 @@ pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()
     write_state_file(FINDINGS_FILENAME, &serialized, config)
 }
 
-// ---------------------------------------------------------------------------
-// Planning findings (planning_findings.json)
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PlanningFindingStatus {
-    Open,
-    Resolved,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanningFindingEntry {
-    pub id: String,
-    pub description: String,
-    pub status: PlanningFindingStatus,
-    pub round_introduced: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub round_resolved: Option<u32>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanningFindingsFile {
-    pub findings: Vec<PlanningFindingEntry>,
-}
-
-pub fn read_planning_findings(config: &Config) -> PlanningFindingsFile {
-    let raw = read_state_file(PLANNING_FINDINGS_FILENAME, config);
-    let trimmed = raw.trim();
+/// Check if review text ends with "no findings" (case-insensitive).
+/// This is the simplified planning verdict: if the reviewer's review ends
+/// with "no findings", the plan is approved.
+pub fn review_has_no_findings(review_text: &str) -> bool {
+    let trimmed = review_text.trim();
     if trimmed.is_empty() {
-        return PlanningFindingsFile::default();
+        return false;
     }
-    serde_json::from_str(trimmed).unwrap_or_default()
-}
-
-pub fn write_planning_findings(findings: &PlanningFindingsFile, config: &Config) -> io::Result<()> {
-    let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
-    write_state_file(PLANNING_FINDINGS_FILENAME, &serialized, config)
-}
-
-pub fn open_planning_findings_for_prompt(findings: &PlanningFindingsFile) -> String {
-    let open: Vec<&PlanningFindingEntry> = findings
-        .findings
-        .iter()
-        .filter(|f| f.status == PlanningFindingStatus::Open)
-        .collect();
-    if open.is_empty() {
-        return String::new();
-    }
-    let mut out = String::from("Open planning findings:\n");
-    for f in &open {
-        out.push_str(&format!("- {}: {}\n", f.id, f.description));
-    }
-    out
-}
-
-pub fn next_planning_finding_id(findings: &PlanningFindingsFile) -> String {
-    let max_num = findings
-        .findings
-        .iter()
-        .filter_map(|f| f.id.strip_prefix("P-").and_then(|n| n.parse::<u32>().ok()))
-        .max()
-        .unwrap_or(0);
-    format!("P-{:03}", max_num + 1)
-}
-
-/// Returns descriptions of findings that have been open for `threshold` or more rounds.
-pub fn stuck_planning_finding_descriptions(
-    findings: &PlanningFindingsFile,
-    current_round: u32,
-    threshold: u32,
-) -> Vec<String> {
-    findings
-        .findings
-        .iter()
-        .filter(|f| {
-            f.status == PlanningFindingStatus::Open
-                && current_round.saturating_sub(f.round_introduced) >= threshold
-        })
-        .map(|f| format!("{}: {}", f.id, f.description))
-        .collect()
+    trimmed.to_lowercase().ends_with("no findings")
 }
 
 pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {

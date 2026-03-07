@@ -18,7 +18,8 @@ use crate::{
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
         planning_adversarial_review_prompt, planning_implementer_review_fix_prompt,
         planning_implementer_revision_prompt, planning_implementer_signoff_prompt,
-        planning_initial_prompt, planning_reviewer_fix_prompt, planning_reviewer_prompt,
+        planning_initial_prompt, planning_reviewer_fix_prompt,
+        planning_reviewer_prompt,
         system_prompt_for_role,
     },
     state::{
@@ -44,7 +45,6 @@ const IMPLEMENT_GATE_SAME_CONTEXT: &str = "[gate:same-context]";
 const IMPLEMENT_GATE_FRESH_CONTEXT: &str = "[gate:fresh-context]";
 const IMPLEMENT_GATE_SIGNOFF: &str = "[gate:implementer-signoff]";
 const IMPLEMENT_GATE_C_BOUNCE: &str = "[gate:gate-c-bounce]";
-const PLANNING_GATE_SAME_CONTEXT: &str = "[gate:same-context]";
 const PLANNING_GATE_ADVERSARIAL: &str = "[gate:fresh-context]";
 const PLANNING_GATE_SIGNOFF: &str = "[gate:implementer-signoff]";
 const CHECKPOINT_SUMMARY_MAX_LEN: usize = 80;
@@ -56,7 +56,6 @@ const QUALITY_CHECK_MAX_LINES: usize = 100;
 enum PlanningReviewerAction {
     Approved,
     NeedsRevision,
-    Error,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -272,177 +271,15 @@ fn reconcile_findings_after_review(
     }
 }
 
-fn planning_reviewer_action(status: Status) -> PlanningReviewerAction {
-    match status {
-        Status::Approved => PlanningReviewerAction::Approved,
-        Status::NeedsRevision => PlanningReviewerAction::NeedsRevision,
-        Status::Error => PlanningReviewerAction::Error,
-        other => {
-            eprintln!(
-                "⚠️ planning_reviewer_action: unexpected status '{other}', falling back to NeedsRevision"
-            );
-            PlanningReviewerAction::NeedsRevision
-        }
+/// Determine planning verdict from review text.
+/// Returns Approved if review ends with "no findings" (case-insensitive),
+/// NeedsRevision otherwise.
+fn planning_verdict_from_review(review_text: &str) -> PlanningReviewerAction {
+    if crate::state::review_has_no_findings(review_text) {
+        PlanningReviewerAction::Approved
+    } else {
+        PlanningReviewerAction::NeedsRevision
     }
-}
-
-// ---------------------------------------------------------------------------
-// Planning VERDICT parsing and findings reconciliation (Tasks 13 & 14)
-// ---------------------------------------------------------------------------
-
-/// Parse `VERDICT: APPROVED` or `VERDICT: REVISE` from reviewer output.
-fn parse_planning_verdict(text: &str) -> Option<&str> {
-    let re = regex::Regex::new(r"(?i)VERDICT:\s*(APPROVED|REVISE)").ok()?;
-    re.captures(text).map(|caps| {
-        let m = caps.get(1).unwrap();
-        if m.as_str().eq_ignore_ascii_case("APPROVED") {
-            "APPROVED"
-        } else {
-            "REVISE"
-        }
-    })
-}
-
-/// Parse planning findings JSON block from reviewer output.
-/// Looks for ```json\n[...]\n``` blocks containing findings with "id" and "description".
-fn parse_planning_findings_from_output(
-    text: &str,
-    round: u32,
-) -> Vec<crate::state::PlanningFindingEntry> {
-    use crate::state::{PlanningFindingEntry, PlanningFindingStatus};
-
-    // Look for JSON array in code blocks
-    let re = regex::Regex::new(r"```(?:json)?\s*\n(\[[\s\S]*?\])\s*\n```").ok();
-    let json_text = re
-        .and_then(|r| r.captures(text))
-        .and_then(|caps| caps.get(1))
-        .map(|m| m.as_str());
-
-    let Some(json_str) = json_text else {
-        return Vec::new();
-    };
-
-    let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(json_str) else {
-        return Vec::new();
-    };
-
-    arr.iter()
-        .filter_map(|v| {
-            let id = v.get("id")?.as_str()?.to_string();
-            let description = v.get("description")?.as_str()?.to_string();
-            // Read optional "status" field; case-insensitive, default to Open for
-            // backward compatibility ("resolved", "Resolved", "RESOLVED" all accepted).
-            let status = match v
-                .get("status")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_ascii_lowercase())
-                .as_deref()
-            {
-                Some("resolved") => PlanningFindingStatus::Resolved,
-                _ => PlanningFindingStatus::Open,
-            };
-            Some(PlanningFindingEntry {
-                id,
-                description,
-                status,
-                round_introduced: round,
-                round_resolved: None,
-            })
-        })
-        .collect()
-}
-
-/// Reconcile planning verdict with findings, applying safety nets:
-/// - REVISE + empty findings → synthesize P-001 from reviewer prose
-/// - APPROVED + open findings → force NEEDS_REVISION
-fn reconcile_planning_verdict(
-    verdict: Option<&str>,
-    new_findings: Vec<crate::state::PlanningFindingEntry>,
-    existing: &crate::state::PlanningFindingsFile,
-    review_status: &LoopStatus,
-    round: u32,
-    config: &Config,
-) -> (PlanningReviewerAction, crate::state::PlanningFindingsFile) {
-    use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
-
-    // ID-based merge: update existing findings, add new ones, resolve transitions.
-    let mut merged = existing.findings.clone();
-    for new_f in &new_findings {
-        if let Some(existing_entry) = merged.iter_mut().find(|f| f.id == new_f.id) {
-            // Update description if changed, transition status.
-            existing_entry.description = new_f.description.clone();
-            if new_f.status == PlanningFindingStatus::Resolved
-                && existing_entry.status == PlanningFindingStatus::Open
-            {
-                existing_entry.status = PlanningFindingStatus::Resolved;
-                existing_entry.round_resolved = Some(round);
-            } else if new_f.status == PlanningFindingStatus::Open
-                && existing_entry.status == PlanningFindingStatus::Resolved
-            {
-                // Reopened — reviewer flagged it again.
-                existing_entry.status = PlanningFindingStatus::Open;
-                existing_entry.round_resolved = None;
-            }
-        } else {
-            // New finding not previously seen.
-            let mut entry = new_f.clone();
-            if entry.status == PlanningFindingStatus::Resolved {
-                entry.round_resolved = Some(round);
-            }
-            merged.push(entry);
-        }
-    }
-
-    // Count open findings in the merged result (after reconciliation).
-    let open_after_merge = merged
-        .iter()
-        .filter(|f| f.status == PlanningFindingStatus::Open)
-        .count();
-
-    let action = match verdict {
-        Some("REVISE") => {
-            // Safety net: REVISE + empty findings → synthesize P-001
-            if new_findings.is_empty() {
-                let desc = review_status.reason.as_deref().unwrap_or(
-                    "Reviewer requested revision but did not provide structured findings.",
-                );
-                let next_id = crate::state::next_planning_finding_id(&PlanningFindingsFile {
-                    findings: merged.clone(),
-                });
-                merged.push(PlanningFindingEntry {
-                    id: next_id,
-                    description: desc.to_string(),
-                    status: PlanningFindingStatus::Open,
-                    round_introduced: round,
-                    round_resolved: None,
-                });
-                let _ = log(
-                    "Planning reconciliation: REVISE with empty findings — synthesized finding from reviewer prose",
-                    config,
-                );
-            }
-            PlanningReviewerAction::NeedsRevision
-        }
-        Some("APPROVED") => {
-            // Safety net: APPROVED + open findings remaining after reconciliation → force NEEDS_REVISION
-            if open_after_merge > 0 {
-                let _ = log(
-                    "Planning reconciliation: APPROVED with open findings — forcing NEEDS_REVISION",
-                    config,
-                );
-                PlanningReviewerAction::NeedsRevision
-            } else {
-                PlanningReviewerAction::Approved
-            }
-        }
-        _ => {
-            // Fall back to status-based decision
-            planning_reviewer_action(review_status.status)
-        }
-    };
-
-    let findings_file = PlanningFindingsFile { findings: merged };
-    (action, findings_file)
 }
 
 fn planning_implementer_reached_consensus(status: Status) -> bool {
@@ -1659,6 +1496,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let mut planning_round = 0;
     let mut reached_consensus = false;
     let mut dispute_reason: Option<String> = None;
+    let mut consecutive_revision_rounds: u32 = 0;
 
     let planning_limit = normalize_round_limit(config.planning_max_rounds);
 
@@ -1678,26 +1516,16 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             config,
         );
 
-        // Read open planning findings for the reviewer prompt.
-        let planning_findings = crate::state::read_planning_findings(config);
-        let open_findings_text =
-            crate::state::open_planning_findings_for_prompt(&planning_findings);
-
-        // Clear review.md before each reviewer round to prevent stale content
-        // from a previous round bleeding into verdict/findings parsing.
+        // Clear review.md before each reviewer round to prevent stale content.
         let _ = write_state_file("review.md", "", config);
 
         let _ = log("🔍 Reviewer evaluating plan...", config);
-        let reviewer_prompt_timestamp = timestamp();
         let reviewer_output = match run_agent_with_output_or_record_error(
             config,
             &config.reviewer,
             &planning_reviewer_prompt(&PlanningReviewerParams {
-                round: planning_round,
-                prompt_timestamp: &reviewer_prompt_timestamp,
                 paths: &paths,
                 dispute_reason: dispute_reason.as_deref(),
-                open_findings: &open_findings_text,
             }),
             Some(planning_round),
             AgentRole::Reviewer,
@@ -1714,110 +1542,60 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             let _ = write_state_file("review.md", &reviewer_output, config);
         }
 
-        let mut review_status = read_status(config);
-        if review_status.status != Status::Error
-            && is_status_stale(&reviewer_prompt_timestamp, &review_status)
-        {
-            let _ = log(
-                "⚠️ Stale status detected after planning reviewer — writing NeedsRevision fallback",
-                config,
-            );
-            warn_on_status_write(
-                "NEEDS_REVISION",
-                StatusPatch {
-                    status: Some(Status::NeedsRevision),
-                    round: Some(planning_round),
-                    reason: Some(gate_reason(
-                        PLANNING_GATE_SAME_CONTEXT,
-                        STALE_TIMESTAMP_REASON,
-                    )),
-                    ..StatusPatch::default()
+        // Determine verdict from review text: ends with "no findings" → approved
+        let review_text = read_state_file("review.md", config);
+        let action = planning_verdict_from_review(&review_text);
+
+        // Write status.json based on verdict (system-managed, not agent-written)
+        let verdict_label = if action == PlanningReviewerAction::Approved {
+            "APPROVED"
+        } else {
+            "NEEDS_REVISION"
+        };
+        warn_on_status_write(
+            verdict_label,
+            StatusPatch {
+                status: Some(if action == PlanningReviewerAction::Approved {
+                    Status::Approved
+                } else {
+                    Status::NeedsRevision
+                }),
+                round: Some(planning_round),
+                reason: if action == PlanningReviewerAction::NeedsRevision {
+                    Some("see review.md".to_string())
+                } else {
+                    None
                 },
-                config,
-            );
-            review_status = read_status(config);
-        }
-
-        // --- VERDICT parsing and findings reconciliation (Tasks 13 & 14) ---
-        // Read the review output (reviewer writes to review.md or plan.md).
-        let review_output = read_state_file("review.md", config);
-        let verdict = parse_planning_verdict(&review_output);
-        let new_findings = parse_planning_findings_from_output(&review_output, planning_round);
-
-        let (reconciled_action, updated_findings) = reconcile_planning_verdict(
-            verdict,
-            new_findings,
-            &planning_findings,
-            &review_status,
-            planning_round,
+                ..StatusPatch::default()
+            },
             config,
         );
 
-        // Persist updated planning findings.
-        let _ = crate::state::write_planning_findings(&updated_findings, config);
-
-        // If reconciliation overrode the status (e.g. forced NEEDS_REVISION),
-        // update status.json accordingly.
-        if reconciled_action == PlanningReviewerAction::NeedsRevision
-            && review_status.status == Status::Approved
-        {
-            warn_on_status_write(
-                "NEEDS_REVISION",
-                StatusPatch {
-                    status: Some(Status::NeedsRevision),
-                    round: Some(planning_round),
-                    reason: Some(gate_reason(
-                        PLANNING_GATE_SAME_CONTEXT,
-                        "Forced NEEDS_REVISION: open planning findings remain",
-                    )),
-                    ..StatusPatch::default()
-                },
-                config,
-            );
-            review_status = read_status(config);
-        }
-
         // Append planning progress after each reviewer round.
-        let progress_summary = format!(
-            "Reviewer: {} — {} (verdict: {})",
-            review_status.status,
-            review_status.reason.as_deref().unwrap_or("(no reason)"),
-            verdict.unwrap_or("none"),
+        crate::state::append_planning_progress(
+            planning_round,
+            &format!("Reviewer: {verdict_label}"),
+            config,
         );
-        crate::state::append_planning_progress(planning_round, &progress_summary, config);
 
-        match reconciled_action {
+        match action {
             PlanningReviewerAction::NeedsRevision => {
-                let _ = log(
-                    &format!(
-                        "📝 Reviewer requested changes: {}",
-                        review_status.reason.as_deref().unwrap_or("see plan.md")
-                    ),
-                    config,
-                );
+                let _ = log("📝 Reviewer requested changes — see review.md", config);
+                consecutive_revision_rounds += 1;
 
-                // Check for stuck findings — if any finding has been open for
-                // planning_role_swap_after rounds, swap roles: reviewer fixes, implementer reviews.
+                // Role swap: after N consecutive revision rounds, have the reviewer
+                // fix the plan directly, then the implementer reviews.
                 let swap_threshold = config.planning_role_swap_after;
-                let stuck_descriptions = crate::state::stuck_planning_finding_descriptions(
-                    &updated_findings,
-                    planning_round,
-                    swap_threshold,
-                );
-
-                if !stuck_descriptions.is_empty() {
+                if swap_threshold > 0 && consecutive_revision_rounds >= swap_threshold {
                     let _ = log(
                         &format!(
-                            "🔄 Role swap: {} finding(s) stuck for {}+ rounds — reviewer will fix, implementer will review",
-                            stuck_descriptions.len(),
-                            swap_threshold,
+                            "🔄 Role swap: {consecutive_revision_rounds} consecutive revision rounds — reviewer will fix, implementer will review",
                         ),
                         config,
                     );
-
                     crate::state::append_planning_progress(
                         planning_round,
-                        &format!("Role swap triggered: stuck findings — {}", stuck_descriptions.join(", ")),
+                        &format!("Role swap triggered after {consecutive_revision_rounds} consecutive revision rounds"),
                         config,
                     );
 
@@ -1826,7 +1604,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     if !run_agent_or_record_error(
                         config,
                         &config.reviewer,
-                        &planning_reviewer_fix_prompt(&paths, &stuck_descriptions),
+                        &planning_reviewer_fix_prompt(&paths),
                         Some(planning_round),
                         AgentRole::Reviewer,
                         "plan",
@@ -1837,16 +1615,11 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
 
                     // Step 2: Implementer reviews the reviewer's fix
                     let _ = log("🔍 Implementer reviewing reviewer's fix...", config);
-                    let fix_review_timestamp = timestamp();
                     let _ = write_state_file("review.md", "", config);
                     if !run_agent_or_record_error(
                         config,
                         &planner_agent,
-                        &planning_implementer_review_fix_prompt(
-                            &paths,
-                            planning_round,
-                            &fix_review_timestamp,
-                        ),
+                        &planning_implementer_review_fix_prompt(&paths),
                         Some(planning_round),
                         AgentRole::Implementer,
                         "plan",
@@ -1855,9 +1628,8 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                         return false;
                     }
 
-                    // The next iteration of the loop will pick up the implementer's
-                    // verdict via the normal reviewer path. If the implementer approved,
-                    // the reviewer will verify in the next round. If not, normal revision continues.
+                    // Reset counter — the reviewer's fix gets a fresh chance
+                    consecutive_revision_rounds = 0;
                     dispute_reason = None;
                     continue;
                 }
@@ -1879,20 +1651,17 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 continue;
             }
             PlanningReviewerAction::Approved => {
+                consecutive_revision_rounds = 0;
+
                 if requires_dual_agent_signoff(config) {
                     // --- Adversarial planning review (dual-agent only) ---
                     if planning_adversarial_enabled(config) {
                         let _ = log("🔍 Running adversarial second review of plan...", config);
 
-                        let adversarial_timestamp = timestamp();
                         let adversarial_output = match run_agent_with_output_or_record_error(
                             config,
                             &config.implementer,
-                            &planning_adversarial_review_prompt(
-                                planning_round,
-                                &adversarial_timestamp,
-                                &paths,
-                            ),
+                            &planning_adversarial_review_prompt(&paths),
                             Some(planning_round),
                             AgentRole::Reviewer,
                             &format!("plan-adversarial-r{planning_round}"),
@@ -1902,38 +1671,23 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                             None => return false,
                         };
 
-                        // Parse adversarial verdict and findings
-                        let adversarial_verdict = parse_planning_verdict(&adversarial_output);
-                        let adversarial_findings = parse_planning_findings_from_output(
-                            &adversarial_output,
-                            planning_round,
-                        );
+                        // Determine adversarial verdict from review text
+                        let adversarial_review = read_state_file("review.md", config);
+                        let adversarial_text = if adversarial_review.trim().is_empty() {
+                            &adversarial_output
+                        } else {
+                            &adversarial_review
+                        };
+                        let adversarial_action = planning_verdict_from_review(adversarial_text);
 
-                        let (adversarial_action, adversarial_updated) = reconcile_planning_verdict(
-                            adversarial_verdict,
-                            adversarial_findings,
-                            &updated_findings,
-                            &read_status(config),
-                            planning_round,
-                            config,
-                        );
-
-                        // Persist merged findings
-                        let _ = crate::state::write_planning_findings(&adversarial_updated, config);
-
-                        let adversarial_summary = format!(
-                            "{} Adversarial: {} (verdict: {})",
-                            PLANNING_GATE_ADVERSARIAL,
-                            if adversarial_action == PlanningReviewerAction::NeedsRevision {
-                                "REVISE"
-                            } else {
-                                "APPROVED"
-                            },
-                            adversarial_verdict.unwrap_or("none"),
-                        );
+                        let adversarial_label = if adversarial_action == PlanningReviewerAction::NeedsRevision {
+                            "REVISE"
+                        } else {
+                            "APPROVED"
+                        };
                         crate::state::append_planning_progress(
                             planning_round,
-                            &adversarial_summary,
+                            &format!("{} Adversarial: {adversarial_label}", PLANNING_GATE_ADVERSARIAL),
                             config,
                         );
 
@@ -1942,6 +1696,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                                 "📝 Adversarial reviewer found issues — requesting revision",
                                 config,
                             );
+                            consecutive_revision_rounds += 1;
                             if !run_agent_or_record_error(
                                 config,
                                 &planner_agent,
@@ -2053,14 +1808,6 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     reached_consensus = true;
                     break;
                 }
-            }
-            PlanningReviewerAction::Error => {
-                write_error_status(
-                    config,
-                    Some(planning_round),
-                    status_error_reason(&review_status),
-                );
-                return false;
             }
         }
 
@@ -3904,242 +3651,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_planning_verdict_extracts_approved() {
+    fn planning_verdict_no_findings_is_approved() {
         assert_eq!(
-            parse_planning_verdict("Some text\nVERDICT: APPROVED\nmore text"),
-            Some("APPROVED")
+            planning_verdict_from_review("Everything looks good.\n\nno findings"),
+            PlanningReviewerAction::Approved,
         );
     }
 
     #[test]
-    fn parse_planning_verdict_extracts_revise() {
-        assert_eq!(parse_planning_verdict("VERDICT:  REVISE"), Some("REVISE"));
-    }
-
-    #[test]
-    fn parse_planning_verdict_returns_none_when_absent() {
-        assert_eq!(parse_planning_verdict("no verdict here"), None);
-    }
-
-    #[test]
-    fn parse_planning_verdict_is_case_insensitive() {
+    fn planning_verdict_with_findings_is_needs_revision() {
         assert_eq!(
-            parse_planning_verdict("verdict: approved"),
-            Some("APPROVED")
-        );
-        assert_eq!(parse_planning_verdict("Verdict: revise"), Some("REVISE"));
-    }
-
-    #[test]
-    fn parse_planning_findings_extracts_valid_json_block() {
-        let text = r#"Here are findings:
-```json
-[{"id": "P-001", "description": "Missing error handling"}]
-```
-"#;
-        let findings = parse_planning_findings_from_output(text, 2);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].id, "P-001");
-        assert_eq!(findings[0].description, "Missing error handling");
-        assert_eq!(findings[0].round_introduced, 2);
-    }
-
-    #[test]
-    fn parse_planning_findings_returns_empty_for_no_json_block() {
-        let text = "No JSON block here, just plain text.";
-        let findings = parse_planning_findings_from_output(text, 1);
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn parse_planning_findings_returns_empty_for_invalid_json() {
-        let text = "```json\n{not valid json}\n```";
-        let findings = parse_planning_findings_from_output(text, 1);
-        assert!(findings.is_empty());
-    }
-
-    #[test]
-    fn parse_planning_findings_status_field_case_insensitive() {
-        // "Resolved" (title case) → Resolved
-        let text = "```json\n[{\"id\": \"P-001\", \"description\": \"Fixed\", \"status\": \"Resolved\"}]\n```\n";
-        let findings = parse_planning_findings_from_output(text, 1);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].status,
-            crate::state::PlanningFindingStatus::Resolved
-        );
-
-        // "RESOLVED" (upper case) → Resolved
-        let text = "```json\n[{\"id\": \"P-002\", \"description\": \"Fixed\", \"status\": \"RESOLVED\"}]\n```\n";
-        let findings = parse_planning_findings_from_output(text, 1);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].status,
-            crate::state::PlanningFindingStatus::Resolved
-        );
-
-        // missing status field → defaults to Open
-        let text = "```json\n[{\"id\": \"P-003\", \"description\": \"Still open\"}]\n```\n";
-        let findings = parse_planning_findings_from_output(text, 1);
-        assert_eq!(findings.len(), 1);
-        assert_eq!(
-            findings[0].status,
-            crate::state::PlanningFindingStatus::Open
+            planning_verdict_from_review("Found issues:\n1. Missing migration step"),
+            PlanningReviewerAction::NeedsRevision,
         );
     }
 
     #[test]
-    fn reconcile_planning_verdict_revise_with_empty_findings_synthesizes() {
-        let config = test_config();
-        let existing = crate::state::PlanningFindingsFile::default();
-        let review_status = LoopStatus {
-            status: Status::NeedsRevision,
-            round: 2,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: Some("The error handling section needs work".to_string()),
-
-            timestamp: String::new(),
-        };
-
-        let (action, findings_file) = reconcile_planning_verdict(
-            Some("REVISE"),
-            Vec::new(), // empty findings
-            &existing,
-            &review_status,
-            2,
-            &config,
-        );
-
-        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
-        assert_eq!(findings_file.findings.len(), 1);
-        assert_eq!(findings_file.findings[0].id, "P-001");
+    fn planning_verdict_empty_review_is_needs_revision() {
         assert_eq!(
-            findings_file.findings[0].description,
-            "The error handling section needs work"
+            planning_verdict_from_review(""),
+            PlanningReviewerAction::NeedsRevision,
+        );
+    }
+
+    #[test]
+    fn planning_verdict_no_findings_case_insensitive() {
+        assert_eq!(
+            planning_verdict_from_review("All good.\nNo Findings"),
+            PlanningReviewerAction::Approved,
         );
         assert_eq!(
-            findings_file.findings[0].status,
-            crate::state::PlanningFindingStatus::Open
+            planning_verdict_from_review("Looks great.\nNO FINDINGS"),
+            PlanningReviewerAction::Approved,
         );
     }
 
     #[test]
-    fn reconcile_planning_verdict_approved_with_open_findings_forces_needs_revision() {
-        let config = test_config();
-        let existing = crate::state::PlanningFindingsFile {
-            findings: vec![crate::state::PlanningFindingEntry {
-                id: "P-001".to_string(),
-                description: "Missing error handling".to_string(),
-                status: crate::state::PlanningFindingStatus::Open,
-                round_introduced: 1,
-                round_resolved: None,
-            }],
-        };
-        let review_status = LoopStatus {
-            status: Status::Approved,
-            round: 3,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: None,
-
-            timestamp: String::new(),
-        };
-
-        let (action, findings_file) = reconcile_planning_verdict(
-            Some("APPROVED"),
-            Vec::new(),
-            &existing,
-            &review_status,
-            3,
-            &config,
-        );
-
-        // Should force NEEDS_REVISION despite APPROVED verdict
-        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
-        // Existing finding should be preserved
-        assert_eq!(findings_file.findings.len(), 1);
-        assert_eq!(findings_file.findings[0].id, "P-001");
-    }
-
-    #[test]
-    fn reconcile_planning_verdict_approved_without_open_findings_approves() {
-        let config = test_config();
-        let existing = crate::state::PlanningFindingsFile {
-            findings: vec![crate::state::PlanningFindingEntry {
-                id: "P-001".to_string(),
-                description: "Was resolved".to_string(),
-                status: crate::state::PlanningFindingStatus::Resolved,
-                round_introduced: 1,
-                round_resolved: Some(2),
-            }],
-        };
-        let review_status = LoopStatus {
-            status: Status::Approved,
-            round: 3,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: None,
-
-            timestamp: String::new(),
-        };
-
-        let (action, _) = reconcile_planning_verdict(
-            Some("APPROVED"),
-            Vec::new(),
-            &existing,
-            &review_status,
-            3,
-            &config,
-        );
-
-        assert_eq!(action, PlanningReviewerAction::Approved);
-    }
-
-    #[test]
-    fn reconcile_planning_verdict_revise_with_findings_keeps_them() {
-        let config = test_config();
-        let existing = crate::state::PlanningFindingsFile::default();
-        let new_findings = vec![crate::state::PlanningFindingEntry {
-            id: "P-001".to_string(),
-            description: "Explicit finding from reviewer".to_string(),
-            status: crate::state::PlanningFindingStatus::Open,
-            round_introduced: 2,
-            round_resolved: None,
-        }];
-        let review_status = LoopStatus {
-            status: Status::NeedsRevision,
-            round: 2,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: Some("Needs work".to_string()),
-
-            timestamp: String::new(),
-        };
-
-        let (action, findings_file) = reconcile_planning_verdict(
-            Some("REVISE"),
-            new_findings,
-            &existing,
-            &review_status,
-            2,
-            &config,
-        );
-
-        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
-        // Should keep the explicit finding, not synthesize
-        assert_eq!(findings_file.findings.len(), 1);
+    fn planning_verdict_no_findings_with_trailing_whitespace() {
         assert_eq!(
-            findings_file.findings[0].description,
-            "Explicit finding from reviewer"
+            planning_verdict_from_review("All good.\nno findings  \n"),
+            PlanningReviewerAction::Approved,
         );
     }
 
@@ -4512,108 +4063,6 @@ mod tests {
         config.implementer = Agent::known("claude");
         config.reviewer = Agent::known("claude");
         assert!(!planning_adversarial_enabled(&config));
-    }
-
-    // -----------------------------------------------------------------------
-    // PA-xxx findings reconciliation with existing P-xxx findings
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn reconcile_planning_verdict_merges_pa_findings_with_existing_p_findings() {
-        use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
-
-        let config = test_config();
-
-        // Existing P-xxx findings from primary reviewer
-        let existing = PlanningFindingsFile {
-            findings: vec![PlanningFindingEntry {
-                id: "P-001".to_string(),
-                description: "Missing error handling".to_string(),
-                status: PlanningFindingStatus::Resolved,
-                round_introduced: 1,
-                round_resolved: Some(1),
-            }],
-        };
-
-        // New PA-xxx findings from adversarial reviewer
-        let adversarial_findings = vec![PlanningFindingEntry {
-            id: "PA-001".to_string(),
-            description: "Route returns SVG not HTML".to_string(),
-            status: PlanningFindingStatus::Open,
-            round_introduced: 1,
-            round_resolved: None,
-        }];
-
-        let review_status = LoopStatus {
-            status: Status::NeedsRevision,
-            round: 1,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: Some("Adversarial review found issues".to_string()),
-
-            timestamp: String::new(),
-        };
-
-        let (action, merged) = reconcile_planning_verdict(
-            Some("REVISE"),
-            adversarial_findings,
-            &existing,
-            &review_status,
-            1,
-            &config,
-        );
-
-        assert_eq!(action, PlanningReviewerAction::NeedsRevision);
-        // Both P-001 (resolved) and PA-001 (open) should be in merged findings
-        assert_eq!(merged.findings.len(), 2);
-        assert!(merged.findings.iter().any(|f| f.id == "P-001"));
-        assert!(merged.findings.iter().any(|f| f.id == "PA-001"));
-        let pa = merged.findings.iter().find(|f| f.id == "PA-001").unwrap();
-        assert_eq!(pa.status, PlanningFindingStatus::Open);
-    }
-
-    #[test]
-    fn reconcile_planning_verdict_adversarial_approved_with_no_open_findings() {
-        use crate::state::{PlanningFindingEntry, PlanningFindingStatus, PlanningFindingsFile};
-
-        let config = test_config();
-
-        // All existing findings resolved
-        let existing = PlanningFindingsFile {
-            findings: vec![PlanningFindingEntry {
-                id: "P-001".to_string(),
-                description: "Missing error handling".to_string(),
-                status: PlanningFindingStatus::Resolved,
-                round_introduced: 1,
-                round_resolved: Some(1),
-            }],
-        };
-
-        let review_status = LoopStatus {
-            status: Status::Approved,
-            round: 1,
-            implementer: "claude".to_string(),
-            reviewer: "codex".to_string(),
-            mode: "dual-agent".to_string(),
-            last_run_task: "plan".to_string(),
-            reason: None,
-
-            timestamp: String::new(),
-        };
-
-        // Adversarial reviewer found no issues
-        let (action, _) = reconcile_planning_verdict(
-            Some("APPROVED"),
-            vec![],
-            &existing,
-            &review_status,
-            1,
-            &config,
-        );
-
-        assert_eq!(action, PlanningReviewerAction::Approved);
     }
 
     // -----------------------------------------------------------------------
@@ -6896,7 +6345,6 @@ More text.
 
     #[test]
     fn planning_gate_constants_have_expected_values() {
-        assert_eq!(PLANNING_GATE_SAME_CONTEXT, "[gate:same-context]");
         assert_eq!(PLANNING_GATE_ADVERSARIAL, "[gate:fresh-context]");
         assert_eq!(PLANNING_GATE_SIGNOFF, "[gate:implementer-signoff]");
     }
