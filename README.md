@@ -181,7 +181,17 @@ The following subcommands have been removed. Using them produces a parse error:
 plan  ->  tasks  ->  implement
 ```
 
-Consensus/signoff model:
+Revision loop (plan, tasks, and implement):
+
+```text
+  implementer drafts -> reviewer reviews
+    if REVISE/NEEDS_REVISION -> implementer revises -> reviewer re-reviews (loop)
+    if APPROVED -> proceed to signoff / next phase
+```
+
+The reviewer always gets the last word. When the reviewer requests changes, the implementer revises the artifact (plan, tasks, or code), then the **reviewer re-reviews** — the loop continues until the reviewer approves or the round limit is reached.
+
+Signoff model:
 
 ```text
 Plan/tasks single-agent:
@@ -402,10 +412,15 @@ After the planner creates a plan, the reviewer validates it:
    - Verify API payloads match controller/request validation requirements
    - Verify waiver/exclusion lists are complete
 
+   If the reviewer returns REVISE, the implementer revises `plan.md` to address the
+   review findings, then the reviewer re-reviews. This loop continues until the
+   reviewer approves or the round limit is reached.
+
 2. **Adversarial review** (dual-agent only) — After the first reviewer approves, the
    implementer agent performs an adversarial pass focused on what the first reviewer
-   missed. Uses `PA-xxx` finding IDs. Skipped in single-agent mode or when
-   `planning_adversarial_review = false`.
+   missed. Uses `PA-xxx` finding IDs. If the adversarial review returns REVISE, the
+   implementer revises and the loop returns to the primary reviewer.
+   Skipped in single-agent mode or when `planning_adversarial_review = false`.
 
 Findings are tracked in `planning_findings.json` with IDs (`P-001`, `PA-001`, ...).
 Reviewers must cite `file_refs` in their review to evidence each issue.
@@ -419,6 +434,8 @@ After plan consensus, the decomposition reviewer validates the task breakdown:
 - Dependencies correctly identified and ordered
 - Missing tasks
 - Testing/verification steps included
+
+If the reviewer returns NEEDS_REVISION, the implementer revises `tasks.md` to address the findings, then the reviewer re-reviews. The loop continues until approved or the round limit is reached.
 
 ### Implementation Review
 

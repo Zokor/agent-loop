@@ -399,13 +399,12 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
         End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
         If APPROVED, write to {status_path}:\n\
         {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If REVISE, write revised plan to {plan_path} and to {status_path2}:\n\
+        If REVISE, write to {status_path2}:\n\
         {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"your reason\", \"timestamp\": \"{prompt_timestamp}\"}}",
         task_md = path_text(&paths.task_md),
         plan_md = path_text(&paths.plan_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        plan_path = path_text(&paths.plan_md),
         status_path2 = path_text(&paths.status_json),
     )
 }
@@ -425,31 +424,24 @@ pub(crate) fn planning_adversarial_review_prompt(
         End with VERDICT: APPROVED or VERDICT: REVISE.\n\n\
         If APPROVED, write to {status_path}:\n\
         {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If REVISE, write revised plan to {plan_path} and to {status_path2}:\n\
+        If REVISE, write to {status_path2}:\n\
         {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"brief summary\", \"timestamp\": \"{prompt_timestamp}\"}}",
         task_md = path_text(&paths.task_md),
         plan_md = path_text(&paths.plan_md),
         review_md = path_text(&paths.review_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        plan_path = path_text(&paths.plan_md),
         status_path2 = path_text(&paths.status_json),
     )
 }
 
 pub(crate) fn planning_implementer_revision_prompt(
-    reviewer_reason: &str,
-    round: u32,
-    prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "The reviewer has revised your plan. Read the task from {task_md} and the revised plan from {plan_md}.\n\n\
-        REVIEWER'S REASON:\n{reviewer_reason}\n\n\
-        {signoff_block}",
-        task_md = path_text(&paths.task_md),
+        "Read the review in {review_md}. Revise the plan in {plan_md} to address the findings.",
+        review_md = path_text(&paths.review_md),
         plan_md = path_text(&paths.plan_md),
-        signoff_block = signoff_status_block(round, prompt_timestamp, paths),
     )
 }
 
@@ -470,23 +462,13 @@ pub(crate) fn decomposition_initial_prompt(paths: &PhasePaths) -> String {
 }
 
 pub(crate) fn decomposition_revision_prompt(
-    reviewer_feedback: &str,
-    round: u32,
-    prompt_timestamp: &str,
     paths: &PhasePaths,
 ) -> String {
     format!(
-        "Read the task from {task_md}, the plan from {plan_md}, and current tasks from {tasks_md}.\n\n\
-        REVIEWER FEEDBACK:\n{reviewer_feedback}\n\n\
-        Revise {tasks_md2} to address all feedback.\n\
-        Do NOT add revision history, changelogs, or round-by-round notes to the file — only task definitions.\n\n\
-        Then write to {status_json}:\n\
-        {{\"status\": \"DISPUTED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}",
-        task_md = path_text(&paths.task_md),
-        plan_md = path_text(&paths.plan_md),
+        "Read the review in {review_md}. Revise {tasks_md} to address the findings.\n\
+        Do NOT add revision history or changelogs — only task definitions.",
+        review_md = path_text(&paths.review_md),
         tasks_md = path_text(&paths.tasks_md),
-        tasks_md2 = path_text(&paths.tasks_md),
-        status_json = path_text(&paths.status_json),
     )
 }
 
@@ -517,13 +499,12 @@ pub(crate) fn decomposition_reviewer_prompt(
         Write your review to {review_path}.\n\n\
         If APPROVED, write to {status_path}:\n\
         {{\"status\": \"APPROVED\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\n\
-        If changes needed, revise {tasks_path} and write to {status_path2}:\n\
+        If changes needed, write to {status_path2}:\n\
         {{\"status\": \"NEEDS_REVISION\", \"round\": {round}, \"reason\": \"brief explanation\", \"timestamp\": \"{prompt_timestamp}\"}}",
         plan_md = path_text(&paths.plan_md),
         tasks_md = path_text(&paths.tasks_md),
         review_path = path_text(&paths.review_md),
         status_path = path_text(&paths.status_json),
-        tasks_path = path_text(&paths.tasks_md),
         status_path2 = path_text(&paths.status_json),
     )
 }

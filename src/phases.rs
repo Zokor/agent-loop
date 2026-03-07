@@ -992,109 +992,6 @@ fn run_agent_or_record_error(
 }
 
 // ---------------------------------------------------------------------------
-// Planning revision helper
-// ---------------------------------------------------------------------------
-
-/// Outcome from running the implementer revision step during planning.
-enum PlanningRevisionOutcome {
-    /// Agent call failed — caller should return false.
-    AgentFailed,
-    /// Implementer accepted the revised plan.
-    Consensus,
-    /// Implementer continues to next round (possibly with concerns).
-    Continue { dispute_reason: Option<String> },
-}
-
-/// Run the implementer revision step: let the planner review a revised plan,
-/// handle stale/error statuses, and determine the outcome.
-fn run_planning_implementer_revision(
-    config: &Config,
-    planner_agent: &Agent,
-    reviewer_reason: &str,
-    round: u32,
-    paths: &crate::prompts::PhasePaths,
-) -> PlanningRevisionOutcome {
-    let _ = log("🔍 Implementer reviewing revised plan...", config);
-    let implementer_prompt_timestamp = timestamp();
-    if !run_agent_or_record_error(
-        config,
-        planner_agent,
-        &planning_implementer_revision_prompt(
-            reviewer_reason,
-            round,
-            &implementer_prompt_timestamp,
-            paths,
-        ),
-        Some(round),
-        AgentRole::Implementer,
-        "plan",
-        "implementer-revision",
-    ) {
-        return PlanningRevisionOutcome::AgentFailed;
-    }
-
-    let mut implementer_status = read_status(config);
-    if implementer_status.status != Status::Error
-        && is_status_stale(&implementer_prompt_timestamp, &implementer_status)
-    {
-        let _ = log(
-            "⚠️ Stale status detected after planning implementer revision — writing NeedsRevision fallback",
-            config,
-        );
-        warn_on_status_write(
-            "NEEDS_REVISION",
-            StatusPatch {
-                status: Some(Status::NeedsRevision),
-                round: Some(round),
-                reason: Some(STALE_TIMESTAMP_REASON.to_string()),
-                ..StatusPatch::default()
-            },
-            config,
-        );
-        implementer_status = read_status(config);
-    }
-
-    if implementer_status.status == Status::Error {
-        write_error_status(
-            config,
-            Some(round),
-            status_error_reason(&implementer_status),
-        );
-        return PlanningRevisionOutcome::AgentFailed;
-    }
-
-    if planning_implementer_reached_consensus(implementer_status.status) {
-        let _ = log("✅ Both agents agreed on the plan!", config);
-        return PlanningRevisionOutcome::Consensus;
-    }
-
-    let dispute = if implementer_status.status == Status::Disputed {
-        implementer_status
-            .reason
-            .as_deref()
-            .filter(|r| !r.trim().is_empty())
-            .map(ToOwned::to_owned)
-    } else {
-        None
-    };
-
-    let _ = log(
-        &format!(
-            "📝 Implementer has concerns: {}",
-            implementer_status
-                .reason
-                .as_deref()
-                .unwrap_or("see plan.md")
-        ),
-        config,
-    );
-
-    PlanningRevisionOutcome::Continue {
-        dispute_reason: dispute,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Quality checks (AUTO_TEST feature)
 // ---------------------------------------------------------------------------
 
@@ -1898,25 +1795,20 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     config,
                 );
 
-                match run_planning_implementer_revision(
+                let _ = log("📝 Implementer revising plan...", config);
+                if !run_agent_or_record_error(
                     config,
                     &planner_agent,
-                    review_status
-                        .reason
-                        .as_deref()
-                        .unwrap_or("See plan revisions"),
-                    planning_round,
-                    &paths,
+                    &planning_implementer_revision_prompt(&paths),
+                    Some(planning_round),
+                    AgentRole::Implementer,
+                    "plan",
+                    "implementer-revision",
                 ) {
-                    PlanningRevisionOutcome::AgentFailed => return false,
-                    PlanningRevisionOutcome::Consensus => {
-                        reached_consensus = true;
-                        break;
-                    }
-                    PlanningRevisionOutcome::Continue { dispute_reason: dr } => {
-                        dispute_reason = dr;
-                    }
+                    return false;
                 }
+                dispute_reason = None;
+                continue;
             }
             PlanningReviewerAction::Approved => {
                 if requires_dual_agent_signoff(config) {
@@ -1982,23 +1874,19 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                                 "📝 Adversarial reviewer found issues — requesting revision",
                                 config,
                             );
-                            match run_planning_implementer_revision(
+                            if !run_agent_or_record_error(
                                 config,
                                 &planner_agent,
-                                "Adversarial review found issues the first reviewer missed",
-                                planning_round,
-                                &paths,
+                                &planning_implementer_revision_prompt(&paths),
+                                Some(planning_round),
+                                AgentRole::Implementer,
+                                "plan",
+                                "implementer-revision",
                             ) {
-                                PlanningRevisionOutcome::AgentFailed => return false,
-                                PlanningRevisionOutcome::Consensus => {
-                                    reached_consensus = true;
-                                    break;
-                                }
-                                PlanningRevisionOutcome::Continue { dispute_reason: dr } => {
-                                    dispute_reason = dr;
-                                    continue;
-                                }
+                                return false;
                             }
+                            dispute_reason = None;
+                            continue;
                         }
 
                         let _ = log("✅ Adversarial reviewer approved the plan", config);
@@ -2259,45 +2147,16 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 config,
             );
 
-            let implementer_prompt_timestamp = timestamp();
             if !run_agent_or_record_error(
                 config,
                 &config.implementer,
-                &decomposition_revision_prompt(
-                    previous_status
-                        .reason
-                        .as_deref()
-                        .unwrap_or("Needs revision"),
-                    round,
-                    &implementer_prompt_timestamp,
-                    &paths,
-                ),
+                &decomposition_revision_prompt(&paths),
                 Some(round),
                 AgentRole::Implementer,
                 "decompose",
                 "revision",
             ) {
                 return false;
-            }
-
-            let impl_revision_status = read_status(config);
-            if impl_revision_status.status != Status::Error
-                && is_status_stale(&implementer_prompt_timestamp, &impl_revision_status)
-            {
-                let _ = log(
-                    "⚠️ Stale status detected after decomposition implementer revision — writing NeedsRevision fallback",
-                    config,
-                );
-                warn_on_status_write(
-                    "NEEDS_REVISION",
-                    StatusPatch {
-                        status: Some(Status::NeedsRevision),
-                        round: Some(round),
-                        reason: Some(STALE_TIMESTAMP_REASON.to_string()),
-                        ..StatusPatch::default()
-                    },
-                    config,
-                );
             }
         }
 

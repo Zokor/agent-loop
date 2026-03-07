@@ -4,6 +4,13 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-03-07
+
+### Changed
+- Planning and task-decomposition revision loops now keep artifact ownership with the implementer: reviewers record findings in `review.md`, then implementers revise `plan.md` or `tasks.md` from that review instead of reviewers rewriting those files directly.
+- Planning and decomposition revision prompts were simplified to remove stale signoff/status handoff from implementer revision steps.
+- README workflow documentation now explicitly describes the reviewer re-review loop for plan, tasks, and implementation phases.
+
 ## [0.1.8] - 2026-03-06
 
 ### Fixed
