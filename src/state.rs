@@ -955,15 +955,20 @@ pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()
     write_state_file(FINDINGS_FILENAME, &serialized, config)
 }
 
-/// Check if review text ends with "no findings" (case-insensitive).
-/// This is the simplified planning verdict: if the reviewer's review ends
-/// with "no findings", the plan is approved.
+/// Check if review text ends with a standalone "no findings" line (case-insensitive).
+/// This is the simplified planning verdict: if the reviewer's last non-empty
+/// line is exactly "no findings", the plan is approved.
+/// A line like "I cannot say no findings" will NOT match.
 pub fn review_has_no_findings(review_text: &str) -> bool {
-    let trimmed = review_text.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    trimmed.to_lowercase().ends_with("no findings")
+    review_text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .is_some_and(|last| {
+            let stripped = last.trim_end_matches(|c: char| matches!(c, '.' | '!' | ':' | ';'));
+            stripped.eq_ignore_ascii_case("no findings")
+        })
 }
 
 pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {

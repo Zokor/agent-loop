@@ -106,6 +106,8 @@ struct PlanArgs {
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
     #[arg(long)]
+    resume: bool,
+    #[arg(long)]
     single_agent: bool,
 }
 
@@ -352,7 +354,7 @@ fn print_help_message() -> Result<(), AgentLoopError> {
 
 fn environment_help() -> String {
     format!(
-        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nRound limits: 0 = unlimited (timeout and stuck detection remain active).\nImplementation review gates:\n  - single-agent: reviewer gate only\n  - dual-agent: reviewer gate (same-context) -> reviewer gate (fresh-context) -> implementer signoff\n  REVIEW_MAX_ROUNDS applies to the full implementation loop across all gates.\n\nEnvironment variables:\n  REVIEW_MAX_ROUNDS     (default: {DEFAULT_REVIEW_MAX_ROUNDS})   Max implementation/review rounds (0 = unlimited)\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds (0 = unlimited)\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds (0 = unlimited)\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_ENABLED     (default: 1)    Master switch for decisions subsystem (0 disables all decisions)\n  DECISIONS_AUTO_REFERENCE (default: 1) Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  DIFF_MAX_LINES        (default: {DEFAULT_DIFF_MAX_LINES})  Max diff lines before truncation\n  CONTEXT_LINE_CAP      (default: 0)    Max lines for project context (0 = unlimited)\n  PLANNING_CONTEXT_EXCERPT_LINES (default: 0) Max lines per file excerpt in planning (0 = unlimited)\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  VERBOSE               (default: 0)    Enable verbose logging when truthy\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n  PLANNING_ADVERSARIAL_REVIEW (default: 1) Adversarial second review of plans (dual-agent only)\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 1)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 1)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\n  Observability:\n  TRANSCRIPT_ENABLED    (default: 0)    Write human-readable agent I/O transcript to .agent-loop/state/transcript.log\n\nMigration note: max_rounds / MAX_ROUNDS has been renamed to review_max_rounds / REVIEW_MAX_ROUNDS.\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>           Planning only\n  agent-loop plan --file <path>    Planning only from file\n  agent-loop plan --resume         Resume planning from existing plan.md\n  agent-loop tasks                 Decompose only\n  agent-loop tasks --resume        Resume decomposition\n  agent-loop implement             Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task  Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>  Implement one inline task\n  agent-loop implement --file <p>  Implement one task from file\n  agent-loop implement --resume    Resume implementation\n  agent-loop reset                 Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init           Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nRound limits: 0 = unlimited (timeout and stuck detection remain active).\nImplementation review gates:\n  - single-agent: reviewer gate only\n  - dual-agent: reviewer gate (same-context) -> reviewer gate (fresh-context) -> implementer signoff\n  REVIEW_MAX_ROUNDS applies to the full implementation loop across all gates.\n\nEnvironment variables:\n  REVIEW_MAX_ROUNDS     (default: {DEFAULT_REVIEW_MAX_ROUNDS})   Max implementation/review rounds (0 = unlimited)\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds (0 = unlimited)\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds (0 = unlimited)\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_ENABLED     (default: 1)    Master switch for decisions subsystem (0 disables all decisions)\n  DECISIONS_AUTO_REFERENCE (default: 1) Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  DIFF_MAX_LINES        (default: {DEFAULT_DIFF_MAX_LINES})  Max diff lines before truncation\n  CONTEXT_LINE_CAP      (default: 0)    Max lines for project context (0 = unlimited)\n  PLANNING_CONTEXT_EXCERPT_LINES (default: 0) Max lines per file excerpt in planning (0 = unlimited)\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  VERBOSE               (default: 0)    Enable verbose logging when truthy\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n  PLANNING_ADVERSARIAL_REVIEW (default: 1) Adversarial second review of plans (dual-agent only)\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 1)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 1)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\n  Observability:\n  TRANSCRIPT_ENABLED    (default: 0)    Write human-readable agent I/O transcript to .agent-loop/state/transcript.log\n\nMigration note: max_rounds / MAX_ROUNDS has been renamed to review_max_rounds / REVIEW_MAX_ROUNDS.\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
@@ -683,6 +685,46 @@ fn resume_for_tasks(
 }
 
 fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
+    let started = Instant::now();
+
+    if args.resume {
+        let project_dir = current_project_dir()?;
+        let state_dir = project_dir.join(".agent-loop").join("state");
+        ensure_resume_state_dir_exists(&state_dir)?;
+        let config = Config::from_cli(project_dir, args.single_agent, false)?;
+        let workflow = state::read_workflow(&config);
+        if workflow != Some(state::WorkflowKind::Plan) {
+            return Err(AgentLoopError::State(
+                "Cannot resume planning: workflow is not 'plan'.".to_string(),
+            ));
+        }
+        let plan_content = state::read_state_file("plan.md", &config);
+        if plan_content.trim().is_empty() {
+            return Err(AgentLoopError::State(
+                "Cannot resume planning: plan.md is empty.".to_string(),
+            ));
+        }
+
+        let planned = phases::planning_phase_resume(&config);
+        let exit_code = phase_success_to_exit_code(planned);
+        if planned {
+            phases::print_summary(&config);
+        }
+        println!("Elapsed: {}", format_duration_ms(started.elapsed().as_millis() as u64));
+
+        if exit_code != 0 {
+            let final_status = state::read_status(&config);
+            if final_status.status == state::Status::Interrupted {
+                return Err(AgentLoopError::Interrupted(
+                    final_status
+                        .reason
+                        .unwrap_or_else(|| "Interrupted by signal".to_string()),
+                ));
+            }
+        }
+        return Ok(exit_code);
+    }
+
     let task = resolve_task_for_plan(&args)?;
     let project_dir = current_project_dir()?;
     let config = Config::from_cli(project_dir, args.single_agent, false)?;
@@ -707,6 +749,8 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
     if planned {
         phases::print_summary(&config);
     }
+
+    println!("Elapsed: {}", format_duration_ms(started.elapsed().as_millis() as u64));
 
     persist_last_run_task(task.as_str(), &config)?;
 
@@ -994,6 +1038,7 @@ fn implementation_resume_with_review_max_rounds(
     single_agent: bool,
     review_max_rounds_override: Option<u32>,
 ) -> Result<i32, AgentLoopError> {
+    let started = Instant::now();
     let project_dir = current_project_dir()?;
     let state_dir = project_dir.join(".agent-loop").join("state");
     ensure_resume_state_dir_exists(&state_dir)?;
@@ -1022,6 +1067,7 @@ fn implementation_resume_with_review_max_rounds(
 
     let reached_consensus = phases::implementation_loop_resume(&config, &baseline_set);
     phases::print_summary(&config);
+    println!("Elapsed: {}", format_duration_ms(started.elapsed().as_millis() as u64));
     let exit_code = phase_success_to_exit_code(reached_consensus);
     persist_last_run_task(task.as_str(), &config)?;
 
@@ -1067,6 +1113,7 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
 }
 
 fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
+    let started = Instant::now();
     args.validate()?;
 
     let project_dir = current_project_dir()?;
@@ -1084,6 +1131,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
 
         let exit_code =
             phase_success_to_exit_code(phases::task_decomposition_phase_resume(&config));
+        println!("Elapsed: {}", format_duration_ms(started.elapsed().as_millis() as u64));
         if exit_code != 0 {
             let final_status = state::read_status(&config);
             if final_status.status == state::Status::Interrupted {
@@ -1148,6 +1196,8 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
             config.state_dir.join("tasks.md").display()
         );
     }
+
+    println!("Elapsed: {}", format_duration_ms(started.elapsed().as_millis() as u64));
 
     if exit_code != 0 {
         let final_status = state::read_status(&config);

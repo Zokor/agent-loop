@@ -1434,6 +1434,14 @@ fn print_planning_complete_summary(status: &LoopStatus, task: &str) {
 }
 
 pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
+    planning_phase_internal(config, planning_only, false)
+}
+
+pub fn planning_phase_resume(config: &Config) -> bool {
+    planning_phase_internal(config, true, true)
+}
+
+fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -> bool {
     let _ = log("━━━ Planning Phase ━━━", config);
     warn_on_status_write(
         "PLANNING",
@@ -1447,53 +1455,72 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
     let paths = phase_paths(config);
 
     let planner_agent = config.planner.clone();
-    let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
-    let _ = log("📝 Implementer proposing plan...", config);
-    let planner_output = match run_agent_with_output_or_record_error(
-        config,
-        &planner_agent,
-        &planning_initial_prompt(
-            &paths,
-            planner_plan_mode,
-        ),
-        Some(0),
-        AgentRole::Planner,
-        "plan",
-        "initial",
-    ) {
-        Some(output) => output,
-        None => return false,
-    };
+    if resume {
+        let current = read_status(config);
+        if matches!(current.status, Status::Consensus | Status::Approved) {
+            let _ = log("✅ Planning already reached consensus.", config);
+            return true;
+        }
+        let _ = log(
+            &format!("↪ Resuming planning from round {}", current.round.saturating_add(1)),
+            config,
+        );
+    } else {
+        let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
-    if planner_plan_mode {
-        if let Some(plan_text) = extract_plan_from_output_markers(&planner_output) {
-            if let Err(err) = write_state_file("plan.md", &plan_text, config) {
-                write_error_status(
+        let _ = log("📝 Implementer proposing plan...", config);
+        let planner_output = match run_agent_with_output_or_record_error(
+            config,
+            &planner_agent,
+            &planning_initial_prompt(
+                &paths,
+                planner_plan_mode,
+            ),
+            Some(0),
+            AgentRole::Planner,
+            "plan",
+            "initial",
+        ) {
+            Some(output) => output,
+            None => return false,
+        };
+
+        if planner_plan_mode {
+            if let Some(plan_text) = extract_plan_from_output_markers(&planner_output) {
+                if let Err(err) = write_state_file("plan.md", &plan_text, config) {
+                    write_error_status(
+                        config,
+                        Some(0),
+                        format!("Failed to persist plan from planner output: {err}"),
+                    );
+                    return false;
+                }
+            } else {
+                let fallback_plan = read_state_file("plan.md", config);
+                if fallback_plan.trim().is_empty() {
+                    write_error_status(
+                        config,
+                        Some(0),
+                        "Planner plan-mode output missing <plan>...</plan> block and no plan.md was produced.".to_string(),
+                    );
+                    return false;
+                }
+                let _ = log(
+                    "⚠ Planner plan-mode output missing <plan> markers; using plan.md fallback",
                     config,
-                    Some(0),
-                    format!("Failed to persist plan from planner output: {err}"),
                 );
-                return false;
             }
-        } else {
-            let fallback_plan = read_state_file("plan.md", config);
-            if fallback_plan.trim().is_empty() {
-                write_error_status(
-                    config,
-                    Some(0),
-                    "Planner plan-mode output missing <plan>...</plan> block and no plan.md was produced.".to_string(),
-                );
-                return false;
-            }
-            let _ = log(
-                "⚠ Planner plan-mode output missing <plan> markers; using plan.md fallback",
-                config,
-            );
         }
     }
 
-    let mut planning_round = 0;
+    let start_round = if resume {
+        let previous = read_status(config);
+        previous.round.saturating_add(1).max(1)
+    } else {
+        1
+    };
+    let mut planning_round = start_round.saturating_sub(1);
     let mut reached_consensus = false;
     let mut dispute_reason: Option<String> = None;
     let mut consecutive_revision_rounds: u32 = 0;
@@ -1526,6 +1553,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
             &planning_reviewer_prompt(&PlanningReviewerParams {
                 paths: &paths,
                 dispute_reason: dispute_reason.as_deref(),
+                resumed: planning_round > 1,
             }),
             Some(planning_round),
             AgentRole::Reviewer,
@@ -1604,7 +1632,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     if !run_agent_or_record_error(
                         config,
                         &config.reviewer,
-                        &planning_reviewer_fix_prompt(&paths),
+                        &planning_reviewer_fix_prompt(&paths, planning_round > 1),
                         Some(planning_round),
                         AgentRole::Reviewer,
                         "plan",
@@ -1619,7 +1647,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                     if !run_agent_or_record_error(
                         config,
                         &planner_agent,
-                        &planning_implementer_review_fix_prompt(&paths),
+                        &planning_implementer_review_fix_prompt(&paths, planning_round > 1),
                         Some(planning_round),
                         AgentRole::Implementer,
                         "plan",
@@ -1639,7 +1667,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                 if !run_agent_or_record_error(
                     config,
                     &planner_agent,
-                    &planning_implementer_revision_prompt(&paths),
+                    &planning_implementer_revision_prompt(&paths, planning_round > 1),
                     Some(planning_round),
                     AgentRole::Implementer,
                     "plan",
@@ -1700,7 +1728,7 @@ pub fn planning_phase(config: &Config, planning_only: bool) -> bool {
                             if !run_agent_or_record_error(
                                 config,
                                 &planner_agent,
-                                &planning_implementer_revision_prompt(&paths),
+                                &planning_implementer_revision_prompt(&paths, planning_round > 1),
                                 Some(planning_round),
                                 AgentRole::Implementer,
                                 "plan",
@@ -1965,7 +1993,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             if !run_agent_or_record_error(
                 config,
                 &config.implementer,
-                &decomposition_revision_prompt(&paths),
+                &decomposition_revision_prompt(&paths, round > 1),
                 Some(round),
                 AgentRole::Implementer,
                 "decompose",
@@ -1997,6 +2025,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 &reviewer_prompt_timestamp,
                 &paths,
                 &open_findings_text,
+                round > 1,
             ),
             Some(round),
             AgentRole::Reviewer,
@@ -2363,6 +2392,7 @@ where
             &implementation_implementer_prompt(
                 round,
                 &paths,
+                round > 1,
             ),
             None,
             config,
@@ -2487,6 +2517,7 @@ where
                 &reviewer_prompt_timestamp,
                 &paths,
                 config.auto_test,
+                round > 1,
             ),
             None,
             config,
@@ -3694,6 +3725,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn planning_verdict_no_findings_with_trailing_punctuation() {
+        // Trailing period — the most common variant from real runs
+        assert_eq!(
+            planning_verdict_from_review("All good.\n\nNo findings."),
+            PlanningReviewerAction::Approved,
+        );
+        assert_eq!(
+            planning_verdict_from_review("Approved.\nNo findings.\n"),
+            PlanningReviewerAction::Approved,
+        );
+        // Other trailing punctuation
+        assert_eq!(
+            planning_verdict_from_review("Done!\nno findings!"),
+            PlanningReviewerAction::Approved,
+        );
+        assert_eq!(
+            planning_verdict_from_review("no findings:"),
+            PlanningReviewerAction::Approved,
+        );
+    }
+
+    #[test]
+    fn planning_verdict_rejects_embedded_no_findings() {
+        // "no findings" must be the entire last line, not embedded in a sentence
+        assert_eq!(
+            planning_verdict_from_review("I cannot say no findings"),
+            PlanningReviewerAction::NeedsRevision,
+        );
+        assert_eq!(
+            planning_verdict_from_review("There are definitely no findings here today"),
+            PlanningReviewerAction::NeedsRevision,
+        );
+        // But a standalone last line is still accepted
+        assert_eq!(
+            planning_verdict_from_review("I reviewed everything.\nno findings"),
+            PlanningReviewerAction::Approved,
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Tasks findings reconciliation tests
     // -----------------------------------------------------------------------
@@ -4080,6 +4151,7 @@ mod tests {
             "2026-01-01T00:00:00.000Z",
             &paths,
             "",
+            false,
         );
         assert!(prompt.contains("\"status\": \"APPROVED\""));
         assert!(!prompt.contains("\"status\": \"CONSENSUS\""));
@@ -4237,6 +4309,7 @@ More text.
             "2026-01-01T00:00:00.000Z",
             &paths,
             "",
+            false,
         );
         // Should reference tasks file and have review/status instructions
         assert!(prompt.contains("/state/tasks.md"));
