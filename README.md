@@ -368,7 +368,7 @@ The planning phase uses a lightweight verdict protocol:
 - Reviewer ends their review with the exact phrase "no findings" (case-insensitive) to approve, or describes issues otherwise
 - The system checks the review text for this phrase — no JSON parsing or structured findings needed
 - Role swap: if the reviewer keeps finding issues for `planning_role_swap_after` consecutive rounds (default 3), roles swap — the reviewer fixes the plan directly and the implementer reviews
-- Progress tracked in `planning-progress.md`
+- Progress tracked in CLI-managed `planning-progress.md` (human-readable round log)
 
 ## Session Resume
 
@@ -433,6 +433,8 @@ After plan consensus, the decomposition reviewer validates the task breakdown:
 
 If the reviewer returns NEEDS_REVISION, the implementer revises `tasks.md` to address the findings, then the reviewer re-reviews. The loop continues until approved or the round limit is reached.
 
+Task decomposition findings are persisted in `tasks_findings.json` as structured state (`T-xxx` IDs plus `open`/`resolved` lifecycle fields) so resume and cross-round reconciliation can merge findings deterministically.
+
 ### Implementation Review
 
 After each implementation round, the review process uses a multi-gate system.
@@ -455,6 +457,8 @@ In single-agent mode, Gate A approval triggers auto-consensus (no further gates)
 Every Gate A approval triggers a mandatory fresh-context reviewer pass using a new session. This prevents the reviewer from rubber-stamping based on familiarity with prior rounds. Uses `F-xxx` finding IDs with severity and `file_refs` evidence.
 
 If Gate B finds issues, a **verification loop** runs: the same fresh-context reviewer re-examines each finding against the actual code and either confirms or withdraws it. If all findings are withdrawn, the review proceeds to signoff. If any are confirmed, the loop returns to the implementer.
+
+Implementation findings are persisted in `findings.json` as structured state because the loop needs stable IDs, severity, file references, and reconciliation rules. Human-readable progress stays in markdown files such as `planning-progress.md`, `log.txt`, and `conversation.md`.
 
 **Gate C — Late Findings Bounce** (dual-agent only):
 
@@ -720,19 +724,20 @@ Wave runtime:
     review.md
     status.json
     findings.json                        # implementation reviewer findings
-    planning-progress.md                 # planning phase progress log
+    planning-progress.md                 # planning phase progress log (CLI-managed)
     tasks_findings.json                  # task decomposition findings
     quality_checks.md                    # auto-test / quality check results
     workflow.txt
     log.txt
-    conversation.md                      # accumulated context (capped at 200 lines)
-    data.json                            # reserved for workflow persistence
-    task_status.json
-    task_metrics.json
-    planning-progress.md
+    conversation.md                      # implementation round summaries / recent history (capped at 200 lines)
+    data.json                            # reserved placeholder; not used by the current runtime
+    task_status.json                     # per-task lifecycle state for per-task/wave execution
+    task_metrics.json                    # per-task timing and usage metrics
     transcript.log                       # agent I/O transcript (when transcript_enabled=true)
     task-{index}/                        # per-task state dirs (wave mode)
 ```
+
+There is no `tasks-progress.md` or `implement-progress.md` in the current version. Decomposition progress is tracked through `tasks_findings.json` and `status.json`; implementation progress is tracked through `conversation.md`, `status.json`, `task_status.json`, and `task_metrics.json`.
 
 `reset` only clears `state/`; `decisions.md` is preserved.
 
