@@ -18,16 +18,14 @@ use crate::{
         implementation_implementer_prompt, implementation_reviewer_prompt, phase_paths,
         planning_adversarial_review_prompt, planning_implementer_review_fix_prompt,
         planning_implementer_revision_prompt, planning_implementer_signoff_prompt,
-        planning_initial_prompt, planning_reviewer_fix_prompt,
-        planning_reviewer_prompt,
+        planning_initial_prompt, planning_reviewer_fix_prompt, planning_reviewer_prompt,
         system_prompt_for_role,
     },
     state::{
         AgentCallMeta, FINDINGS_FILENAME, FindingEntry, FindingsFile, LoopStatus,
         QUALITY_CHECKS_FILENAME, Status, StatusPatch, TASKS_FINDINGS_FILENAME, append_decision,
-        is_status_stale, log, read_findings, read_findings_with_warnings,
-        read_state_file, read_status, summarize_task, timestamp, write_findings, write_state_file,
-        write_status,
+        is_status_stale, log, read_findings, read_findings_with_warnings, read_state_file,
+        read_status, summarize_task, timestamp, write_findings, write_state_file, write_status,
     },
     stuck::{StuckDetector, StuckSignal},
 };
@@ -1394,11 +1392,16 @@ fn format_summary_block(status: &LoopStatus) -> String {
 
     lines.push(border);
     lines.push("\n📁 State files in: .agent-loop/state/".to_string());
-    lines.push(
-        format!(
-            "   - task.md, plan.md, tasks.md, changes.md, {QUALITY_CHECKS_FILENAME}, review.md, {FINDINGS_FILENAME}, status.json, log.txt"
-        ),
-    );
+    lines.push(format!(
+        "   - Core: task.md, plan.md, tasks.md, changes.md, workflow.txt, {QUALITY_CHECKS_FILENAME}, review.md, status.json, log.txt"
+    ));
+    lines.push(format!(
+        "   - Planning: planning-progress.md, {TASKS_FINDINGS_FILENAME}"
+    ));
+    lines.push("   - Tasks: tasks-progress.md".to_string());
+    lines.push(format!(
+        "   - Implementation: implement-progress.md, conversation.md, {FINDINGS_FILENAME}, task_status.json, task_metrics.json"
+    ));
     lines.push(String::new());
 
     lines.join("\n")
@@ -1463,20 +1466,21 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
             return true;
         }
         let _ = log(
-            &format!("↪ Resuming planning from round {}", current.round.saturating_add(1)),
+            &format!(
+                "↪ Resuming planning from round {}",
+                current.round.saturating_add(1)
+            ),
             config,
         );
     } else {
-        let planner_plan_mode = planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
+        let planner_plan_mode =
+            planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
         let _ = log("📝 Implementer proposing plan...", config);
         let planner_output = match run_agent_with_output_or_record_error(
             config,
             &planner_agent,
-            &planning_initial_prompt(
-                &paths,
-                planner_plan_mode,
-            ),
+            &planning_initial_prompt(&paths, planner_plan_mode),
             Some(0),
             AgentRole::Planner,
             "plan",
@@ -1623,7 +1627,9 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                     );
                     crate::state::append_planning_progress(
                         planning_round,
-                        &format!("Role swap triggered after {consecutive_revision_rounds} consecutive revision rounds"),
+                        &format!(
+                            "Role swap triggered after {consecutive_revision_rounds} consecutive revision rounds"
+                        ),
                         config,
                     );
 
@@ -1708,14 +1714,18 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                         };
                         let adversarial_action = planning_verdict_from_review(adversarial_text);
 
-                        let adversarial_label = if adversarial_action == PlanningReviewerAction::NeedsRevision {
-                            "REVISE"
-                        } else {
-                            "APPROVED"
-                        };
+                        let adversarial_label =
+                            if adversarial_action == PlanningReviewerAction::NeedsRevision {
+                                "REVISE"
+                            } else {
+                                "APPROVED"
+                            };
                         crate::state::append_planning_progress(
                             planning_round,
-                            &format!("{} Adversarial: {adversarial_label}", PLANNING_GATE_ADVERSARIAL),
+                            &format!(
+                                "{} Adversarial: {adversarial_label}",
+                                PLANNING_GATE_ADVERSARIAL
+                            ),
                             config,
                         );
 
@@ -1892,6 +1902,29 @@ fn decomposition_start_round(config: &Config, resume: bool) -> u32 {
     previous.round.saturating_add(1).max(1)
 }
 
+fn open_tasks_findings_count(findings: &crate::state::TasksFindingsFile) -> usize {
+    findings
+        .findings
+        .iter()
+        .filter(|entry| entry.status == crate::state::TasksFindingStatus::Open)
+        .count()
+}
+
+fn decomposition_decision_label(decision: DecompositionStatusDecision) -> &'static str {
+    match decision {
+        DecompositionStatusDecision::Approved => "Approved",
+        DecompositionStatusDecision::NeedsRevision => "NeedsRevision",
+        DecompositionStatusDecision::Error => "Error",
+        DecompositionStatusDecision::ForceNeedsRevision => "ForceNeedsRevision",
+    }
+}
+
+fn append_decomposition_error_progress(config: &Config, round: u32, fallback: &str) {
+    let status = read_status(config);
+    let reason = status.reason.as_deref().unwrap_or(fallback);
+    crate::state::append_tasks_progress(round, &format!("Stopped: {reason}"), config);
+}
+
 fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     let _ = log("━━━ Task Decomposition Phase ━━━", config);
 
@@ -1901,6 +1934,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
     // Clear tasks_findings.json on fresh runs; preserve on resume.
     if !resume {
         crate::state::clear_tasks_findings(config);
+        crate::state::clear_tasks_progress(config);
     }
 
     if resume {
@@ -1943,6 +1977,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             ),
             config,
         );
+        crate::state::append_tasks_progress(
+            start_round,
+            "Max rounds reached without consensus",
+            config,
+        );
         return false;
     }
 
@@ -1955,6 +1994,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         let previous_status = read_status(config);
         if previous_status.status == Status::Error {
             write_error_status(config, Some(round), status_error_reason(&previous_status));
+            append_decomposition_error_progress(
+                config,
+                round,
+                "Decomposition stopped after an error",
+            );
             return false;
         }
 
@@ -1979,6 +2023,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 "decompose",
                 "initial",
             ) {
+                append_decomposition_error_progress(
+                    config,
+                    round,
+                    "Implementer decomposition failed",
+                );
                 return false;
             }
         } else {
@@ -1999,6 +2048,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 "decompose",
                 "revision",
             ) {
+                append_decomposition_error_progress(
+                    config,
+                    round,
+                    "Implementer decomposition revision failed",
+                );
                 return false;
             }
         }
@@ -2032,6 +2086,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             "decompose",
             "review",
         ) {
+            append_decomposition_error_progress(
+                config,
+                round,
+                "Reviewer decomposition review failed",
+            );
             return false;
         }
 
@@ -2097,6 +2156,16 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             status = read_status(config);
         }
 
+        crate::state::append_tasks_progress(
+            round,
+            &format!(
+                "Reviewer verdict: {} (open findings: {})",
+                decomposition_decision_label(reconciled_decision),
+                open_tasks_findings_count(&updated_findings)
+            ),
+            config,
+        );
+
         match reconciled_decision {
             DecompositionStatusDecision::Approved => {
                 if requires_dual_agent_signoff(config) {
@@ -2119,6 +2188,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                         "decompose",
                         "implementer-signoff",
                     ) {
+                        append_decomposition_error_progress(
+                            config,
+                            round,
+                            "Implementer signoff failed during decomposition",
+                        );
                         return false;
                     }
 
@@ -2149,14 +2223,30 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                             Some(round),
                             status_error_reason(&signoff_status),
                         );
+                        append_decomposition_error_progress(
+                            config,
+                            round,
+                            "Implementer signoff ended with an error",
+                        );
                         return false;
                     }
 
                     if signoff_status.status == Status::Consensus {
+                        crate::state::append_tasks_progress(
+                            round,
+                            "Implementer signoff: CONSENSUS",
+                            config,
+                        );
                         let _ = log("✅ Both agents agreed on task breakdown!", config);
                         print_planning_complete_summary(&signoff_status, &task);
                         return true;
                     }
+
+                    crate::state::append_tasks_progress(
+                        round,
+                        "Implementer signoff: DISPUTED",
+                        config,
+                    );
 
                     // Disputed — continue to next round with the implementer's concerns.
                     let _ = log(
@@ -2174,8 +2264,18 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     let _ = log("✅ Task breakdown approved!", config);
                     if let Err(err) = finalize_phase_consensus(config, round, None) {
                         write_error_status(config, Some(round), err.to_string());
+                        append_decomposition_error_progress(
+                            config,
+                            round,
+                            "Failed to finalize single-agent decomposition consensus",
+                        );
                         return false;
                     }
+                    crate::state::append_tasks_progress(
+                        round,
+                        "Approved (single-agent -> consensus)",
+                        config,
+                    );
                     let final_status = read_status(config);
                     print_planning_complete_summary(&final_status, &task);
                     return true;
@@ -2184,6 +2284,11 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             DecompositionStatusDecision::NeedsRevision => {}
             DecompositionStatusDecision::Error => {
                 write_error_status(config, Some(round), status_error_reason(&status));
+                append_decomposition_error_progress(
+                    config,
+                    round,
+                    "Reviewer reconciliation ended with an error",
+                );
                 return false;
             }
             DecompositionStatusDecision::ForceNeedsRevision => {
@@ -2233,6 +2338,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         ),
         config,
     );
+    crate::state::append_tasks_progress(round, "Max rounds reached without consensus", config);
 
     false
 }
@@ -2243,6 +2349,23 @@ pub fn task_decomposition_phase(config: &Config) -> bool {
 
 pub fn task_decomposition_phase_resume(config: &Config) -> bool {
     task_decomposition_phase_internal(config, true)
+}
+
+fn implementation_progress_entry(phase: &str, summary: &str) -> String {
+    let label = match phase {
+        "implementation" => "Implementation",
+        "review" => "Gate A",
+        "fresh-review" => "Gate B",
+        "gate-b-verify" => "Gate B verification",
+        "consensus" => "Consensus",
+        "gate-c-bounce" => "Gate C bounce",
+        "stuck" => "Stuck",
+        "error" => "Error",
+        "terminal" => "Terminal",
+        other => other,
+    };
+
+    format!("{label}: {}", summary.trim())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2340,6 +2463,12 @@ where
             config.review_max_rounds,
             config,
         );
+        append_history_fn(
+            config.review_max_rounds,
+            "terminal",
+            "MAX_ROUNDS — already exhausted before resume",
+            config,
+        );
         return false;
     }
 
@@ -2389,11 +2518,7 @@ where
         if let Err(err) = run_agent_fn(
             &config.implementer,
             AgentRole::Implementer,
-            &implementation_implementer_prompt(
-                round,
-                &paths,
-                round > 1,
-            ),
+            &implementation_implementer_prompt(round, &paths, round > 1),
             None,
             config,
             Some(&impl_meta),
@@ -2411,6 +2536,7 @@ where
                 config,
             );
             record_struggle_signal(&task, &err.to_string(), round, config);
+            append_history_fn(round, "error", &err.to_string(), config);
             return false;
         }
 
@@ -2454,6 +2580,7 @@ where
                         config,
                     );
                     record_struggle_signal(&task, &signal_msg, round, config);
+                    append_history_fn(round, "stuck", &format!("STUCK — {signal_msg}"), config);
                     return false;
                 }
                 StuckAction::Warn => {
@@ -2536,6 +2663,7 @@ where
                 config,
             );
             record_struggle_signal(&task, &err.to_string(), round, config);
+            append_history_fn(round, "error", &err.to_string(), config);
             return false;
         }
 
@@ -2679,6 +2807,7 @@ where
                             config,
                         );
                         record_struggle_signal(&task, &err.to_string(), round, config);
+                        append_history_fn(round, "error", &err.to_string(), config);
                         return false;
                     }
 
@@ -2827,6 +2956,7 @@ where
                                     config,
                                 );
                                 record_struggle_signal(&task, &err.to_string(), round, config);
+                                append_history_fn(round, "error", &err.to_string(), config);
                                 return false;
                             }
 
@@ -2888,6 +3018,7 @@ where
                                         config,
                                     );
                                     record_struggle_signal(&task, &reason, round, config);
+                                    append_history_fn(round, "error", &reason, config);
                                     return false;
                                 }
                             }
@@ -2905,6 +3036,7 @@ where
                                 config,
                             );
                             record_struggle_signal(&task, &reason, round, config);
+                            append_history_fn(round, "error", &reason, config);
                             return false;
                         }
                     };
@@ -2968,6 +3100,7 @@ where
                                 config,
                             );
                             record_struggle_signal(&task, &err.to_string(), round, config);
+                            append_history_fn(round, "error", &err.to_string(), config);
                             return false;
                         }
 
@@ -3086,6 +3219,7 @@ where
                                         config,
                                     );
                                     record_struggle_signal(&task, &err.to_string(), round, config);
+                                    append_history_fn(round, "error", &err.to_string(), config);
                                     return false;
                                 }
 
@@ -3181,6 +3315,7 @@ where
                                             config,
                                         );
                                         record_struggle_signal(&task, &reason, round, config);
+                                        append_history_fn(round, "error", &reason, config);
                                         return false;
                                     }
                                 }
@@ -3207,6 +3342,7 @@ where
                                     config,
                                 );
                                 record_struggle_signal(&task, &reason, round, config);
+                                append_history_fn(round, "error", &reason, config);
                                 return false;
                             }
                         }
@@ -3216,10 +3352,7 @@ where
                     // === Single-agent auto-consensus ===
                     // Same model self-reviewing adds latency without signal.
                     // After findings reconciliation, system converts APPROVED -> CONSENSUS.
-                    log_fn(
-                        "🎉 Single-agent approved — auto-consensus",
-                        config,
-                    );
+                    log_fn("🎉 Single-agent approved — auto-consensus", config);
                     write_status_fn(
                         StatusPatch {
                             status: Some(Status::Consensus),
@@ -3228,12 +3361,7 @@ where
                         },
                         config,
                     );
-                    append_history_fn(
-                        round,
-                        "consensus",
-                        "AUTO-CONSENSUS (single-agent)",
-                        config,
-                    );
+                    append_history_fn(round, "consensus", "AUTO-CONSENSUS (single-agent)", config);
                     git_checkpoint_fn(&format!("consensus-round-{round}"), config, baseline_files);
                     run_compound_phase_with_runner(
                         &paths,
@@ -3259,6 +3387,7 @@ where
                     config,
                 );
                 record_struggle_signal(&task, &reason, round, config);
+                append_history_fn(round, "error", &reason, config);
                 return false;
             }
         }
@@ -3291,6 +3420,7 @@ where
     );
     git_checkpoint_fn("max-rounds-reached", config, baseline_files);
     record_struggle_signal(&task, &issue, round, config);
+    append_history_fn(round, "terminal", &format!("MAX_ROUNDS — {issue}"), config);
     false
 }
 
@@ -3346,6 +3476,11 @@ pub fn implementation_loop(config: &Config, baseline_files: &HashSet<String>) ->
         timestamp,
         crate::state::read_recent_history,
         |round, phase, summary, current_config| {
+            crate::state::append_implement_progress(
+                round,
+                &implementation_progress_entry(phase, summary),
+                current_config,
+            );
             if let Err(err) =
                 crate::state::append_round_summary(round, phase, summary, current_config)
             {
@@ -3411,6 +3546,11 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
         timestamp,
         crate::state::read_recent_history,
         |round, phase, summary, current_config| {
+            crate::state::append_implement_progress(
+                round,
+                &implementation_progress_entry(phase, summary),
+                current_config,
+            );
             if let Err(err) =
                 crate::state::append_round_summary(round, phase, summary, current_config)
             {
@@ -4146,13 +4286,8 @@ mod tests {
         let root = create_temp_project_root("phases_decomp_approved");
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
-        let prompt = decomposition_reviewer_prompt(
-            1,
-            "2026-01-01T00:00:00.000Z",
-            &paths,
-            "",
-            false,
-        );
+        let prompt =
+            decomposition_reviewer_prompt(1, "2026-01-01T00:00:00.000Z", &paths, "", false);
         assert!(prompt.contains("\"status\": \"APPROVED\""));
         assert!(!prompt.contains("\"status\": \"CONSENSUS\""));
     }
@@ -4304,13 +4439,8 @@ More text.
         let root = create_temp_project_root("phases_decomp_findings_proto");
         let config = make_test_config(&root, TestConfigOptions::default());
         let paths = phase_paths(&config);
-        let prompt = decomposition_reviewer_prompt(
-            1,
-            "2026-01-01T00:00:00.000Z",
-            &paths,
-            "",
-            false,
-        );
+        let prompt =
+            decomposition_reviewer_prompt(1, "2026-01-01T00:00:00.000Z", &paths, "", false);
         // Should reference tasks file and have review/status instructions
         assert!(prompt.contains("/state/tasks.md"));
         assert!(prompt.contains("\"status\": \"APPROVED\""));
@@ -4392,7 +4522,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "2026-01-01T00:00:02.000Z".to_string(),
                     }
                 }
@@ -4475,7 +4605,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "Implement quality checks flow".to_string(),
                         reason: None,
-        
+
                         timestamp: "2026-01-01T00:00:00.000Z".to_string(),
                     },
                     _ => LoopStatus {
@@ -4486,7 +4616,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "Implement quality checks flow".to_string(),
                         reason: None,
-        
+
                         timestamp: "2026-01-01T00:00:00.000Z".to_string(),
                     },
                 };
@@ -4551,7 +4681,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "ts".to_string(),
                     },
                     1 => LoopStatus {
@@ -4562,7 +4692,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "ts".to_string(),
                     },
                     _ => LoopStatus {
@@ -4573,7 +4703,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "ts".to_string(),
                     },
                 };
@@ -4655,7 +4785,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "ts".to_string(),
                     }
                 } else {
@@ -4670,7 +4800,7 @@ More text.
                             "[gate:fresh-context] Open findings: F-001. See .agent-loop/state/findings.json."
                                 .to_string(),
                         ),
-        
+
                         timestamp: "ts".to_string(),
                     }
                 };
@@ -4895,7 +5025,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-    
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -4957,7 +5087,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5026,7 +5156,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-    
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5086,7 +5216,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-001".to_string()),
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5223,7 +5353,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5392,7 +5522,7 @@ More text.
                 mode: "single-agent".to_string(),
                 last_run_task: "test".to_string(),
                 reason: None,
-    
+
                 timestamp: "now".to_string(),
             },
             LoopStatus {
@@ -5449,7 +5579,7 @@ More text.
                         mode: "single-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-001".to_string()),
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5605,7 +5735,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5765,7 +5895,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("Open findings: F-042".to_string()),
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -5945,7 +6075,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6089,7 +6219,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("issues".to_string()),
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6224,7 +6354,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: None,
-        
+
                         timestamp: "now".to_string(),
                     }
                 }
@@ -6263,13 +6393,8 @@ More text.
 
         // Verify a CONSENSUS status write was made
         let writes = observed_status_writes.borrow();
-        let has_consensus = writes
-            .iter()
-            .any(|p| p.status == Some(Status::Consensus));
-        assert!(
-            has_consensus,
-            "CONSENSUS status write must be present"
-        );
+        let has_consensus = writes.iter().any(|p| p.status == Some(Status::Consensus));
+        assert!(has_consensus, "CONSENSUS status write must be present");
     }
 
     /// When signoff returns Disputed and the gate-C bounce reviewer returns
@@ -6375,7 +6500,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some("issues".to_string()),
-        
+
                         timestamp: "now".to_string(),
                     }
                 }

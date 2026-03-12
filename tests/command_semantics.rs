@@ -51,6 +51,22 @@ CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:sp
 if [ -z "$CURRENT_TS" ]; then
     CURRENT_TS="2026-02-16T00:00:00.000Z"
 fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Critically review the plan in" || printf '%s' "$ALL_ARGS" | grep -q "The plan was revised. Re-review"; then
+    printf 'no findings\n' > "$STATE_DIR/review.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the task from" && printf '%s' "$ALL_ARGS" | grep -q "propose a detailed development plan"; then
+    printf '# Plan\n- Step 1\n' > "$STATE_DIR/plan.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Revise the plan in" || printf '%s' "$ALL_ARGS" | grep -q "Directly revise the plan in"; then
+    printf '# Plan\n- Step 1\n' > "$STATE_DIR/plan.md"
+    exit 0
+fi
+
 printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
 exit 0
 "#;
@@ -84,6 +100,63 @@ exit 0
 }
 
 #[cfg(unix)]
+fn create_compound_agents(project_dir: &Path) {
+    let script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+STATE_DIR="$(pwd)/.agent-loop/state"
+mkdir -p "$STATE_DIR"
+ALL_ARGS="$*"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "propose a detailed development plan"; then
+    printf '# Plan\n- Step 1\n' > "$STATE_DIR/plan.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Critically review the plan in"; then
+    printf 'no findings\n' > "$STATE_DIR/review.md"
+    printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Break down the plan into discrete, implementable tasks"; then
+    printf '## Task 1: Implement approved plan\nDo the work.\n' > "$STATE_DIR/tasks.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the plan from" && printf '%s' "$ALL_ARGS" | grep -q "proposed tasks from"; then
+    printf 'approved\n' > "$STATE_DIR/review.md"
+    printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Implement ONLY the task"; then
+    printf 'Implemented requested work.\n' > "$STATE_DIR/changes.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the task from" && printf '%s' "$ALL_ARGS" | grep -q "changes from"; then
+    printf 'no findings\n' > "$STATE_DIR/review.md"
+    printf '{"round":1,"findings":[]}' > "$STATE_DIR/findings.json"
+    printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
+    exit 0
+fi
+
+exit 0
+"#;
+
+    create_mock_agent(project_dir, "claude", script);
+    create_mock_agent(project_dir, "codex", script);
+}
+
+#[cfg(unix)]
 fn create_dual_signoff_agents(project_dir: &Path) {
     let implementer_script = r#"#!/bin/sh
 for arg in "$@"; do
@@ -112,12 +185,17 @@ if printf '%s' "$ALL_ARGS" | grep -q "The reviewer has APPROVED the task breakdo
     exit 0
 fi
 
-if printf '%s' "$ALL_ARGS" | grep -q "Read the task below and propose a detailed development plan"; then
+if printf '%s' "$ALL_ARGS" | grep -q "A first reviewer has already approved the plan in"; then
+    printf 'no findings\n' > "$STATE_DIR/review.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the task from" && printf '%s' "$ALL_ARGS" | grep -q "propose a detailed development plan"; then
     printf '# Plan\n- Dual-agent signoff path\n' > "$STATE_DIR/plan.md"
     exit 0
 fi
 
-if printf '%s' "$ALL_ARGS" | grep -q "Both agents have agreed on the following development plan"; then
+if printf '%s' "$ALL_ARGS" | grep -q "Break down the plan into discrete, implementable tasks"; then
     printf '### Task 1: Signed Off\nDo the work.\n' > "$STATE_DIR/tasks.md"
     exit 0
 fi
@@ -140,12 +218,19 @@ if [ -z "$CURRENT_TS" ]; then
     CURRENT_TS="2026-02-16T00:00:00.000Z"
 fi
 
-if printf '%s' "$ALL_ARGS" | grep -q "Review this development plan against the original task"; then
+if printf '%s' "$ALL_ARGS" | grep -q "Critically review the plan in" || printf '%s' "$ALL_ARGS" | grep -q "The plan was revised. Re-review"; then
+    printf 'no findings\n' > "$STATE_DIR/review.md"
+    exit 0
+fi
+
+if printf '%s' "$ALL_ARGS" | grep -q "Read the plan from" && printf '%s' "$ALL_ARGS" | grep -q "proposed tasks from"; then
+    printf 'approved\n' > "$STATE_DIR/review.md"
     printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
     exit 0
 fi
 
-if printf '%s' "$ALL_ARGS" | grep -q "The implementer has broken down the agreed plan into discrete tasks"; then
+if printf '%s' "$ALL_ARGS" | grep -q "The tasks were revised. Re-review"; then
+    printf 'approved\n' > "$STATE_DIR/review.md"
     printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"codex","mode":"dual-agent","lastRunTask":"","timestamp":"%s"}' "$CURRENT_TS" > "$STATE_DIR/status.json"
     exit 0
 fi
@@ -182,6 +267,7 @@ fn plan_creates_plan_md_and_not_tasks_md() {
         )
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
+        .env("PLANNING_MAX_ROUNDS", "2")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop plan should execute");
@@ -265,6 +351,7 @@ fn plan_resets_state_dir_before_run_and_preserves_decisions() {
         )
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
+        .env("PLANNING_MAX_ROUNDS", "2")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop plan should execute");
@@ -347,6 +434,156 @@ fn implement_falls_back_to_plan_when_tasks_missing() {
 
 #[cfg(unix)]
 #[test]
+fn plan_tasks_implement_runs_all_phases_and_writes_progress_logs() {
+    let project_dir = create_project_dir("plan_tasks_implement");
+    create_compound_agents(&project_dir);
+
+    let output = Command::new(agent_loop_bin())
+        .args(["plan-tasks-implement", "ship feature", "--single-agent"])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("PLANNING_MAX_ROUNDS", "1")
+        .env("DECOMPOSITION_MAX_ROUNDS", "1")
+        .env("REVIEW_MAX_ROUNDS", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("plan-tasks-implement should execute");
+
+    assert!(
+        output.status.success(),
+        "plan-tasks-implement should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    assert!(state_dir.join("plan.md").is_file(), "plan.md should exist");
+    assert!(
+        state_dir.join("tasks.md").is_file(),
+        "tasks.md should exist"
+    );
+    assert!(
+        state_dir.join("tasks-progress.md").is_file(),
+        "tasks-progress.md should exist"
+    );
+    assert!(
+        state_dir.join("implement-progress.md").is_file(),
+        "implement-progress.md should exist"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn plan_implement_per_task_synthesizes_tasks_md() {
+    let project_dir = create_project_dir("plan_implement_per_task");
+    create_compound_agents(&project_dir);
+
+    let output = Command::new(agent_loop_bin())
+        .args([
+            "plan-implement",
+            "ship feature",
+            "--per-task",
+            "--single-agent",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("PLANNING_MAX_ROUNDS", "1")
+        .env("REVIEW_MAX_ROUNDS", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("plan-implement should execute");
+
+    assert!(
+        output.status.success(),
+        "plan-implement --per-task should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    let tasks = fs::read_to_string(state_dir.join("tasks.md")).expect("tasks.md");
+    assert!(
+        tasks.contains("## Task 1: Implement approved plan"),
+        "plan-implement should synthesize a single fallback task"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn tasks_implement_uses_external_plan_and_ignores_stale_task() {
+    let project_dir = create_project_dir("tasks_implement_external_plan");
+    create_compound_agents(&project_dir);
+
+    let state_dir = project_dir.join(".agent-loop").join("state");
+    fs::create_dir_all(&state_dir).expect("state dir should exist");
+    fs::write(state_dir.join("task.md"), "STALE TASK").expect("stale task should be written");
+
+    let external_plan = project_dir.join("external-plan.md");
+    fs::write(&external_plan, "# Plan\n- external input\n").expect("external plan");
+
+    let output = Command::new(agent_loop_bin())
+        .args([
+            "tasks-implement",
+            "--file",
+            external_plan.to_str().expect("utf8 path"),
+            "--single-agent",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                project_dir.join("bin").display()
+            ),
+        )
+        .env("AUTO_COMMIT", "0")
+        .env("TIMEOUT", "30")
+        .env("DECOMPOSITION_MAX_ROUNDS", "1")
+        .env("REVIEW_MAX_ROUNDS", "1")
+        .current_dir(&project_dir)
+        .output()
+        .expect("tasks-implement should execute");
+
+    assert!(
+        output.status.success(),
+        "tasks-implement should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let task = fs::read_to_string(state_dir.join("task.md")).expect("task.md");
+    assert!(
+        !task.contains("STALE TASK"),
+        "external plan input should not reuse stale task.md"
+    );
+    let persisted_plan = fs::read_to_string(state_dir.join("plan.md")).expect("plan.md");
+    assert!(
+        persisted_plan.contains("external input"),
+        "external plan input should drive the persisted plan context"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
 fn dual_agent_plan_requires_and_executes_implementer_signoff() {
     let project_dir = create_project_dir("dual_plan_signoff");
     create_dual_signoff_agents(&project_dir);
@@ -362,6 +599,7 @@ fn dual_agent_plan_requires_and_executes_implementer_signoff() {
         )
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
+        .env("PLANNING_MAX_ROUNDS", "2")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop plan should execute");
@@ -414,6 +652,7 @@ fn dual_agent_tasks_requires_and_executes_implementer_signoff() {
         )
         .env("AUTO_COMMIT", "0")
         .env("TIMEOUT", "30")
+        .env("DECOMPOSITION_MAX_ROUNDS", "2")
         .current_dir(&project_dir)
         .output()
         .expect("agent-loop tasks should execute");

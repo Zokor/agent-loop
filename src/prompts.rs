@@ -281,11 +281,7 @@ fn implementation_reviewer_output_block(
 }
 
 /// Shared signoff block for consensus/disputed prompts.
-fn signoff_status_block(
-    round: u32,
-    prompt_timestamp: &str,
-    paths: &PhasePaths,
-) -> String {
+fn signoff_status_block(round: u32, prompt_timestamp: &str, paths: &PhasePaths) -> String {
     format!(
         "Write to {status_json}:\n\
         If you agree: {{\"status\": \"CONSENSUS\", \"round\": {round}, \"timestamp\": \"{prompt_timestamp}\"}}\n\
@@ -328,10 +324,7 @@ pub(crate) fn system_prompt_for_role(role: AgentRole, config: &Config) -> String
     parts.join("\n\n")
 }
 
-pub(crate) fn planning_initial_prompt(
-    paths: &PhasePaths,
-    planner_plan_mode: bool,
-) -> String {
+pub(crate) fn planning_initial_prompt(paths: &PhasePaths, planner_plan_mode: bool) -> String {
     let output_instruction = if planner_plan_mode {
         "Output your plan below between <plan> and </plan> markers.".to_string()
     } else {
@@ -394,9 +387,7 @@ pub(crate) fn planning_reviewer_prompt(params: &PlanningReviewerParams<'_>) -> S
     )
 }
 
-pub(crate) fn planning_adversarial_review_prompt(
-    paths: &PhasePaths,
-) -> String {
+pub(crate) fn planning_adversarial_review_prompt(paths: &PhasePaths) -> String {
     format!(
         "A first reviewer has already approved the plan in {plan_md}. Find what they missed.\n\n\
         The original task is in {task_md}. The first review is in {review_md}.\n\
@@ -412,10 +403,7 @@ pub(crate) fn planning_adversarial_review_prompt(
     )
 }
 
-pub(crate) fn planning_implementer_revision_prompt(
-    paths: &PhasePaths,
-    resumed: bool,
-) -> String {
+pub(crate) fn planning_implementer_revision_prompt(paths: &PhasePaths, resumed: bool) -> String {
     if resumed {
         return format!(
             "Revise {plan_md} to address the findings in {review_md}.",
@@ -432,41 +420,33 @@ pub(crate) fn planning_implementer_revision_prompt(
 
 /// Prompt for the reviewer to fix the plan directly during role swap.
 /// Used when the implementer has failed to resolve issues after N consecutive rounds.
-pub(crate) fn planning_reviewer_fix_prompt(
-    paths: &PhasePaths,
-    resumed: bool,
-) -> String {
+pub(crate) fn planning_reviewer_fix_prompt(paths: &PhasePaths, resumed: bool) -> String {
     if resumed {
         return format!(
             "The implementer could not resolve the findings. \
-            Read {task_md}, {plan_md}, and {review_md}. \
-            Directly revise {plan_md2} to fix the verified issues.",
+            Read {task_md} and {review_md}. \
+            Directly revise {plan_md} to fix the verified issues.",
             task_md = path_text(&paths.task_md),
             plan_md = path_text(&paths.plan_md),
-            plan_md2 = path_text(&paths.plan_md),
             review_md = path_text(&paths.review_md),
         );
     }
     format!(
         "The implementer has been unable to resolve your review findings after multiple rounds. \
         You originally identified these issues, so you understand them best.\n\n\
-        Read the plan in {plan_md}, the task in {task_md}, and your last review in {review_md}.\n\
-        Use your tools to verify against the actual codebase, then directly revise the plan in {plan_md2} \
+        Read the task in {task_md} and your last review in {review_md}.\n\
+        Use your tools to verify against the actual codebase, then directly revise the plan in {plan_md} \
         to fix the issues.\n\n\
         Do NOT just describe what should change — actually edit the plan with correct file paths, \
         function names, and integration details verified against the real code.",
         plan_md = path_text(&paths.plan_md),
-        plan_md2 = path_text(&paths.plan_md),
         task_md = path_text(&paths.task_md),
         review_md = path_text(&paths.review_md),
     )
 }
 
 /// Prompt for the implementer to review the reviewer's fix during role swap.
-pub(crate) fn planning_implementer_review_fix_prompt(
-    paths: &PhasePaths,
-    resumed: bool,
-) -> String {
+pub(crate) fn planning_implementer_review_fix_prompt(paths: &PhasePaths, resumed: bool) -> String {
     if resumed {
         return format!(
             "The reviewer directly revised {plan_md}. \
@@ -507,10 +487,7 @@ pub(crate) fn decomposition_initial_prompt(paths: &PhasePaths) -> String {
     )
 }
 
-pub(crate) fn decomposition_revision_prompt(
-    paths: &PhasePaths,
-    resumed: bool,
-) -> String {
+pub(crate) fn decomposition_revision_prompt(paths: &PhasePaths, resumed: bool) -> String {
     if resumed {
         return format!(
             "Revise {tasks_md} to address the findings in {review_md}.\n\
@@ -1127,8 +1104,14 @@ mod tests {
             resumed: false,
         });
 
-        assert!(prompt.contains("/state/task.md"), "should reference task file");
-        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
+        assert!(
+            prompt.contains("/state/task.md"),
+            "should reference task file"
+        );
+        assert!(
+            prompt.contains("/state/plan.md"),
+            "should reference plan file"
+        );
     }
 
     #[test]
@@ -1150,7 +1133,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn decomposition_initial_prompt_references_files() {
         let paths = test_phase_paths();
@@ -1163,12 +1145,7 @@ mod tests {
     #[test]
     fn implementation_consensus_prompt_references_files_and_statuses() {
         let paths = test_phase_paths();
-        let prompt = implementation_consensus_prompt(
-            "",
-            2,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-        );
+        let prompt = implementation_consensus_prompt("", 2, "2026-02-15T00:00:00.000Z", &paths);
 
         assert!(prompt.contains("Review the implementation"));
         assert!(prompt.contains("/state/task.md"));
@@ -1196,26 +1173,42 @@ mod tests {
             resumed: false,
         });
 
-        assert!(prompt.contains("/state/task.md"), "should reference task file");
-        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
-        assert!(prompt.contains("no findings"), "should contain 'no findings' instruction");
+        assert!(
+            prompt.contains("/state/task.md"),
+            "should reference task file"
+        );
+        assert!(
+            prompt.contains("/state/plan.md"),
+            "should reference plan file"
+        );
+        assert!(
+            prompt.contains("no findings"),
+            "should contain 'no findings' instruction"
+        );
     }
 
     #[test]
     fn implementation_reviewer_prompt_references_files() {
         let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            false,
-            false,
-        );
+        let prompt =
+            implementation_reviewer_prompt(1, "2026-02-15T00:00:00.000Z", &paths, false, false);
 
-        assert!(prompt.contains("/state/task.md"), "should reference task file");
-        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
-        assert!(prompt.contains("/state/changes.md"), "should reference changes file");
-        assert!(prompt.contains("/state/review.md"), "should reference review file");
+        assert!(
+            prompt.contains("/state/task.md"),
+            "should reference task file"
+        );
+        assert!(
+            prompt.contains("/state/plan.md"),
+            "should reference plan file"
+        );
+        assert!(
+            prompt.contains("/state/changes.md"),
+            "should reference changes file"
+        );
+        assert!(
+            prompt.contains("/state/review.md"),
+            "should reference review file"
+        );
     }
 
     #[test]
@@ -1231,8 +1224,14 @@ mod tests {
             prompt.contains("do not implement unrelated plan items"),
             "implementer prompt should explicitly forbid unrelated plan work"
         );
-        assert!(prompt.contains("/state/task.md"), "should reference task file");
-        assert!(prompt.contains("/state/plan.md"), "should reference plan file");
+        assert!(
+            prompt.contains("/state/task.md"),
+            "should reference task file"
+        );
+        assert!(
+            prompt.contains("/state/plan.md"),
+            "should reference plan file"
+        );
     }
 
     #[test]
@@ -1261,13 +1260,8 @@ mod tests {
     #[test]
     fn implementation_reviewer_prompt_preserves_json_status_format() {
         let paths = test_phase_paths();
-        let prompt = implementation_reviewer_prompt(
-            1,
-            "2026-02-15T00:00:00.000Z",
-            &paths,
-            false,
-            false,
-        );
+        let prompt =
+            implementation_reviewer_prompt(1, "2026-02-15T00:00:00.000Z", &paths, false, false);
 
         assert!(
             prompt.contains("\"status\": \"APPROVED\""),
@@ -1541,11 +1535,7 @@ mod tests {
     fn gate_b_verification_prompt_references_files_and_status_templates() {
         let paths = test_phase_paths();
 
-        let prompt = implementation_gate_b_verification_prompt(
-            3,
-            "2025-01-01T00:00:00Z",
-            &paths,
-        );
+        let prompt = implementation_gate_b_verification_prompt(3, "2025-01-01T00:00:00Z", &paths);
 
         assert!(
             prompt.contains("Re-examine each finding"),
@@ -1600,12 +1590,8 @@ mod tests {
     #[test]
     fn fresh_context_reviewer_prompt_includes_independent_verification() {
         let paths = test_phase_paths();
-        let prompt = implementation_fresh_context_reviewer_prompt(
-            1,
-            "2025-01-01T00:00:00Z",
-            &paths,
-            false,
-        );
+        let prompt =
+            implementation_fresh_context_reviewer_prompt(1, "2025-01-01T00:00:00Z", &paths, false);
         assert!(
             prompt.contains("Review the implementation"),
             "fresh context reviewer prompt must include review instruction"
@@ -1685,8 +1671,8 @@ mod tests {
             2,
             "2026-02-15T00:00:00.000Z",
             &paths,
-            true,  // auto_test enabled
-            true,  // resumed
+            true, // auto_test enabled
+            true, // resumed
         );
 
         assert!(
@@ -1707,7 +1693,7 @@ mod tests {
             "2026-02-15T00:00:00.000Z",
             &paths,
             false,
-            true,  // resumed
+            true, // resumed
         );
 
         assert!(
@@ -1748,9 +1734,8 @@ mod tests {
         );
 
         // Implementation reviewer resumed must reference task, plan, and changes
-        let rev_prompt = implementation_reviewer_prompt(
-            2, "2026-01-01T00:00:00.000Z", &paths, false, true,
-        );
+        let rev_prompt =
+            implementation_reviewer_prompt(2, "2026-01-01T00:00:00.000Z", &paths, false, true);
         assert!(
             rev_prompt.contains("task.md"),
             "resumed reviewer must reference task.md"
@@ -1780,19 +1765,44 @@ mod tests {
 
         // Planning reviewer fix resumed must reference task.md, plan.md, and review.md
         let fix_prompt = planning_reviewer_fix_prompt(&paths, true);
-        assert!(fix_prompt.contains("task.md"), "resumed reviewer fix must reference task.md");
-        assert!(fix_prompt.contains("plan.md"), "resumed reviewer fix must reference plan.md");
-        assert!(fix_prompt.contains("review.md"), "resumed reviewer fix must reference review.md");
+        assert!(
+            fix_prompt.contains("task.md"),
+            "resumed reviewer fix must reference task.md"
+        );
+        assert!(
+            fix_prompt.contains("plan.md"),
+            "resumed reviewer fix must reference plan.md"
+        );
+        assert!(
+            fix_prompt.contains("review.md"),
+            "resumed reviewer fix must reference review.md"
+        );
 
         // Planning implementer review fix resumed must reference task.md
         let review_fix = planning_implementer_review_fix_prompt(&paths, true);
-        assert!(review_fix.contains("task.md"), "resumed implementer review fix must reference task.md");
-        assert!(review_fix.contains("plan.md"), "resumed implementer review fix must reference plan.md");
+        assert!(
+            review_fix.contains("task.md"),
+            "resumed implementer review fix must reference task.md"
+        );
+        assert!(
+            review_fix.contains("plan.md"),
+            "resumed implementer review fix must reference plan.md"
+        );
 
         // Decomposition reviewer resumed must reference plan.md and task.md
-        let decomp_review = decomposition_reviewer_prompt(2, "2026-01-01T00:00:00.000Z", &paths, "", true);
-        assert!(decomp_review.contains("plan.md"), "resumed decomposition reviewer must reference plan.md");
-        assert!(decomp_review.contains("task.md"), "resumed decomposition reviewer must reference task.md");
-        assert!(decomp_review.contains("tasks.md"), "resumed decomposition reviewer must reference tasks.md");
+        let decomp_review =
+            decomposition_reviewer_prompt(2, "2026-01-01T00:00:00.000Z", &paths, "", true);
+        assert!(
+            decomp_review.contains("plan.md"),
+            "resumed decomposition reviewer must reference plan.md"
+        );
+        assert!(
+            decomp_review.contains("task.md"),
+            "resumed decomposition reviewer must reference task.md"
+        );
+        assert!(
+            decomp_review.contains("tasks.md"),
+            "resumed decomposition reviewer must reference tasks.md"
+        );
     }
 }

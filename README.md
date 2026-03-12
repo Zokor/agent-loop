@@ -6,6 +6,8 @@
 2. `tasks`: decompose the plan into implementable tasks only
 3. `implement`: execute implementation work only
 
+It also supports compound flows for `plan -> tasks -> implement`, `plan -> implement`, and `tasks -> implement`.
+
 It persists session state under `.agent-loop/`, captures reusable decisions in `decisions.md`, and can run an optional post-consensus compound learning phase.
 
 ## Supported Agents
@@ -130,6 +132,44 @@ If both `tasks.md` and `plan.md` are unavailable in plain batch mode, it errors 
 No tasks found and no plan found. Run 'agent-loop plan' first, or generate tasks with 'agent-loop tasks'.
 ```
 
+### `plan-tasks-implement`
+
+Run planning, decomposition, and implementation in one command.
+
+```bash
+agent-loop plan-tasks-implement "ship feature"
+agent-loop plan-tasks-implement --file task.md
+agent-loop plan-tasks-implement --resume
+agent-loop plan-tasks-implement "ship feature" --wave --max-parallel 4
+```
+
+The resolved implementation mode is persisted before planning starts, so a later `--resume` from `plan` or `tasks` state keeps the original batch / per-task / wave intent.
+
+### `plan-implement`
+
+Run planning and then implementation, skipping decomposition.
+
+```bash
+agent-loop plan-implement "ship feature"
+agent-loop plan-implement "ship feature" --per-task
+agent-loop plan-implement "ship feature" --wave
+agent-loop plan-implement --resume
+```
+
+`plan-implement` accepts the full implement-mode flag surface. In non-batch mode it synthesizes and persists a single-task `tasks.md` so the existing per-task and wave execution paths can be reused.
+
+### `tasks-implement`
+
+Run decomposition and then implementation from an existing or external `plan.md`.
+
+```bash
+agent-loop tasks-implement
+agent-loop tasks-implement --file plan.md
+agent-loop tasks-implement --resume
+```
+
+Fresh runs load `.agent-loop/state/plan.md` unless `--file` is provided. When `--file` is used, persisted `task.md` is ignored and replacement task context is derived from the supplied plan instead. Fresh runs clear the previous state tree after loading the inputs they need to preserve.
+
 ### `reset`
 
 Clear `.agent-loop/state/` and recreate it empty.
@@ -179,6 +219,8 @@ The following subcommands have been removed. Using them produces a parse error:
 
 ```text
 plan  ->  tasks  ->  implement
+plan  ->  implement
+tasks ->  implement
 ```
 
 Revision loop (plan, tasks, and implement):
@@ -368,7 +410,7 @@ The planning phase uses a lightweight verdict protocol:
 - Reviewer ends their review with the exact phrase "no findings" (case-insensitive) to approve, or describes issues otherwise
 - The system checks the review text for this phrase — no JSON parsing or structured findings needed
 - Role swap: if the reviewer keeps finding issues for `planning_role_swap_after` consecutive rounds (default 3), roles swap — the reviewer fixes the plan directly and the implementer reviews
-- Progress tracked in CLI-managed `planning-progress.md` (human-readable round log)
+- Progress tracked in CLI-managed `planning-progress.md`, `tasks-progress.md`, and `implement-progress.md`
 
 ## Session Resume
 
@@ -387,7 +429,7 @@ codex_session_persistence = true
 
 ### Resume Behavior
 
-`agent-loop implement --resume` (non-wave) validates that workflow is `implement` and resumes the implementation loop from `status.json`. If the previous status is already `CONSENSUS`, it logs success and returns immediately. The starting round is calculated from the previous status (`previous_round + 1`).
+`agent-loop implement --resume` validates that workflow is `implement`, reads persisted implementation mode when available, and resumes the correct implementation path. Direct user-facing per-task implementation resume remains unsupported once the workflow is already in `implement`.
 
 `agent-loop implement --wave --resume` uses wave resume semantics from `task_status.json` (completed tasks are kept; remaining tasks continue).
 
@@ -458,7 +500,7 @@ Every Gate A approval triggers a mandatory fresh-context reviewer pass using a n
 
 If Gate B finds issues, a **verification loop** runs: the same fresh-context reviewer re-examines each finding against the actual code and either confirms or withdraws it. If all findings are withdrawn, the review proceeds to signoff. If any are confirmed, the loop returns to the implementer.
 
-Implementation findings are persisted in `findings.json` as structured state because the loop needs stable IDs, severity, file references, and reconciliation rules. Human-readable progress stays in markdown files such as `planning-progress.md`, `log.txt`, and `conversation.md`.
+Implementation findings are persisted in `findings.json` as structured state because the loop needs stable IDs, severity, file references, and reconciliation rules. Human-readable progress stays in markdown files such as `planning-progress.md`, `tasks-progress.md`, `implement-progress.md`, `log.txt`, and `conversation.md`.
 
 **Gate C — Late Findings Bounce** (dual-agent only):
 
@@ -725,6 +767,8 @@ Wave runtime:
     status.json
     findings.json                        # implementation reviewer findings
     planning-progress.md                 # planning phase progress log (CLI-managed)
+    tasks-progress.md                    # task decomposition progress log (CLI-managed)
+    implement-progress.md                # canonical implementation progress log
     tasks_findings.json                  # task decomposition findings
     quality_checks.md                    # auto-test / quality check results
     workflow.txt
@@ -737,7 +781,11 @@ Wave runtime:
     task-{index}/                        # per-task state dirs (wave mode)
 ```
 
-There is no `tasks-progress.md` or `implement-progress.md` in the current version. Decomposition progress is tracked through `tasks_findings.json` and `status.json`; implementation progress is tracked through `conversation.md`, `status.json`, `task_status.json`, and `task_metrics.json`.
+`implement-progress.md` is canonical in the active implementation state directory:
+- batch and sequential per-task runs use `.agent-loop/state/implement-progress.md`
+- wave runs use `.agent-loop/state/task-{index}/implement-progress.md`
+
+`status` reads `workflow.txt`, prints phase-specific resume guidance, and surfaces task-local wave progress files when they exist.
 
 `reset` only clears `state/`; `decisions.md` is preserved.
 

@@ -93,6 +93,36 @@ exit 0
 }
 
 #[cfg(unix)]
+fn create_prompt_path_succeeding_agents(project_dir: &Path) {
+    let script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+ALL_ARGS="$*"
+TASK_FILE_PATH=$(printf '%s' "$ALL_ARGS" | grep -o '/[^"[:space:]]*\.agent-loop/state[^"[:space:]]*/task\.md' | head -n1)
+if [ -n "$TASK_FILE_PATH" ]; then
+    STATE_DIR=$(dirname "$TASK_FILE_PATH")
+else
+    STATE_DIR="$(pwd)/.agent-loop/state"
+fi
+mkdir -p "$STATE_DIR"
+STATUS_FILE="$STATE_DIR/status.json"
+FINDINGS_FILE="$STATE_DIR/findings.json"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+printf '{"round":1,"findings":[]}' > "$FINDINGS_FILE"
+printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}' "$CURRENT_TS" > "$STATUS_FILE"
+exit 0
+"#;
+    create_mock_agent(project_dir, "claude", script);
+    create_mock_agent(project_dir, "codex", script);
+}
+
+#[cfg(unix)]
 fn create_agent_succeeds_on_nth(project_dir: &Path, succeed_on: u32) {
     let claude_script = format!(
         r#"#!/bin/sh
@@ -311,6 +341,41 @@ fn implement_per_task_clears_implementation_sessions_between_tasks() {
     assert!(
         !leak_marker.exists(),
         "per-task mode should not pass --resume into a new task's first round"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_per_task_progress_keeps_task_boundaries() {
+    let project_dir = create_project_dir("per_task_progress_boundaries");
+    create_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Setup\nA\n\n### Task 2: Ship\nB\n",
+    );
+
+    let output = run_implement_cmd(&project_dir, &["--per-task"]);
+    assert!(
+        output.status.success(),
+        "implement should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let progress = read_state_file(&project_dir, "implement-progress.md");
+    assert_eq!(
+        progress.matches("### Task: ").count(),
+        2,
+        "each task should get its own progress heading: {progress}"
+    );
+    assert_eq!(
+        progress.matches("## Round 1").count(),
+        2,
+        "same-numbered rounds from different tasks should not merge: {progress}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);
@@ -572,7 +637,17 @@ fn implement_wave_resume_routes_to_wave_mode_without_resume_state() {
     let project_dir = create_project_dir("wave_resume_routes_to_wave_mode");
     create_succeeding_agents(&project_dir);
 
-    write_state_file(&project_dir, "tasks.md", "### Task 1: Wave resume route\nA\n");
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Wave resume route\nA\n",
+    );
+    write_state_file(&project_dir, "workflow.txt", "implement\n");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"resume needed","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
 
     let output = run_implement_cmd(&project_dir, &["--wave", "--resume"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -585,6 +660,79 @@ fn implement_wave_resume_routes_to_wave_mode_without_resume_state() {
     assert!(
         !stderr.contains("Cannot resume:"),
         "--wave --resume should not use generic resume preconditions: stderr={stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_wave_resume_preserves_task_local_progress_history() {
+    let project_dir = create_project_dir("wave_resume_progress_history");
+    create_prompt_path_succeeding_agents(&project_dir);
+
+    write_state_file(
+        &project_dir,
+        "tasks.md",
+        "### Task 1: Preserve progress\nA\n",
+    );
+    write_state_file(&project_dir, "workflow.txt", "implement\n");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"resume needed","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+    write_state_file(&project_dir, "implement-mode.txt", "wave\n");
+
+    let task_state_dir = project_dir.join(".agent-loop").join("state").join("task-1");
+    fs::create_dir_all(&task_state_dir).expect("task state dir should exist");
+    fs::write(
+        task_state_dir.join("implement-progress.md"),
+        "## Round 1\nPrevious attempt\n",
+    )
+    .expect("progress seed should be written");
+
+    let _output = run_implement_cmd(&project_dir, &["--resume"]);
+
+    let progress = fs::read_to_string(task_state_dir.join("implement-progress.md"))
+        .expect("task progress should exist");
+    assert!(
+        progress.contains("Previous attempt"),
+        "resumed wave task should preserve prior task-local progress: {progress}"
+    );
+    assert!(
+        progress.contains("Implementation:"),
+        "resumed wave task should append new progress entries: {progress}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn implement_resume_uses_persisted_wave_flags() {
+    let project_dir = create_project_dir("resume_persisted_wave_flags");
+    create_prompt_path_succeeding_agents(&project_dir);
+
+    write_state_file(&project_dir, "tasks.md", "### Task 1: Persist flags\nA\n");
+    write_state_file(&project_dir, "workflow.txt", "implement\n");
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"NEEDS_CHANGES","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","reason":"resume needed","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+    write_state_file(&project_dir, "implement-mode.txt", "wave\n");
+    write_state_file(
+        &project_dir,
+        "implement-flags.json",
+        r#"{"per_task":false,"wave":true,"max_retries":2,"round_step":2,"continue_on_fail":false,"fail_fast":false,"max_parallel":4}"#,
+    );
+
+    let output = run_implement_cmd(&project_dir, &["--resume"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("max_parallel=4"),
+        "resume should reuse persisted wave max_parallel: stdout={stdout}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);

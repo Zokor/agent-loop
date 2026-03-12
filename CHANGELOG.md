@@ -4,6 +4,26 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-03-11
+
+### Fixed
+- `planning_reviewer_fix_prompt` no longer redundantly lists `plan.md` in the read list; the edit target reference is sufficient.
+
+## [0.1.10] - 2026-03-11
+
+### Added
+- Compound workflow commands: `plan-tasks-implement`, `plan-implement`, and `tasks-implement`.
+- CLI-managed `tasks-progress.md` and canonical `implement-progress.md` progress logs, including task-local wave progress files.
+
+### Changed
+- Persisted implementation mode and flags before compound runs so `--resume` returns to the original batch, per-task, or wave path with the saved wave settings.
+- Dual-agent planning and task decomposition now require explicit implementer signoff before reaching consensus.
+- `status` and CLI help now surface phase-specific resume guidance and the active progress log locations.
+
+### Fixed
+- `tasks-implement --file` now replaces stale task state with the supplied plan before decomposition and implementation.
+- Non-wave `implement --resume` no longer rewrites `task.md` via the plan fallback path, and resumed wave runs preserve prior task-local `implement-progress.md` history.
+
 ## [0.1.9] - 2026-03-07
 
 ### Changed

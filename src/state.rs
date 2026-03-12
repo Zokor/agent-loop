@@ -983,6 +983,138 @@ pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {
     }
 }
 
+const IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX: &str = "### Task: ";
+
+fn last_progress_round(content: &str) -> Option<u32> {
+    for line in content.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX) {
+            return None;
+        }
+        if let Some(round) = trimmed
+            .strip_prefix("## Round ")
+            .and_then(|value| value.parse::<u32>().ok())
+        {
+            return Some(round);
+        }
+    }
+    None
+}
+
+fn append_round_progress(path: &Path, round: u32, summary: &str) -> io::Result<()> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+
+    let heading = format!("## Round {round}");
+    let mut updated = if existing.trim().is_empty() {
+        format!("{heading}\n{summary}\n")
+    } else if last_progress_round(&existing) == Some(round) {
+        let mut content = existing;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(summary);
+        content.push('\n');
+        content
+    } else {
+        let mut content = existing;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+        content.push_str(&heading);
+        content.push('\n');
+        content.push_str(summary);
+        content.push('\n');
+        content
+    };
+
+    // Keep files tidy when the previous contents were whitespace-only.
+    if updated.starts_with('\n') {
+        updated = updated.trim_start_matches('\n').to_string();
+    }
+
+    fs::write(path, updated)
+}
+
+fn clear_progress_file(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, "")
+}
+
+fn append_progress_heading(path: &Path, heading: &str) -> io::Result<()> {
+    let heading = heading.trim();
+    if heading.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let existing = match fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err),
+    };
+
+    let mut updated = existing;
+    if !updated.trim().is_empty() {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        if !updated.ends_with("\n\n") {
+            updated.push('\n');
+        }
+    }
+    updated.push_str(heading);
+    updated.push('\n');
+
+    fs::write(path, updated)
+}
+
+pub fn append_tasks_progress(round: u32, summary: &str, config: &Config) {
+    let path = config.state_dir.join("tasks-progress.md");
+    let _ = append_round_progress(&path, round, summary);
+}
+
+pub fn clear_tasks_progress(config: &Config) {
+    let path = config.state_dir.join("tasks-progress.md");
+    let _ = clear_progress_file(&path);
+}
+
+pub fn append_implement_progress(round: u32, summary: &str, config: &Config) {
+    let path = config.state_dir.join("implement-progress.md");
+    let _ = append_round_progress(&path, round, summary);
+}
+
+pub fn append_implement_progress_task(task_title: &str, config: &Config) {
+    let path = config.state_dir.join("implement-progress.md");
+    let heading = format!("{IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX}{task_title}");
+    let _ = append_progress_heading(&path, &heading);
+}
+
+pub fn clear_implement_progress(config: &Config) {
+    let path = config.state_dir.join("implement-progress.md");
+    let _ = clear_progress_file(&path);
+}
+
 // ---------------------------------------------------------------------------
 // Tasks (decomposition) findings (tasks_findings.json)
 // ---------------------------------------------------------------------------
@@ -2091,6 +2223,79 @@ mod tests {
             line.len()
         );
         assert!(line.ends_with("..."));
+    }
+
+    #[test]
+    fn append_tasks_progress_groups_same_round_entries() {
+        let project = new_project();
+
+        append_tasks_progress(1, "Reviewer verdict: APPROVED", &project.config);
+        append_tasks_progress(1, "Implementer signoff: CONSENSUS", &project.config);
+        append_tasks_progress(2, "Reviewer verdict: NEEDS_REVISION", &project.config);
+
+        let path = project.config.state_dir.join("tasks-progress.md");
+        let content = fs::read_to_string(path).expect("tasks-progress.md should exist");
+        assert_eq!(
+            content,
+            "## Round 1\nReviewer verdict: APPROVED\nImplementer signoff: CONSENSUS\n\n## Round 2\nReviewer verdict: NEEDS_REVISION\n"
+        );
+    }
+
+    #[test]
+    fn clear_tasks_progress_truncates_existing_content() {
+        let project = new_project();
+
+        append_tasks_progress(1, "Initial", &project.config);
+        clear_tasks_progress(&project.config);
+
+        let path = project.config.state_dir.join("tasks-progress.md");
+        let content = fs::read_to_string(path).expect("tasks-progress.md should exist");
+        assert!(content.is_empty(), "tasks-progress.md should be empty");
+    }
+
+    #[test]
+    fn append_implement_progress_groups_same_round_entries() {
+        let project = new_project();
+
+        append_implement_progress(3, "Implementation summary", &project.config);
+        append_implement_progress(3, "Gate A: APPROVED", &project.config);
+        append_implement_progress(4, "CONSENSUS", &project.config);
+
+        let path = project.config.state_dir.join("implement-progress.md");
+        let content = fs::read_to_string(path).expect("implement-progress.md should exist");
+        assert_eq!(
+            content,
+            "## Round 3\nImplementation summary\nGate A: APPROVED\n\n## Round 4\nCONSENSUS\n"
+        );
+    }
+
+    #[test]
+    fn append_implement_progress_separates_rounds_across_task_headings() {
+        let project = new_project();
+
+        append_implement_progress_task("Task 1: Setup", &project.config);
+        append_implement_progress(1, "Implementation: first task", &project.config);
+        append_implement_progress_task("Task 2: Ship", &project.config);
+        append_implement_progress(1, "Implementation: second task", &project.config);
+
+        let path = project.config.state_dir.join("implement-progress.md");
+        let content = fs::read_to_string(path).expect("implement-progress.md should exist");
+        assert_eq!(
+            content,
+            "### Task: Task 1: Setup\n\n## Round 1\nImplementation: first task\n\n### Task: Task 2: Ship\n\n## Round 1\nImplementation: second task\n"
+        );
+    }
+
+    #[test]
+    fn clear_implement_progress_truncates_existing_content() {
+        let project = new_project();
+
+        append_implement_progress(1, "Initial", &project.config);
+        clear_implement_progress(&project.config);
+
+        let path = project.config.state_dir.join("implement-progress.md");
+        let content = fs::read_to_string(path).expect("implement-progress.md should exist");
+        assert!(content.is_empty(), "implement-progress.md should be empty");
     }
 
     #[test]
