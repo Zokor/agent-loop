@@ -189,7 +189,7 @@ struct FileConfig {
     codex_session_persistence: Option<bool>,
 
     // ── Observability ────────────────────────────────────────────────
-    /// Write a human-readable agent I/O transcript to `.agent-loop/state/transcript.log` (default false).
+    /// Write a human-readable agent I/O transcript to `.agent-loop/state/transcript.log` (default true).
     transcript_enabled: Option<bool>,
 }
 
@@ -620,7 +620,7 @@ impl Config {
         // --- Observability: env > TOML > default ---
         let transcript_enabled = env_bool("TRANSCRIPT_ENABLED")
             .or(file.transcript_enabled)
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         let config = Self {
             state_dir: project_dir.join(".agent-loop").join("state"),
@@ -1119,7 +1119,7 @@ pub fn generate_default_config_template() -> String {
 # wave_shutdown_grace_ms = 30000
 
 # ── Observability ─────────────────────────────────────────────────────────────
-# transcript_enabled = false
+# transcript_enabled = true
 
 # ── Quality commands ─────────────────────────────────────────────────────────
 # Uncomment and customize to define explicit quality checks.
@@ -3334,12 +3334,12 @@ planning_context_excerpt_lines = 75
     }
 
     #[test]
-    fn transcript_enabled_defaults_to_false() {
+    fn transcript_enabled_defaults_to_true() {
         let _guard = env_lock();
         clear_env();
         let dir = create_temp_project_root("cfg_transcript_default");
         let config = Config::from_cli(dir.clone(), false, false).unwrap();
-        assert!(!config.transcript_enabled);
+        assert!(config.transcript_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
