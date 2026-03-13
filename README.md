@@ -89,13 +89,23 @@ agent-loop implement --file <task.md>
 agent-loop implement --resume
 ```
 
+For the dependency-aware execution path, see [Wave Mode](#wave-mode) before using `--wave`.
+
 `agent-loop implement` (without flags) runs in batch mode:
 - Uses `.agent-loop/state/tasks.md` when present and non-empty.
 - Falls back to `.agent-loop/state/plan.md` when `tasks.md` is missing or empty.
 
 Use `agent-loop implement --per-task` for legacy one-task-at-a-time execution.
-Use `agent-loop implement --wave` for dependency-aware parallel execution (see Wave Mode below).
+Use `agent-loop implement --wave` for dependency-aware parallel execution (see [Wave Mode](#wave-mode)).
 When `batch_implement = false` (or `--per-task` / `--wave` is used), `tasks.md` is mandatory and plan fallback is disabled.
+
+### Choosing An Implementation Mode
+
+| Mode | Best for | Execution model | Input requirements |
+|---|---|---|---|
+| `implement` | Small or loosely structured work where one implementation pass is enough | Batch execution over the available task list, with fallback to `plan.md` when `tasks.md` is absent or empty | `tasks.md` preferred; falls back to `plan.md` |
+| `implement --per-task` | Sequential task-by-task delivery with explicit retries and failure handling | One task at a time, in listed order | `tasks.md` required |
+| `implement --wave` | Task graphs with real dependencies and parallelizable branches | Dependency-aware waves with barriers between waves | `tasks.md` required, with optional `depends:` metadata |
 
 Per-task and wave mode flags:
 
@@ -253,7 +263,13 @@ Implement dual-agent:
 
 ## Wave Mode
 
-Wave mode (`--wave`) enables dependency-aware parallel task execution. Tasks declare dependencies in `tasks.md`:
+Wave mode (`--wave`) is the dependency-aware execution path for `tasks.md`. Instead of running tasks strictly top-to-bottom, `agent-loop` builds a dependency graph, groups independent work into waves, and runs each wave in parallel up to the configured concurrency limit.
+
+Use wave mode when your task list contains real dependencies and you want safe parallelism. If the work is mostly independent but you do not care about dependency ordering, plain batch mode is simpler. If you want one task at a time with retry-focused control, use `--per-task`.
+
+### Declaring dependencies
+
+Tasks declare dependencies in `tasks.md` with a `depends:` line:
 
 ```markdown
 ## Task 1: Foundation
@@ -268,16 +284,97 @@ depends: 1, 2
 Document everything.
 ```
 
-Tasks are grouped into waves using topological sort with longest-path levelling. Tasks within the same wave run in parallel (bounded by `MAX_PARALLEL`). Wave barriers ensure all tasks in wave N complete before wave N+1 starts.
+Dependency numbers are human-facing and 1-indexed, so `depends: 1, 2` means "do not start this task until Task 1 and Task 2 are done."
+
+The parser looks for `depends:` in the first 3 non-blank lines of the task body. In practice, put dependency declarations at the top of each task so they are unambiguous.
+
+### How scheduling works
+
+`agent-loop` computes a topological schedule, then assigns each task to the earliest possible wave based on the longest dependency chain:
+
+- Tasks with no dependencies go into wave 1.
+- A task that depends on wave-1 work lands in wave 2.
+- A task only starts after every declared dependency has finished successfully.
+- Tasks in the same wave can run concurrently.
+- A wave barrier applies between waves: wave N+1 does not start until wave N is finished.
+
+Concurrency is bounded by `--max-parallel`, falling back to `max_parallel` from config/env when the flag is omitted.
+
+Precedence is explicit: `--max-parallel` (CLI) overrides `MAX_PARALLEL` / `.agent-loop.toml`, which overrides the built-in default of `1`.
+
+Example:
+
+```text
+Task 1          -> wave 1
+Task 2          -> wave 1
+Task 3 depends: 1 -> wave 2
+Task 4 depends: 1,2 -> wave 2
+Task 5 depends: 3,4 -> wave 3
+```
+
+### Example: failure propagation in practice
+
+Given this `tasks.md`:
+
+```markdown
+## Task 1: Schema groundwork
+Create the shared types and persistence layer.
+
+## Task 2: API endpoints
+depends: 1
+Implement the server endpoints.
+
+## Task 3: Frontend integration
+depends: 1
+Connect the UI to the shared model.
+
+## Task 4: End-to-end verification
+depends: 2, 3
+Add integration coverage for the full flow.
+```
+
+The schedule is:
+
+```text
+wave 1: Task 1
+wave 2: Task 2, Task 3
+wave 3: Task 4
+```
+
+If Task 2 fails but Task 3 succeeds, the resulting state is:
+
+```text
+Task 1 -> Done
+Task 2 -> Failed
+Task 3 -> Done
+Task 4 -> Skipped ("dependency failed: API endpoints")
+```
+
+On `agent-loop implement --wave --resume`, the completed tasks stay `Done`, Task 2 is retried, and Task 4 becomes runnable again only if its dependencies finish successfully.
+
+### Runtime behavior
+
+Each task keeps its own state, metrics, and conversation history under `.agent-loop/state/task-{index}/`, while wave-level status is tracked centrally in `.agent-loop/state/task_status.json`, `.agent-loop/state/task_metrics.json`, and `wave-progress.jsonl`.
 
 Features:
-- Per-task state isolation (`.agent-loop/state/task-{index}/`)
-- Git checkpoints at wave boundaries only (serialized by main thread)
-- Failure propagation: failed tasks cause transitive dependents to be skipped
-- `--fail-fast`: stop all execution on first failure
-- `--resume` support: reuse completed task state and continue remaining work
-- Wave lock prevents concurrent wave runs (stale lock detection via PID liveness)
-- Progress journal (`wave-progress.jsonl`) records all wave events
+- Per-task state isolation: every task runs in its own state directory.
+- Dependency failure propagation: if a dependency fails, downstream tasks are marked `Skipped` with a `dependency failed: ...` reason instead of running with invalid context.
+- `--fail-fast`: stop the run on the first failed task and mark untouched tasks as skipped.
+- `--resume`: keep `Done` tasks, reset non-done tasks, and continue from the persisted `task_status.json` state.
+- Wave lock: `.agent-loop/wave.lock` prevents overlapping wave runs and can reclaim stale locks when the owning PID is gone or the lock is too old.
+- Progress journal: `wave-progress.jsonl` records `RunStart`, `WaveStart`, `TaskStart`, `TaskEnd`, `WaveEnd`, `RunInterrupted`, and `RunEnd`.
+- Git checkpoints happen at wave boundaries only, which keeps commits serialized even when tasks inside a wave run in parallel.
+
+### Failure and resume semantics
+
+Wave mode treats dependency order as authoritative:
+
+- A task only runs if all of its declared dependencies finished `Done`.
+- If an upstream task fails, dependents are skipped rather than retried prematurely.
+- On `agent-loop implement --wave --resume`, previously completed tasks are preserved and skipped; failed or skipped tasks are reconsidered and can run again.
+- Resume uses persisted wave metadata, including stored `wave_index` assignments in `task_status.json`.
+
+This makes wave mode useful for long-running implementation passes where you want to recover from interruption or partial failure without rerunning known-good work.
 
 ### Wave Interrupt Handling
 
