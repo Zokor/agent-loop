@@ -1005,16 +1005,18 @@ pub fn review_has_no_findings(review_text: &str) -> bool {
         })
 }
 
-pub fn append_planning_progress(round: u32, summary: &str, config: &Config) {
-    let progress_path = config.state_dir.join("planning-progress.md");
-    let entry = format!("\n## Round {round}\n{summary}\n");
-    if let Ok(mut file) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&progress_path)
-    {
-        let _ = file.write_all(entry.as_bytes());
-    }
+pub fn append_planning_progress(
+    round: u32,
+    summary: &str,
+    findings_summary: Option<&str>,
+    config: &Config,
+) {
+    let path = config.state_dir.join("planning-progress.md");
+    let full_summary = match findings_summary {
+        Some(findings) => format!("{summary}\n{findings}"),
+        None => summary.to_string(),
+    };
+    let _ = append_round_progress(&path, round, &full_summary);
 }
 
 const IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX: &str = "### Task: ";
@@ -1123,9 +1125,18 @@ fn append_progress_heading(path: &Path, heading: &str) -> io::Result<()> {
     fs::write(path, updated)
 }
 
-pub fn append_tasks_progress(round: u32, summary: &str, config: &Config) {
+pub fn append_tasks_progress(
+    round: u32,
+    summary: &str,
+    findings_summary: Option<&str>,
+    config: &Config,
+) {
     let path = config.state_dir.join("tasks-progress.md");
-    let _ = append_round_progress(&path, round, summary);
+    let full_summary = match findings_summary {
+        Some(findings) => format!("{summary}\n{findings}"),
+        None => summary.to_string(),
+    };
+    let _ = append_round_progress(&path, round, &full_summary);
 }
 
 pub fn clear_tasks_progress(config: &Config) {
@@ -2332,9 +2343,9 @@ mod tests {
     fn append_tasks_progress_groups_same_round_entries() {
         let project = new_project();
 
-        append_tasks_progress(1, "Reviewer verdict: APPROVED", &project.config);
-        append_tasks_progress(1, "Implementer signoff: CONSENSUS", &project.config);
-        append_tasks_progress(2, "Reviewer verdict: NEEDS_REVISION", &project.config);
+        append_tasks_progress(1, "Reviewer verdict: APPROVED", None, &project.config);
+        append_tasks_progress(1, "Implementer signoff: CONSENSUS", None, &project.config);
+        append_tasks_progress(2, "Reviewer verdict: NEEDS_REVISION", None, &project.config);
 
         let path = project.config.state_dir.join("tasks-progress.md");
         let content = fs::read_to_string(path).expect("tasks-progress.md should exist");
@@ -2348,12 +2359,66 @@ mod tests {
     fn clear_tasks_progress_truncates_existing_content() {
         let project = new_project();
 
-        append_tasks_progress(1, "Initial", &project.config);
+        append_tasks_progress(1, "Initial", None, &project.config);
         clear_tasks_progress(&project.config);
 
         let path = project.config.state_dir.join("tasks-progress.md");
         let content = fs::read_to_string(path).expect("tasks-progress.md should exist");
         assert!(content.is_empty(), "tasks-progress.md should be empty");
+    }
+
+    #[test]
+    fn append_planning_progress_groups_same_round_entries() {
+        let project = new_project();
+
+        append_planning_progress(1, "Reviewer: NEEDS_REVISION", None, &project.config);
+        append_planning_progress(1, "Role swap triggered after 3 consecutive revision rounds", None, &project.config);
+        append_planning_progress(2, "Reviewer: APPROVED", None, &project.config);
+
+        let path = project.config.state_dir.join("planning-progress.md");
+        let content = fs::read_to_string(path).expect("planning-progress.md should exist");
+        assert_eq!(
+            content,
+            "## Round 1\nReviewer: NEEDS_REVISION\nRole swap triggered after 3 consecutive revision rounds\n\n## Round 2\nReviewer: APPROVED\n"
+        );
+    }
+
+    #[test]
+    fn append_planning_progress_with_findings() {
+        let project = new_project();
+
+        append_planning_progress(
+            1,
+            "Reviewer: NEEDS_REVISION",
+            Some("- missing error handling\n- unclear API boundary"),
+            &project.config,
+        );
+
+        let path = project.config.state_dir.join("planning-progress.md");
+        let content = fs::read_to_string(path).expect("planning-progress.md should exist");
+        assert_eq!(
+            content,
+            "## Round 1\nReviewer: NEEDS_REVISION\n- missing error handling\n- unclear API boundary\n"
+        );
+    }
+
+    #[test]
+    fn append_tasks_progress_with_findings() {
+        let project = new_project();
+
+        append_tasks_progress(
+            1,
+            "Reviewer verdict: NeedsRevision (open findings: 2)",
+            Some("- [F1] missing test coverage\n- [F2] unclear naming"),
+            &project.config,
+        );
+
+        let path = project.config.state_dir.join("tasks-progress.md");
+        let content = fs::read_to_string(path).expect("tasks-progress.md should exist");
+        assert_eq!(
+            content,
+            "## Round 1\nReviewer verdict: NeedsRevision (open findings: 2)\n- [F1] missing test coverage\n- [F2] unclear naming\n"
+        );
     }
 
     #[test]

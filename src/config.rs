@@ -1119,7 +1119,7 @@ pub fn generate_default_config_template() -> String {
 # wave_shutdown_grace_ms = 30000
 
 # ── Observability ─────────────────────────────────────────────────────────────
-# transcript_enabled = true
+# transcript_enabled = false
 
 # ── Quality commands ─────────────────────────────────────────────────────────
 # Uncomment and customize to define explicit quality checks.
