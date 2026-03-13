@@ -994,6 +994,7 @@ struct ImplementationRunOptions {
     clear_progress: bool,
     write_mode: Option<ImplementExecutionMode>,
     persist_flags: Option<ImplementModeFlags>,
+    cleanup_on_success: bool,
 }
 
 /// Internal helper used by `implement --task`, `implement --file`, and
@@ -1028,6 +1029,18 @@ fn run_command_with_review_max_rounds(
 
     let task = resolve_task_for_run(&args)?;
 
+    run_command_with_review_max_rounds_using(task, config, options, phases::implementation_loop)
+}
+
+fn run_command_with_review_max_rounds_using<F>(
+    task: String,
+    config: Config,
+    options: ImplementationRunOptions,
+    run_loop: F,
+) -> Result<i32, AgentLoopError>
+where
+    F: FnOnce(&Config, &HashSet<String>) -> bool,
+{
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
     } else {
@@ -1055,7 +1068,7 @@ fn run_command_with_review_max_rounds(
         state::write_state_file("plan.md", &existing_plan, &config)?;
     }
 
-    let reached_consensus = phases::implementation_loop(&config, &baseline_set);
+    let reached_consensus = run_loop(&config, &baseline_set);
     phases::print_summary(&config);
     let exit_code = phase_success_to_exit_code(reached_consensus);
     persist_last_run_task(task.as_str(), &config)?;
@@ -1073,6 +1086,7 @@ fn run_command_with_review_max_rounds(
         }
     }
 
+    cleanup_session_files_on_success_if_requested(&config, exit_code, options.cleanup_on_success);
     Ok(exit_code)
 }
 
@@ -1125,6 +1139,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
                 ));
             }
         }
+        cleanup_session_files_on_success(&config, exit_code);
         return Ok(exit_code);
     }
 
@@ -1173,6 +1188,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
         }
     }
 
+    cleanup_session_files_on_success(&config, exit_code);
     Ok(exit_code)
 }
 
@@ -1444,6 +1460,7 @@ fn implementation_resume_with_review_max_rounds_internal(
     single_agent: bool,
     review_max_rounds_override: Option<u32>,
     print_elapsed: bool,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
     let started = Instant::now();
     let project_dir = current_project_dir()?;
@@ -1465,6 +1482,27 @@ fn implementation_resume_with_review_max_rounds_internal(
         ));
     }
 
+    implementation_resume_with_review_max_rounds_internal_using(
+        started,
+        task,
+        config,
+        print_elapsed,
+        cleanup_on_success,
+        phases::implementation_loop_resume,
+    )
+}
+
+fn implementation_resume_with_review_max_rounds_internal_using<F>(
+    started: Instant,
+    task: String,
+    config: Config,
+    print_elapsed: bool,
+    cleanup_on_success: bool,
+    run_loop: F,
+) -> Result<i32, AgentLoopError>
+where
+    F: FnOnce(&Config, &HashSet<String>) -> bool,
+{
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
     } else {
@@ -1472,7 +1510,7 @@ fn implementation_resume_with_review_max_rounds_internal(
     };
     let baseline_set = baseline_vec.iter().cloned().collect::<HashSet<_>>();
 
-    let reached_consensus = phases::implementation_loop_resume(&config, &baseline_set);
+    let reached_consensus = run_loop(&config, &baseline_set);
     phases::print_summary(&config);
     let exit_code = phase_success_to_exit_code(reached_consensus);
     persist_last_run_task(task.as_str(), &config)?;
@@ -1495,6 +1533,7 @@ fn implementation_resume_with_review_max_rounds_internal(
         );
     }
 
+    cleanup_session_files_on_success_if_requested(&config, exit_code, cleanup_on_success);
     Ok(exit_code)
 }
 
@@ -1505,6 +1544,7 @@ fn implementation_resume_with_review_max_rounds(
     implementation_resume_with_review_max_rounds_internal(
         single_agent,
         review_max_rounds_override,
+        true,
         true,
     )
 }
@@ -1525,7 +1565,32 @@ fn implement_all_tasks_command_with_mode(
     config: &Config,
     project_dir: &Path,
     mode: ImplementExecutionMode,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
+    implement_all_tasks_command_with_mode_using(
+        args,
+        config,
+        project_dir,
+        mode,
+        cleanup_on_success,
+        implement_all_tasks_wave,
+        implement_all_tasks_per_task,
+    )
+}
+
+fn implement_all_tasks_command_with_mode_using<W, P>(
+    args: &ImplementArgs,
+    config: &Config,
+    project_dir: &Path,
+    mode: ImplementExecutionMode,
+    cleanup_on_success: bool,
+    run_wave: W,
+    run_per_task: P,
+) -> Result<i32, AgentLoopError>
+where
+    W: FnOnce(&ImplementArgs, &[ParsedTask], &Config, &Path) -> Result<i32, AgentLoopError>,
+    P: FnOnce(&ImplementArgs, &[ParsedTask], &Config, &Path) -> Result<i32, AgentLoopError>,
+{
     let tasks_file = project_dir
         .join(".agent-loop")
         .join("state")
@@ -1539,7 +1604,7 @@ fn implement_all_tasks_command_with_mode(
         ));
     }
 
-    match mode {
+    let result = match mode {
         ImplementExecutionMode::Wave => {
             let raw_tasks = raw_tasks.as_deref().ok_or_else(|| {
                 AgentLoopError::State("No tasks found. Run 'agent-loop tasks' first.".to_string())
@@ -1551,7 +1616,7 @@ fn implement_all_tasks_command_with_mode(
                 parsed_tasks.len(),
                 tasks_file.display()
             );
-            implement_all_tasks_wave(args, &parsed_tasks, config, project_dir)
+            run_wave(args, &parsed_tasks, config, project_dir)
         }
         ImplementExecutionMode::PerTask => {
             let raw_tasks = raw_tasks.as_deref().ok_or_else(|| {
@@ -1565,7 +1630,7 @@ fn implement_all_tasks_command_with_mode(
                 parsed_tasks.len(),
                 tasks_file.display()
             );
-            implement_all_tasks_per_task(args, &parsed_tasks, config, project_dir)
+            run_per_task(args, &parsed_tasks, config, project_dir)
         }
         ImplementExecutionMode::Batch => {
             if let Some(raw_tasks) = raw_tasks.as_deref()
@@ -1584,20 +1649,33 @@ fn implement_all_tasks_command_with_mode(
                     config,
                     project_dir,
                     raw_tasks,
+                    cleanup_on_success,
                 );
             }
 
             let raw_plan = state::read_state_file("plan.md", config);
             if !raw_plan.trim().is_empty() {
                 persist_implement_settings(mode, &args.flags, config)?;
-                return implement_plan_batch(args, config, project_dir, &raw_plan);
+                return implement_plan_batch(
+                    args,
+                    config,
+                    project_dir,
+                    &raw_plan,
+                    cleanup_on_success,
+                );
             }
 
             Err(AgentLoopError::State(
                 "No tasks found and no plan found. Run 'agent-loop plan' first, or generate tasks with 'agent-loop tasks'.".to_string(),
             ))
         }
+    };
+
+    if cleanup_on_success && mode != ImplementExecutionMode::Batch {
+        cleanup_result_session_files_on_success(config, &result);
     }
+
+    result
 }
 
 fn resume_implementation_for_mode(
@@ -1606,16 +1684,22 @@ fn resume_implementation_for_mode(
     project_dir: &Path,
     mode: ImplementExecutionMode,
     print_elapsed: bool,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
     match mode {
         ImplementExecutionMode::Batch => implementation_resume_with_review_max_rounds_internal(
             args.single_agent,
             None,
             print_elapsed,
+            cleanup_on_success,
         ),
-        ImplementExecutionMode::Wave => {
-            implement_all_tasks_command_with_mode(args, config, project_dir, mode)
-        }
+        ImplementExecutionMode::Wave => implement_all_tasks_command_with_mode(
+            args,
+            config,
+            project_dir,
+            mode,
+            cleanup_on_success,
+        ),
         ImplementExecutionMode::PerTask => Err(AgentLoopError::Config(
             "--per-task cannot be combined with --resume.".to_string(),
         )),
@@ -1644,7 +1728,14 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
         )?;
         let mut resume_args = args.clone();
         resume_args.flags = effective_flags;
-        return resume_implementation_for_mode(&resume_args, &config, &project_dir, mode, true);
+        return resume_implementation_for_mode(
+            &resume_args,
+            &config,
+            &project_dir,
+            mode,
+            true,
+            true,
+        );
     }
 
     if args.task.is_some() || args.file.is_some() {
@@ -1662,6 +1753,7 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
                 clear_progress: true,
                 write_mode: Some(ImplementExecutionMode::Batch),
                 persist_flags: Some(args.flags.clone()),
+                cleanup_on_success: true,
             },
         );
     }
@@ -1669,7 +1761,7 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
     let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
     let mode = resolve_fresh_implement_mode(&args.flags, &config);
-    implement_all_tasks_command_with_mode(&args, &config, &project_dir, mode)
+    implement_all_tasks_command_with_mode(&args, &config, &project_dir, mode, true)
 }
 
 fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
@@ -1705,6 +1797,7 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
                 ));
             }
         }
+        cleanup_session_files_on_success(&config, exit_code);
         return Ok(exit_code);
     }
 
@@ -1776,7 +1869,34 @@ fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
         }
     }
 
+    cleanup_session_files_on_success(&config, exit_code);
     Ok(exit_code)
+}
+
+fn cleanup_session_files_on_success(config: &Config, exit_code: i32) {
+    if exit_code != 0 {
+        return;
+    }
+
+    if let Err(err) = state::cleanup_session_files(config) {
+        eprintln!("Warning: failed to clean up session files: {err}");
+    }
+}
+
+fn cleanup_session_files_on_success_if_requested(
+    config: &Config,
+    exit_code: i32,
+    cleanup_on_success: bool,
+) {
+    if cleanup_on_success {
+        cleanup_session_files_on_success(config, exit_code);
+    }
+}
+
+fn cleanup_result_session_files_on_success(config: &Config, result: &Result<i32, AgentLoopError>) {
+    if let Ok(exit_code) = result {
+        cleanup_session_files_on_success(config, *exit_code);
+    }
 }
 
 fn build_implement_args(
@@ -1812,6 +1932,7 @@ fn finish_command_exit(
             ));
         }
     }
+    cleanup_session_files_on_success(config, exit_code);
     Ok(exit_code)
 }
 
@@ -1833,7 +1954,7 @@ fn transition_to_implementation(
         state::write_state_file("tasks.md", tasks_content, config)?;
     }
 
-    implement_all_tasks_command_with_mode(implement_args, config, &config.project_dir, mode)
+    implement_all_tasks_command_with_mode(implement_args, config, &config.project_dir, mode, false)
 }
 
 fn plan_tasks_implement_command(args: PlanTasksImplementArgs) -> Result<i32, AgentLoopError> {
@@ -1973,6 +2094,7 @@ fn plan_tasks_implement_resume(
                 &config.project_dir,
                 mode,
                 false,
+                false,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2079,6 +2201,7 @@ fn plan_implement_resume(args: PlanImplementArgs, started: Instant) -> Result<i3
                     &config,
                     &config.project_dir,
                     mode,
+                    false,
                     false,
                 )?;
             finish_command_exit(started, &config, exit_code)
@@ -2212,6 +2335,7 @@ fn tasks_implement_resume(
                     &config.project_dir,
                     mode,
                     false,
+                    false,
                 )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2261,11 +2385,42 @@ fn implement_all_tasks_batch(
     config: &Config,
     project_dir: &Path,
     raw_tasks: &str,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
+    implement_all_tasks_batch_using(
+        args,
+        parsed_tasks,
+        config,
+        project_dir,
+        raw_tasks,
+        cleanup_on_success,
+        run_batch_implementation_with_title,
+    )
+}
+
+fn implement_all_tasks_batch_using<F>(
+    args: &ImplementArgs,
+    parsed_tasks: &[ParsedTask],
+    config: &Config,
+    project_dir: &Path,
+    raw_tasks: &str,
+    cleanup_on_success: bool,
+    run_batch: F,
+) -> Result<i32, AgentLoopError>
+where
+    F: FnOnce(&ImplementArgs, &Config, &Path, &str, String, bool) -> Result<i32, AgentLoopError>,
+{
     println!("Running batch implementation for all tasks in a single loop.");
     let title = batch_metrics_title(parsed_tasks.len());
     let combined_task = build_batch_implementation_task(raw_tasks);
-    run_batch_implementation_with_title(args, config, project_dir, &title, combined_task)
+    run_batch(
+        args,
+        config,
+        project_dir,
+        &title,
+        combined_task,
+        cleanup_on_success,
+    )
 }
 
 fn implement_plan_batch(
@@ -2273,6 +2428,7 @@ fn implement_plan_batch(
     config: &Config,
     project_dir: &Path,
     plan: &str,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
     println!("No tasks found; falling back to plan.md for batch implementation.");
     let original_task = state::read_state_file("task.md", config);
@@ -2283,6 +2439,7 @@ fn implement_plan_batch(
         project_dir,
         "Batch implementation (plan fallback)",
         combined_task,
+        cleanup_on_success,
     )
 }
 
@@ -2292,11 +2449,35 @@ fn run_batch_implementation_with_title(
     project_dir: &Path,
     title: &str,
     combined_task: String,
+    cleanup_on_success: bool,
 ) -> Result<i32, AgentLoopError> {
+    run_batch_implementation_with_title_using(
+        args,
+        config,
+        project_dir,
+        title,
+        combined_task,
+        cleanup_on_success,
+        run_command_with_review_max_rounds,
+    )
+}
+
+fn run_batch_implementation_with_title_using<F>(
+    args: &ImplementArgs,
+    config: &Config,
+    project_dir: &Path,
+    title: &str,
+    combined_task: String,
+    cleanup_on_success: bool,
+    run_impl: F,
+) -> Result<i32, AgentLoopError>
+where
+    F: FnOnce(RunArgs, ImplementationRunOptions) -> Result<i32, AgentLoopError>,
+{
     let started_at = state::timestamp();
     let timer = Instant::now();
     let usage_before = agent::usage_snapshot();
-    let run_result = run_command_with_review_max_rounds(
+    let run_result = run_impl(
         RunArgs {
             task: Some(combined_task),
             file: None,
@@ -2309,6 +2490,7 @@ fn run_batch_implementation_with_title(
             clear_progress: true,
             write_mode: Some(ImplementExecutionMode::Batch),
             persist_flags: Some(args.flags.clone()),
+            cleanup_on_success,
         },
     );
     let usage_after = agent::usage_snapshot();
@@ -2938,6 +3120,7 @@ fn implement_all_tasks_per_task(
                         clear_progress: false,
                         write_mode: None,
                         persist_flags: None,
+                        cleanup_on_success: true,
                     },
                 )?
             };
@@ -3788,6 +3971,297 @@ mod tests {
 
         assert_eq!(statuses[2].status, state::TaskRunStatus::Skipped);
         assert_eq!(statuses[2].skip_reason.as_deref(), Some("interrupted"));
+    }
+
+    #[test]
+    fn finish_command_exit_cleans_session_files_on_success() {
+        let root = create_temp_project_root("main_finish_cleanup_success");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(config.state_dir.join("task-1")).expect("state dir should exist");
+        fs::write(
+            config.state_dir.join("implement-implementer_session_id"),
+            "root",
+        )
+        .expect("root session file should be written");
+        fs::write(
+            config
+                .state_dir
+                .join("task-1")
+                .join("implement-reviewer_session_id"),
+            "nested",
+        )
+        .expect("nested session file should be written");
+
+        let exit_code =
+            finish_command_exit(Instant::now(), &config, 0).expect("success should pass through");
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            !config
+                .state_dir
+                .join("implement-implementer_session_id")
+                .exists()
+        );
+        assert!(
+            !config
+                .state_dir
+                .join("task-1")
+                .join("implement-reviewer_session_id")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn cleanup_session_files_on_success_skips_nonzero_exit_codes() {
+        let root = create_temp_project_root("main_cleanup_nonzero_exit");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(&config.state_dir).expect("state dir should exist");
+        let session_path = config.state_dir.join("implement-implementer_session_id");
+        fs::write(&session_path, "keep").expect("session file should be written");
+
+        cleanup_session_files_on_success(&config, 1);
+
+        assert!(
+            session_path.exists(),
+            "nonzero exit code must preserve session files for resume"
+        );
+    }
+
+    #[test]
+    fn implement_all_tasks_batch_propagates_cleanup_flag() {
+        let root = create_temp_project_root("main_batch_cleanup_flag");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(&config.state_dir).expect("state dir should exist");
+        let args = ImplementArgs {
+            task: None,
+            file: None,
+            resume: false,
+            single_agent: false,
+            flags: ImplementModeFlags::default(),
+        };
+        let parsed_tasks = vec![ParsedTask {
+            title: "Task 1".to_string(),
+            content: "Ship it".to_string(),
+            dependencies: Vec::new(),
+        }];
+        let observed_cleanup = std::sync::Mutex::new(None);
+
+        let exit_code = implement_all_tasks_batch_using(
+            &args,
+            &parsed_tasks,
+            &config,
+            &config.project_dir,
+            "### Task 1: Ship it\nDo the work",
+            false,
+            |_args, _config, _project_dir, title, combined_task, cleanup_on_success| {
+                assert_eq!(title, "Batch implementation (1 tasks)");
+                assert!(combined_task.contains("Do the work"));
+                *observed_cleanup.lock().expect("mutex should lock") = Some(cleanup_on_success);
+                Ok(0)
+            },
+        )
+        .expect("batch helper should succeed");
+
+        assert_eq!(exit_code, 0);
+        assert_eq!(
+            *observed_cleanup.lock().expect("mutex should lock"),
+            Some(false),
+            "compound batch flows must defer cleanup to finish_command_exit"
+        );
+    }
+
+    #[test]
+    fn wave_mode_command_path_cleans_nested_session_files_on_success() {
+        let root = create_temp_project_root("main_wave_cleanup");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(&config.state_dir).expect("state dir should exist");
+
+        // Write a minimal tasks.md so the command path can parse it.
+        fs::write(
+            config.state_dir.join("tasks.md"),
+            "### Task 1: Build widget\nImplement the widget.\n",
+        )
+        .expect("tasks.md should be written");
+
+        // Seed session files in root and nested task-1 directory.
+        let nested_dir = config.state_dir.join("task-1");
+        fs::create_dir_all(&nested_dir).expect("nested state dir should exist");
+        fs::write(
+            config.state_dir.join("implement-implementer_session_id"),
+            "root",
+        )
+        .expect("root session file should be written");
+        fs::write(nested_dir.join("implement-reviewer_session_id"), "nested")
+            .expect("nested session file should be written");
+
+        // Preserve marker: workflow.txt must survive cleanup.
+        fs::write(config.state_dir.join("workflow.txt"), "implement\n")
+            .expect("workflow marker should be written");
+
+        let args = ImplementArgs {
+            task: None,
+            file: None,
+            resume: false,
+            single_agent: false,
+            flags: ImplementModeFlags::default(),
+        };
+
+        let exit_code = implement_all_tasks_command_with_mode_using(
+            &args,
+            &config,
+            &config.project_dir,
+            ImplementExecutionMode::Wave,
+            true, // cleanup_on_success
+            // Mock wave executor: return success without running real wave logic.
+            |_args, _tasks, _config, _project_dir| Ok(0),
+            // Mock per-task executor: unused for Wave mode.
+            |_args, _tasks, _config, _project_dir| unreachable!("wave mode should not call per-task"),
+        )
+        .expect("wave mode should succeed");
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            !config
+                .state_dir
+                .join("implement-implementer_session_id")
+                .exists(),
+            "root session file should be cleaned up after successful wave run"
+        );
+        assert!(
+            !nested_dir.join("implement-reviewer_session_id").exists(),
+            "nested task-1 session file should be cleaned up after successful wave run"
+        );
+        assert!(
+            config.state_dir.join("workflow.txt").exists(),
+            "workflow.txt must be preserved"
+        );
+    }
+
+    /// Command-path test: exercises `run_command_with_review_max_rounds_using`
+    /// (the function body of `implement --task`/`--file`) with a mock loop that
+    /// returns consensus. Proves the cleanup call at the end of the function
+    /// actually removes root and nested session files on success.
+    #[test]
+    fn run_command_using_cleans_session_files_on_success() {
+        let root = create_temp_project_root("main_run_cmd_cleanup");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(&config.state_dir).expect("state dir should exist");
+
+        let exit_code = run_command_with_review_max_rounds_using(
+            "test task".to_string(),
+            config.clone(),
+            ImplementationRunOptions {
+                review_max_rounds_override: None,
+                clear_progress: false,
+                write_mode: None,
+                persist_flags: None,
+                cleanup_on_success: true,
+            },
+            // Mock implementation loop: return true (consensus reached).
+            |_config, _baseline| true,
+        )
+        .expect("run_command_using should succeed");
+
+        assert_eq!(exit_code, 0);
+
+        // Seed session files AFTER state::init (which creates the state dir
+        // and may clean it), then re-run to prove cleanup wiring.
+        // We need a fresh config because init may have written state files.
+        let nested_dir = config.state_dir.join("task-1");
+        fs::create_dir_all(&nested_dir).expect("nested dir should exist");
+        fs::write(
+            config.state_dir.join("implement-implementer_session_id"),
+            "root",
+        )
+        .expect("root session file should be written");
+        fs::write(nested_dir.join("implement-reviewer_session_id"), "nested")
+            .expect("nested session file should be written");
+        fs::write(config.state_dir.join("workflow.txt"), "implement\n")
+            .expect("workflow marker should be written");
+
+        let exit_code = run_command_with_review_max_rounds_using(
+            "test task".to_string(),
+            config.clone(),
+            ImplementationRunOptions {
+                review_max_rounds_override: None,
+                clear_progress: false,
+                write_mode: None,
+                persist_flags: None,
+                cleanup_on_success: true,
+            },
+            |_config, _baseline| true,
+        )
+        .expect("second run should succeed");
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            !config
+                .state_dir
+                .join("implement-implementer_session_id")
+                .exists(),
+            "root session file should be removed after successful implement --task/--file path"
+        );
+        assert!(
+            !nested_dir.join("implement-reviewer_session_id").exists(),
+            "nested session file should be removed after successful implement --task/--file path"
+        );
+        assert!(
+            config.state_dir.join("workflow.txt").exists(),
+            "workflow.txt must be preserved"
+        );
+    }
+
+    /// Command-path test: exercises
+    /// `implementation_resume_with_review_max_rounds_internal_using`
+    /// (the function body of `implement --resume`) with a mock loop that
+    /// returns consensus. Proves the cleanup call at the end of the function
+    /// actually removes session files on success.
+    #[test]
+    fn implementation_resume_using_cleans_session_files_on_success() {
+        let root = create_temp_project_root("main_resume_cleanup");
+        let config = make_test_config(&root, TestConfigOptions::default());
+        fs::create_dir_all(&config.state_dir).expect("state dir should exist");
+
+        // Seed session files before calling the resume path.
+        let nested_dir = config.state_dir.join("task-2");
+        fs::create_dir_all(&nested_dir).expect("nested dir should exist");
+        fs::write(
+            config.state_dir.join("implement-implementer_session_id"),
+            "root",
+        )
+        .expect("root session file should be written");
+        fs::write(nested_dir.join("plan-reviewer_session_id"), "nested")
+            .expect("nested session file should be written");
+        fs::write(config.state_dir.join("changes.md"), "keep me")
+            .expect("changes file should be written");
+
+        let exit_code = implementation_resume_with_review_max_rounds_internal_using(
+            Instant::now(),
+            "resume task".to_string(),
+            config.clone(),
+            false, // print_elapsed
+            true,  // cleanup_on_success
+            // Mock resume loop: return true (consensus reached).
+            |_config, _baseline| true,
+        )
+        .expect("resume_using should succeed");
+
+        assert_eq!(exit_code, 0);
+        assert!(
+            !config
+                .state_dir
+                .join("implement-implementer_session_id")
+                .exists(),
+            "root session file should be removed after successful implement --resume path"
+        );
+        assert!(
+            !nested_dir.join("plan-reviewer_session_id").exists(),
+            "nested session file should be removed after successful implement --resume path"
+        );
+        assert!(
+            config.state_dir.join("changes.md").exists(),
+            "non-session state files must be preserved"
+        );
     }
 
     fn test_loop_status(status: state::Status) -> state::LoopStatus {

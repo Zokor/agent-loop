@@ -10,3 +10,7 @@ state/
 
 # OS
 .DS_Store
+
+# Local agent guides
+AGENTS.md
+CLAUDE.md

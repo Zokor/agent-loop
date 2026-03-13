@@ -851,6 +851,40 @@ pub fn log(msg: &str, config: &Config) -> io::Result<()> {
     writeln!(file, "{line}")
 }
 
+/// Delete all `*_session_id` files from the state directory.
+pub fn cleanup_session_files(config: &Config) -> io::Result<usize> {
+    fn cleanup_dir(path: &Path) -> io::Result<usize> {
+        let mut deleted = 0usize;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                deleted += cleanup_dir(&entry.path())?;
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with("_session_id") {
+                fs::remove_file(entry.path())?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    }
+
+    let deleted = match fs::read_dir(&config.state_dir) {
+        Ok(_) => cleanup_dir(&config.state_dir)?,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+        Err(err) => return Err(err),
+    };
+
+    log(&format!("Cleaned up {deleted} session file(s)"), config)?;
+    Ok(deleted)
+}
+
 pub fn append_round_summary(
     round: u32,
     phase: &str,
@@ -1745,6 +1779,75 @@ mod tests {
             !state_file_path(QUALITY_CHECKS_FILENAME, &project.config).exists(),
             "quality checks file should be removed during init"
         );
+    }
+
+    #[test]
+    fn cleanup_session_files_removes_root_and_nested_session_files_only() {
+        let project = new_project();
+        let nested_dir = project.config.state_dir.join("task-1");
+        fs::create_dir_all(&nested_dir).expect("nested state dir should exist");
+
+        fs::write(
+            project
+                .config
+                .state_dir
+                .join("implement-implementer_session_id"),
+            "root",
+        )
+        .expect("root session file should be written");
+        fs::write(nested_dir.join("plan-reviewer_session_id"), "nested")
+            .expect("nested session file should be written");
+        fs::write(project.config.state_dir.join("workflow.txt"), "implement\n")
+            .expect("workflow marker should be written");
+        fs::write(nested_dir.join("changes.md"), "summary")
+            .expect("changes file should be written");
+
+        let deleted = cleanup_session_files(&project.config).expect("cleanup should succeed");
+
+        assert_eq!(deleted, 2, "expected both session files to be removed");
+        assert!(
+            !project
+                .config
+                .state_dir
+                .join("implement-implementer_session_id")
+                .exists()
+        );
+        assert!(!nested_dir.join("plan-reviewer_session_id").exists());
+        assert!(
+            project.config.state_dir.join("workflow.txt").exists(),
+            "workflow.txt must be preserved"
+        );
+        assert!(
+            nested_dir.join("changes.md").exists(),
+            "changes.md must be preserved"
+        );
+
+        let log_content = fs::read_to_string(project.config.state_dir.join("log.txt"))
+            .expect("log.txt should be readable");
+        assert!(
+            log_content.contains("Cleaned up 2 session file(s)"),
+            "cleanup log line should be recorded, got:\n{log_content}"
+        );
+    }
+
+    #[test]
+    fn cleanup_session_files_returns_zero_and_logs_when_state_dir_is_missing() {
+        use crate::test_support::{TestConfigOptions, create_temp_project_root, make_test_config};
+
+        let root = create_temp_project_root("cleanup_missing_state_dir");
+        let config = make_test_config(&root, TestConfigOptions::default());
+
+        let deleted = cleanup_session_files(&config).expect("cleanup should succeed");
+
+        assert_eq!(deleted, 0, "missing state dir should behave like no files");
+        let log_content =
+            fs::read_to_string(config.state_dir.join("log.txt")).expect("log.txt should exist");
+        assert!(
+            log_content.contains("Cleaned up 0 session file(s)"),
+            "cleanup log line should be recorded, got:\n{log_content}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

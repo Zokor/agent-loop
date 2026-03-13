@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-03-13
+
+### Added
+- Successful plan, tasks, implement, and wave command paths now clean up persisted `*_session_id` files while preserving resume-critical state files.
+- Added regression coverage for session-file cleanup across direct implement, resume, batch, and wave execution paths.
+
+### Changed
+- Expanded the README implementation guidance with clearer mode-selection advice and wave-mode scheduling, failure, and resume documentation.
+
 ## [0.1.11] - 2026-03-11
 
 ### Fixed
