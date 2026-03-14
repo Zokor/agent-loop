@@ -178,7 +178,6 @@ fn findings_for_prompt(findings: &FindingsFile) -> String {
 /// Extracts the portion of a review starting from the first "Findings"
 /// heading ("## Findings" or a bare "Findings" line). Falls back to
 /// the full review text if no marker is found.
-#[cfg(test)]
 fn trim_review_to_findings(review: &str) -> &str {
     let mut byte_offset = 0;
     for line in review.split('\n') {
@@ -1604,9 +1603,11 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
         );
 
         // Append planning progress after each reviewer round.
+        let findings = extract_finding_summary(&review_text, 500);
         crate::state::append_planning_progress(
             planning_round,
             &format!("Reviewer: {verdict_label}"),
+            findings.as_deref(),
             config,
         );
 
@@ -1630,6 +1631,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                         &format!(
                             "Role swap triggered after {consecutive_revision_rounds} consecutive revision rounds"
                         ),
+                        None,
                         config,
                     );
 
@@ -1720,12 +1722,14 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                             } else {
                                 "APPROVED"
                             };
+                        let adversarial_findings = extract_finding_summary(adversarial_text, 500);
                         crate::state::append_planning_progress(
                             planning_round,
                             &format!(
                                 "{} Adversarial: {adversarial_label}",
                                 PLANNING_GATE_ADVERSARIAL
                             ),
+                            adversarial_findings.as_deref(),
                             config,
                         );
 
@@ -1922,7 +1926,7 @@ fn decomposition_decision_label(decision: DecompositionStatusDecision) -> &'stat
 fn append_decomposition_error_progress(config: &Config, round: u32, fallback: &str) {
     let status = read_status(config);
     let reason = status.reason.as_deref().unwrap_or(fallback);
-    crate::state::append_tasks_progress(round, &format!("Stopped: {reason}"), config);
+    crate::state::append_tasks_progress(round, &format!("Stopped: {reason}"), None, config);
 }
 
 fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
@@ -1980,6 +1984,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         crate::state::append_tasks_progress(
             start_round,
             "Max rounds reached without consensus",
+            None,
             config,
         );
         return false;
@@ -2156,6 +2161,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
             status = read_status(config);
         }
 
+        let tasks_findings_bullets = format_tasks_findings_summary(&updated_findings, 500);
         crate::state::append_tasks_progress(
             round,
             &format!(
@@ -2163,6 +2169,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                 decomposition_decision_label(reconciled_decision),
                 open_tasks_findings_count(&updated_findings)
             ),
+            tasks_findings_bullets.as_deref(),
             config,
         );
 
@@ -2235,6 +2242,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                         crate::state::append_tasks_progress(
                             round,
                             "Implementer signoff: CONSENSUS",
+                            None,
                             config,
                         );
                         let _ = log("✅ Both agents agreed on task breakdown!", config);
@@ -2245,6 +2253,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     crate::state::append_tasks_progress(
                         round,
                         "Implementer signoff: DISPUTED",
+                        None,
                         config,
                     );
 
@@ -2274,6 +2283,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                     crate::state::append_tasks_progress(
                         round,
                         "Approved (single-agent -> consensus)",
+                        None,
                         config,
                     );
                     let final_status = read_status(config);
@@ -2338,7 +2348,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         ),
         config,
     );
-    crate::state::append_tasks_progress(round, "Max rounds reached without consensus", config);
+    crate::state::append_tasks_progress(round, "Max rounds reached without consensus", None, config);
 
     false
 }
@@ -2349,6 +2359,124 @@ pub fn task_decomposition_phase(config: &Config) -> bool {
 
 pub fn task_decomposition_phase_resume(config: &Config) -> bool {
     task_decomposition_phase_internal(config, true)
+}
+
+fn extract_finding_summary(review_text: &str, max_chars: usize) -> Option<String> {
+    if review_text.trim().is_empty() {
+        return None;
+    }
+    if crate::state::review_has_no_findings(review_text) {
+        return None;
+    }
+
+    // Narrow to the Findings section so preamble/checklist bullets are excluded.
+    let scoped = trim_review_to_findings(review_text);
+
+    // Tier 1: Extract bullet/numbered list items
+    let bullets: Vec<&str> = scoped
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed
+                    .find(". ")
+                    .map(|pos| trimmed[..pos].chars().all(|c| c.is_ascii_digit()) && pos > 0)
+                    .unwrap_or(false)
+        })
+        .take(5)
+        .collect();
+
+    let lines = if bullets.is_empty() {
+        // Tier 2: Prose fallback — first 5 non-empty, non-heading lines.
+        // Also skip bare "Findings" marker lines that trim_review_to_findings()
+        // includes as the section start.
+        let prose: Vec<String> = scoped
+            .lines()
+            .map(str::trim)
+            .filter(|line| {
+                !line.is_empty()
+                    && !line.starts_with('#')
+                    && line.trim_start_matches('#').trim() != "Findings"
+            })
+            .take(5)
+            .map(|line| format!("- {line}"))
+            .collect();
+        if prose.is_empty() {
+            return None;
+        }
+        prose
+    } else {
+        bullets.iter().map(|line| line.trim().to_string()).collect()
+    };
+
+    Some(truncate_summary_lines(&lines, max_chars))
+}
+
+/// Joins lines with truncation. When a line would exceed `max_chars`,
+/// the line is character-truncated (with `...` suffix) rather than
+/// replaced entirely with `- ...`.
+fn truncate_summary_lines(lines: &[String], max_chars: usize) -> String {
+    let mut result = String::new();
+    for line in lines {
+        let sep_cost = if result.is_empty() { 0 } else { 1 };
+        let remaining = max_chars.saturating_sub(result.len() + sep_cost);
+        if remaining == 0 {
+            break;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        if line.len() <= remaining {
+            result.push_str(line);
+        } else {
+            // Truncate the line itself, preserving at least some content.
+            // Use char boundaries to avoid panicking on multibyte UTF-8.
+            let trunc_end = remaining.saturating_sub(3);
+            if trunc_end > 0 {
+                let safe_end = line
+                    .char_indices()
+                    .take_while(|&(i, _)| i < trunc_end)
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0);
+                result.push_str(&line[..safe_end]);
+                result.push_str("...");
+            } else {
+                result.push_str("...");
+            }
+            break;
+        }
+    }
+    result
+}
+
+fn format_tasks_findings_summary(
+    findings: &crate::state::TasksFindingsFile,
+    max_chars: usize,
+) -> Option<String> {
+    let mut open: Vec<&crate::state::TasksFindingEntry> = findings
+        .findings
+        .iter()
+        .filter(|e| e.status == crate::state::TasksFindingStatus::Open)
+        .collect();
+    // Prioritize most recently introduced findings so the latest round's
+    // rejection reasons appear first, before the 5-item cap is applied.
+    open.sort_by(|a, b| b.round_introduced.cmp(&a.round_introduced));
+    open.truncate(5);
+
+    if open.is_empty() {
+        return None;
+    }
+
+    let lines: Vec<String> = open
+        .iter()
+        .map(|entry| format!("- [{}] {}", entry.id, entry.description))
+        .collect();
+
+    let result = truncate_summary_lines(&lines, max_chars);
+
+    Some(result)
 }
 
 fn implementation_progress_entry(phase: &str, summary: &str) -> String {
@@ -6545,5 +6673,303 @@ More text.
     fn planning_gate_constants_have_expected_values() {
         assert_eq!(PLANNING_GATE_ADVERSARIAL, "[gate:fresh-context]");
         assert_eq!(PLANNING_GATE_SIGNOFF, "[gate:implementer-signoff]");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_finding_summary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_finding_summary_returns_none_for_empty_text() {
+        assert!(extract_finding_summary("", 500).is_none());
+        assert!(extract_finding_summary("   \n  \n  ", 500).is_none());
+    }
+
+    #[test]
+    fn extract_finding_summary_returns_none_for_no_findings() {
+        let review = "Everything looks good.\n\nno findings";
+        assert!(extract_finding_summary(review, 500).is_none());
+    }
+
+    #[test]
+    fn extract_finding_summary_returns_none_for_no_findings_with_punctuation() {
+        let review = "The plan is solid.\n\nno findings.";
+        assert!(extract_finding_summary(review, 500).is_none());
+    }
+
+    #[test]
+    fn extract_finding_summary_extracts_dash_bullets() {
+        let review = "# Review\n\n- first issue\n- second issue\n- third issue\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- first issue\n- second issue\n- third issue");
+    }
+
+    #[test]
+    fn extract_finding_summary_extracts_star_bullets() {
+        let review = "# Review\n\n* alpha problem\n* beta problem\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "* alpha problem\n* beta problem");
+    }
+
+    #[test]
+    fn extract_finding_summary_extracts_numbered_items() {
+        let review = "1. first finding\n2. second finding\n10. tenth finding\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "1. first finding\n2. second finding\n10. tenth finding");
+    }
+
+    #[test]
+    fn extract_finding_summary_prose_fallback() {
+        let review = "The plan has issues.\nError handling is missing.\nAPI boundary is unclear.\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(
+            result,
+            "- The plan has issues.\n- Error handling is missing.\n- API boundary is unclear."
+        );
+    }
+
+    #[test]
+    fn extract_finding_summary_skips_headings_in_prose() {
+        let review = "# Review\nSome issue here.\n## Details\nAnother issue.\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- Some issue here.\n- Another issue.");
+    }
+
+    #[test]
+    fn extract_finding_summary_scopes_to_findings_section() {
+        // Preamble bullets before the Findings heading should be excluded
+        let review = "## Checklist\n- setup step one\n- setup step two\n\n## Findings\n- actual issue one\n- actual issue two\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- actual issue one\n- actual issue two");
+        assert!(!result.contains("setup step"));
+    }
+
+    #[test]
+    fn extract_finding_summary_falls_back_to_full_review_without_findings_heading() {
+        // When there's no Findings heading, the full review is used
+        let review = "- issue one\n- issue two\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- issue one\n- issue two");
+    }
+
+    #[test]
+    fn extract_finding_summary_bare_findings_marker_excluded_from_prose() {
+        // A bare "Findings" marker line should not appear as "- Findings" in the output
+        let review = "Findings\nIssue one\nIssue two\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert!(!result.contains("- Findings"));
+        assert_eq!(result, "- Issue one\n- Issue two");
+    }
+
+    #[test]
+    fn extract_finding_summary_safe_with_multibyte_utf8() {
+        // Must not panic when truncation lands inside a multibyte character
+        let review = "- résumé of the finding — it is quite long and detailed\n";
+        let result = extract_finding_summary(review, 20).unwrap();
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 23); // max_chars + "..."
+        // Verify the result is valid UTF-8 (would panic on push_str otherwise)
+        let _ = result.as_bytes();
+    }
+
+    #[test]
+    fn format_tasks_findings_summary_safe_with_multibyte_utf8() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "F1".to_string(),
+                description: "café résumé — long description with em-dashes".to_string(),
+                status: crate::state::TasksFindingStatus::Open,
+                round_introduced: 1,
+                round_resolved: None,
+            }],
+        };
+        let result = format_tasks_findings_summary(&findings, 20).unwrap();
+        assert!(result.ends_with("..."));
+        // Must be valid UTF-8 and not panic
+        let _ = result.as_bytes();
+    }
+
+    #[test]
+    fn extract_finding_summary_limits_to_5_bullets() {
+        let review = "- a\n- b\n- c\n- d\n- e\n- f\n- g\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- a\n- b\n- c\n- d\n- e");
+    }
+
+    #[test]
+    fn extract_finding_summary_truncates_at_max_chars() {
+        let review = "- this is a long finding that takes up space\n- another long finding here\n- yet another\n";
+        let result = extract_finding_summary(review, 60).unwrap();
+        // Should truncate to max_chars, including partial content from truncated line
+        assert!(result.len() <= 63); // line content + "..."
+        assert!(result.ends_with("..."));
+        // First line fits (44 chars), second line should be char-truncated
+        assert!(result.contains("- this is a long finding that takes up space"));
+    }
+
+    #[test]
+    fn extract_finding_summary_truncates_first_long_line() {
+        // When even the first line exceeds max_chars, it should be
+        // char-truncated rather than replaced with just "- ..."
+        let review = "- this is a very long finding that exceeds the limit by a lot\n";
+        let result = extract_finding_summary(review, 30).unwrap();
+        assert!(result.len() <= 33);
+        assert!(result.ends_with("..."));
+        // Must contain actual finding content, not just "..."
+        assert!(result.starts_with("- this is a very long findi"));
+    }
+
+    #[test]
+    fn extract_finding_summary_mixed_bullet_styles() {
+        let review = "- dash item\n* star item\n1. numbered item\n";
+        let result = extract_finding_summary(review, 500).unwrap();
+        assert_eq!(result, "- dash item\n* star item\n1. numbered item");
+    }
+
+    // -----------------------------------------------------------------------
+    // format_tasks_findings_summary tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_tasks_findings_summary_returns_none_when_no_open() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![crate::state::TasksFindingEntry {
+                id: "F1".to_string(),
+                description: "resolved issue".to_string(),
+                status: crate::state::TasksFindingStatus::Resolved,
+                round_introduced: 1,
+                round_resolved: Some(2),
+            }],
+        };
+        assert!(format_tasks_findings_summary(&findings, 500).is_none());
+    }
+
+    #[test]
+    fn format_tasks_findings_summary_returns_none_when_empty() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![],
+        };
+        assert!(format_tasks_findings_summary(&findings, 500).is_none());
+    }
+
+    #[test]
+    fn format_tasks_findings_summary_renders_open_findings() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![
+                crate::state::TasksFindingEntry {
+                    id: "F1".to_string(),
+                    description: "missing tests".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F2".to_string(),
+                    description: "unclear naming".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+            ],
+        };
+        let result = format_tasks_findings_summary(&findings, 500).unwrap();
+        assert_eq!(result, "- [F1] missing tests\n- [F2] unclear naming");
+    }
+
+    #[test]
+    fn format_tasks_findings_summary_truncates_at_max_chars() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![
+                crate::state::TasksFindingEntry {
+                    id: "F1".to_string(),
+                    description: "a]".repeat(50),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F2".to_string(),
+                    description: "b".repeat(50),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F3".to_string(),
+                    description: "c".repeat(50),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+            ],
+        };
+        let result = format_tasks_findings_summary(&findings, 80).unwrap();
+        assert!(result.ends_with("..."));
+        assert!(result.len() <= 83); // max_chars + "..."
+        // Should contain actual content from F1, not just "..."
+        assert!(result.starts_with("- [F1]"));
+    }
+
+    #[test]
+    fn format_tasks_findings_summary_prioritizes_most_recent_round() {
+        let findings = crate::state::TasksFindingsFile {
+            findings: vec![
+                crate::state::TasksFindingEntry {
+                    id: "F1".to_string(),
+                    description: "old finding from round 1".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 1,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F2".to_string(),
+                    description: "old finding from round 2".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 2,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F3".to_string(),
+                    description: "old finding from round 3".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 3,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F4".to_string(),
+                    description: "old finding from round 4".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 4,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F5".to_string(),
+                    description: "old finding from round 5".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 5,
+                    round_resolved: None,
+                },
+                crate::state::TasksFindingEntry {
+                    id: "F6".to_string(),
+                    description: "new finding from round 6".to_string(),
+                    status: crate::state::TasksFindingStatus::Open,
+                    round_introduced: 6,
+                    round_resolved: None,
+                },
+            ],
+        };
+        let result = format_tasks_findings_summary(&findings, 500).unwrap();
+        // F6 (round 6) should appear first, and F1 (round 1) should be dropped
+        // since we cap at 5 items
+        assert!(result.starts_with("- [F6] new finding from round 6"));
+        assert!(!result.contains("[F1]"));
+        // Should contain F2-F6 in reverse round order
+        let lines: Vec<&str> = result.lines().collect();
+        assert_eq!(lines.len(), 5);
+        assert!(lines[0].contains("[F6]"));
+        assert!(lines[1].contains("[F5]"));
+        assert!(lines[2].contains("[F4]"));
+        assert!(lines[3].contains("[F3]"));
+        assert!(lines[4].contains("[F2]"));
     }
 }

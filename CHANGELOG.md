@@ -4,6 +4,15 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-03-13
+
+### Added
+- Planning and task-decomposition progress logs now capture compact findings summaries alongside round verdicts, so persisted progress files keep the key reviewer objections visible without reopening full review artifacts.
+- Added regression coverage for findings-summary extraction, truncation, UTF-8 safety, and progress-log rendering.
+
+### Changed
+- Planning progress now records adversarial-review findings and role-swap events through the same round-grouped append path used by task progress logs.
+
 ## [0.1.12] - 2026-03-13
 
 ### Added
