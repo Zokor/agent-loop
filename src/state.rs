@@ -447,9 +447,10 @@ pub fn complete_transcript_entry(
 /// Append a human-readable transcript entry to `.agent-loop/state/transcript.log`.
 ///
 /// Convenience wrapper around [`begin_transcript_entry`] and [`complete_transcript_entry`],
-/// retained for backward compatibility with existing tests and direct call sites.
+/// retained for use in tests.
 ///
 /// No-op when `!config.transcript_enabled`. Failures are best-effort (non-fatal).
+#[cfg(test)]
 pub fn append_transcript_entry(
     config: &Config,
     meta: &AgentCallMeta,
