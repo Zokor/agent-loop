@@ -63,6 +63,7 @@ pub struct TestConfigOptions {
     pub codex_full_access: bool,
     pub codex_session_persistence: bool,
     pub transcript_enabled: bool,
+    pub session: Option<String>,
 }
 
 impl Default for TestConfigOptions {
@@ -111,6 +112,7 @@ impl Default for TestConfigOptions {
             codex_full_access: true,
             codex_session_persistence: true,
             transcript_enabled: false,
+            session: None,
         }
     }
 }
@@ -130,9 +132,16 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
             .unwrap_or_else(|| options.implementer.clone())
     };
 
+    let base_state_dir = root.join(".agent-loop").join("state");
+    let state_dir = match &options.session {
+        Some(name) => base_state_dir.join(name),
+        None => base_state_dir,
+    };
+
     Config {
         project_dir: root.to_path_buf(),
-        state_dir: root.join(".agent-loop").join("state"),
+        state_dir,
+        session: options.session.clone(),
         review_max_rounds: options.review_max_rounds,
         planning_max_rounds: options.planning_max_rounds,
         decomposition_max_rounds: options.decomposition_max_rounds,
@@ -435,6 +444,12 @@ impl TestProjectBuilder {
     #[allow(dead_code)]
     pub fn batch_implement(mut self, value: bool) -> Self {
         self.options.batch_implement = value;
+        self
+    }
+
+    #[allow(dead_code)]
+    pub fn session(mut self, name: impl Into<String>) -> Self {
+        self.options.session = Some(name.into());
         self
     }
 

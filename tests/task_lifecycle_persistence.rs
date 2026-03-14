@@ -27,8 +27,26 @@ fn write_state_file(project_dir: &Path, name: &str, content: &str) {
     fs::write(state_dir.join(name), content).expect("state file should be written");
 }
 
+fn write_session_state_file(project_dir: &Path, session: &str, name: &str, content: &str) {
+    let state_dir = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join(session);
+    fs::create_dir_all(&state_dir).expect("session state dir should be created");
+    fs::write(state_dir.join(name), content).expect("session state file should be written");
+}
+
 fn read_state_file(project_dir: &Path, name: &str) -> String {
     let path = project_dir.join(".agent-loop").join("state").join(name);
+    fs::read_to_string(path).unwrap_or_default()
+}
+
+fn read_session_state_file(project_dir: &Path, session: &str, name: &str) -> String {
+    let path = project_dir
+        .join(".agent-loop")
+        .join("state")
+        .join(session)
+        .join(name);
     fs::read_to_string(path).unwrap_or_default()
 }
 
@@ -684,7 +702,7 @@ fn implement_wave_resume_preserves_task_local_progress_history() {
     );
     write_state_file(&project_dir, "implement-mode.txt", "wave\n");
 
-    let task_state_dir = project_dir.join(".agent-loop").join("state").join("task-1");
+    let task_state_dir = project_dir.join(".agent-loop").join("state").join(".wave-task-1");
     fs::create_dir_all(&task_state_dir).expect("task state dir should exist");
     fs::write(
         task_state_dir.join("implement-progress.md"),
@@ -733,6 +751,238 @@ fn implement_resume_uses_persisted_wave_flags() {
     assert!(
         stdout.contains("max_parallel=4"),
         "resume should reuse persisted wave max_parallel: stdout={stdout}"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+// ---------------------------------------------------------------------------
+// Session namespace integration tests
+// ---------------------------------------------------------------------------
+
+/// Mock agents that discover the state dir from prompt args even when relative
+/// paths are used (as happens with session namespaces where prompts contain
+/// `.agent-loop/state/<session>/task.md` instead of absolute paths).
+#[cfg(unix)]
+fn create_session_aware_succeeding_agents(project_dir: &Path) {
+    let script = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        --version) echo "mock 1.0.0"; exit 0 ;;
+    esac
+done
+ALL_ARGS="$*"
+# Try absolute path first, then relative (session prompts use relative paths)
+TASK_FILE_PATH=$(printf '%s' "$ALL_ARGS" | grep -o '/[^"[:space:]]*\.agent-loop/state[^"[:space:]]*/task\.md' | head -n1)
+if [ -z "$TASK_FILE_PATH" ]; then
+    # Relative path: extract .agent-loop/state/.../task.md
+    REL_PATH=$(printf '%s' "$ALL_ARGS" | grep -o '\.agent-loop/state[^"[:space:]]*/task\.md' | head -n1)
+    if [ -n "$REL_PATH" ]; then
+        TASK_FILE_PATH="$(pwd)/$REL_PATH"
+    fi
+fi
+if [ -n "$TASK_FILE_PATH" ]; then
+    STATE_DIR=$(dirname "$TASK_FILE_PATH")
+else
+    STATE_DIR="$(pwd)/.agent-loop/state"
+fi
+mkdir -p "$STATE_DIR"
+STATUS_FILE="$STATE_DIR/status.json"
+FINDINGS_FILE="$STATE_DIR/findings.json"
+CURRENT_TS=$(printf '%s' "$ALL_ARGS" | sed -n 's/.*"timestamp"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | tail -1)
+if [ -z "$CURRENT_TS" ]; then
+    CURRENT_TS="2026-02-16T00:00:00.000Z"
+fi
+printf '{"round":1,"findings":[]}' > "$FINDINGS_FILE"
+printf '{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","rating":5,"timestamp":"%s"}' "$CURRENT_TS" > "$STATUS_FILE"
+exit 0
+"#;
+    create_mock_agent(project_dir, "claude", script);
+    create_mock_agent(project_dir, "codex", script);
+}
+
+#[cfg(unix)]
+#[test]
+fn session_isolation_two_sessions_write_to_separate_dirs() {
+    let project_dir = create_project_dir("session_isolation");
+    create_session_aware_succeeding_agents(&project_dir);
+
+    // Write tasks for session "alpha"
+    write_session_state_file(
+        &project_dir,
+        "alpha",
+        "tasks.md",
+        "### Task 1: Alpha work\nAlpha\n",
+    );
+
+    // Write tasks for session "beta"
+    write_session_state_file(
+        &project_dir,
+        "beta",
+        "tasks.md",
+        "### Task 1: Beta work\nBeta\n",
+    );
+
+    // Run implement for each session
+    let output_alpha = run_implement_cmd(&project_dir, &["--session", "alpha"]);
+    assert!(
+        output_alpha.status.success(),
+        "session alpha should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output_alpha.stdout),
+        String::from_utf8_lossy(&output_alpha.stderr)
+    );
+
+    let output_beta = run_implement_cmd(&project_dir, &["--session", "beta"]);
+    assert!(
+        output_beta.status.success(),
+        "session beta should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output_beta.stdout),
+        String::from_utf8_lossy(&output_beta.stderr)
+    );
+
+    // Each session should have its own status.json
+    let alpha_status = read_session_state_file(&project_dir, "alpha", "status.json");
+    let beta_status = read_session_state_file(&project_dir, "beta", "status.json");
+
+    assert!(
+        !alpha_status.is_empty(),
+        "alpha session should have status.json"
+    );
+    assert!(
+        !beta_status.is_empty(),
+        "beta session should have status.json"
+    );
+
+    // Each session should have its own task.md
+    let alpha_task = read_session_state_file(&project_dir, "alpha", "task.md");
+    let beta_task = read_session_state_file(&project_dir, "beta", "task.md");
+
+    assert!(
+        alpha_task.contains("Alpha"),
+        "alpha task should contain alpha content: {alpha_task}"
+    );
+    assert!(
+        beta_task.contains("Beta"),
+        "beta task should contain beta content: {beta_task}"
+    );
+
+    // Default state dir should be unaffected
+    let default_status = read_state_file(&project_dir, "status.json");
+    assert!(
+        default_status.is_empty(),
+        "default session should have no status.json"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn reset_session_only_clears_that_sessions_state() {
+    let project_dir = create_project_dir("reset_session_scoped");
+
+    // Seed state for session "feat" and default session
+    write_session_state_file(&project_dir, "feat", "status.json", r#"{"status":"APPROVED"}"#);
+    write_session_state_file(&project_dir, "feat", "task.md", "feat task");
+    write_state_file(&project_dir, "status.json", r#"{"status":"APPROVED"}"#);
+    write_state_file(&project_dir, "task.md", "default task");
+
+    // Also seed a second session
+    write_session_state_file(&project_dir, "other", "status.json", r#"{"status":"APPROVED"}"#);
+
+    // Run reset --session feat
+    let output = std::process::Command::new(agent_loop_bin())
+        .args(["reset", "--session", "feat"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("reset should run");
+
+    assert!(
+        output.status.success(),
+        "reset --session feat should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Session "feat" state should be cleared
+    let feat_status = read_session_state_file(&project_dir, "feat", "status.json");
+    assert!(
+        feat_status.is_empty(),
+        "feat session state should be cleared after reset"
+    );
+
+    // Default session state should be untouched
+    let default_status = read_state_file(&project_dir, "status.json");
+    assert!(
+        !default_status.is_empty(),
+        "default session state should survive reset --session feat"
+    );
+
+    // Other session state should be untouched
+    let other_status = read_session_state_file(&project_dir, "other", "status.json");
+    assert!(
+        !other_status.is_empty(),
+        "other session state should survive reset --session feat"
+    );
+
+    let _ = fs::remove_dir_all(&project_dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn status_session_reads_from_session_state_dir() {
+    let project_dir = create_project_dir("status_session");
+
+    // Seed session "dev" with specific status
+    write_session_state_file(
+        &project_dir,
+        "dev",
+        "status.json",
+        r#"{"status":"NEEDS_CHANGES","round":3,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"setup","reason":"needs work","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    // Seed default session with different status
+    write_state_file(
+        &project_dir,
+        "status.json",
+        r#"{"status":"APPROVED","round":1,"implementer":"claude","reviewer":"claude","mode":"single-agent","lastRunTask":"","timestamp":"2026-02-16T00:00:00.000Z"}"#,
+    );
+
+    // Run status --session dev
+    let output = std::process::Command::new(agent_loop_bin())
+        .args(["status", "--session", "dev"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("status should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "status --session dev should succeed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Should show session dev's status, not default
+    assert!(
+        stdout.contains("NEEDS_CHANGES"),
+        "status --session dev should show session's status: {stdout}"
+    );
+    assert!(
+        stdout.contains("round: 3"),
+        "status --session dev should show session's round: {stdout}"
+    );
+
+    // Verify default session shows different status
+    let default_output = std::process::Command::new(agent_loop_bin())
+        .args(["status"])
+        .current_dir(&project_dir)
+        .output()
+        .expect("status should run");
+
+    let default_stdout = String::from_utf8_lossy(&default_output.stdout);
+    assert!(
+        default_stdout.contains("APPROVED"),
+        "default status should show APPROVED, not session dev's status: {default_stdout}"
     );
 
     let _ = fs::remove_dir_all(&project_dir);

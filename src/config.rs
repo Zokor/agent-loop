@@ -266,6 +266,7 @@ impl fmt::Display for RunMode {
 pub struct Config {
     pub project_dir: PathBuf,
     pub state_dir: PathBuf,
+    pub session: Option<String>,
     pub review_max_rounds: u32,
     pub planning_max_rounds: u32,
     pub decomposition_max_rounds: u32,
@@ -382,6 +383,37 @@ impl Config {
         }
     }
 
+    pub fn agent_loop_dir(&self) -> PathBuf {
+        self.project_dir.join(".agent-loop")
+    }
+
+    /// Relative state dir path for use in prompt/display text.
+    ///
+    /// Derived from the actual `state_dir` by stripping `project_dir`, so it
+    /// stays correct for wave task configs where `with_state_dir()` points
+    /// `state_dir` at a task-local subdirectory.
+    pub fn state_dir_rel(&self) -> String {
+        self.state_dir
+            .strip_prefix(&self.project_dir)
+            .unwrap_or(&self.state_dir)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    pub fn wave_lock_path(&self) -> PathBuf {
+        match &self.session {
+            Some(name) => self.agent_loop_dir().join(format!("wave-{name}.lock")),
+            None => self.agent_loop_dir().join("wave.lock"),
+        }
+    }
+
+    pub fn wave_journal_path(&self) -> PathBuf {
+        match &self.session {
+            Some(name) => self.agent_loop_dir().join(format!("wave-progress-{name}.jsonl")),
+            None => self.agent_loop_dir().join("wave-progress.jsonl"),
+        }
+    }
+
     /// Clone this config with a different state_dir and auto_commit disabled.
     /// Used by wave orchestrator to give each task its own state directory.
     pub fn with_state_dir(&self, state_dir: PathBuf) -> Self {
@@ -395,8 +427,9 @@ impl Config {
         project_dir: PathBuf,
         single_agent_flag: bool,
         verbose_flag: bool,
+        session: Option<&str>,
     ) -> Result<Self, AgentLoopError> {
-        Self::from_cli_with_overrides(project_dir, single_agent_flag, verbose_flag, None)
+        Self::from_cli_with_overrides(project_dir, single_agent_flag, verbose_flag, None, session)
     }
 
     /// Build config with optional overrides applied **before** validation.
@@ -408,7 +441,11 @@ impl Config {
         single_agent_flag: bool,
         verbose_flag: bool,
         review_max_rounds_override: Option<u32>,
+        session: Option<&str>,
     ) -> Result<Self, AgentLoopError> {
+        if let Some(name) = session {
+            validate_session_name(name)?;
+        }
         let FileConfigResult {
             config: file,
             file_found: config_file_found,
@@ -622,8 +659,14 @@ impl Config {
             .or(file.transcript_enabled)
             .unwrap_or(true);
 
+        let state_dir = match session {
+            Some(name) => project_dir.join(".agent-loop").join("state").join(name),
+            None => project_dir.join(".agent-loop").join("state"),
+        };
+
         let config = Self {
-            state_dir: project_dir.join(".agent-loop").join("state"),
+            state_dir,
+            session: session.map(|s| s.to_string()),
             run_mode: resolve_run_mode(single_agent),
             project_dir,
             review_max_rounds,
@@ -682,6 +725,31 @@ impl Config {
 
         Ok(config)
     }
+}
+
+/// Validate a session name: alphanumeric, hyphens, underscores only.
+/// Max 64 characters. No path separators, dots, or spaces.
+pub(crate) fn validate_session_name(name: &str) -> Result<(), AgentLoopError> {
+    if name.is_empty() {
+        return Err(AgentLoopError::Config(
+            "Session name cannot be empty.".to_string(),
+        ));
+    }
+    if name.len() > 64 {
+        return Err(AgentLoopError::Config(format!(
+            "Session name too long ({} chars, max 64): {name}",
+            name.len()
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(AgentLoopError::Config(format!(
+            "Invalid session name '{name}': only alphanumeric, hyphens, and underscores allowed."
+        )));
+    }
+    Ok(())
 }
 
 /// Validate that agent string fields in the config contain known values.
@@ -1455,7 +1523,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_defaults");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
 
         assert_eq!(config.project_dir, project_dir);
         assert_eq!(config.state_dir, project_dir.join(".agent-loop/state"));
@@ -1500,7 +1568,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_env_overrides");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
 
         assert_eq!(config.review_max_rounds, 42);
         assert_eq!(config.planning_max_rounds, 7);
@@ -1524,7 +1592,7 @@ command = "cargo test"
         set_env("REVIEW_MAX_ROUNDS", "not-a-number");
 
         let project_dir = create_temp_project_root("cfg_invalid_env");
-        let err = Config::from_cli(project_dir.clone(), false, false)
+        let err = Config::from_cli(project_dir.clone(), false, false, None)
             .expect_err("invalid round-limit env should fail");
         let msg = err.to_string();
         assert!(
@@ -1543,7 +1611,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_invalid_timeout_env");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
 
         assert_eq!(config.timeout_seconds, DEFAULT_TIMEOUT_SECONDS);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -1557,7 +1625,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_zero_rounds");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("0 should be valid");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("0 should be valid");
         assert_eq!(config.review_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -1569,7 +1637,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_auto_test_off");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.auto_test);
         assert_eq!(config.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
@@ -1583,7 +1651,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_auto_test_on");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.auto_test);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -1597,12 +1665,12 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_auto_test_cmd");
         let config =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.auto_test_cmd, Some("make test".to_string()));
 
         set_env("AUTO_TEST_CMD", "   ");
         let config2 =
-            Config::from_cli(project_dir.clone(), false, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config2.auto_test_cmd, None);
         let _ = std::fs::remove_dir_all(&project_dir);
     }
@@ -1616,7 +1684,7 @@ command = "cargo test"
 
         let project_dir = create_temp_project_root("cfg_cli_flag");
         let config =
-            Config::from_cli(project_dir.clone(), true, false).expect("from_cli should succeed");
+            Config::from_cli(project_dir.clone(), true, false, None).expect("from_cli should succeed");
 
         assert!(config.single_agent);
         assert_eq!(config.reviewer, Agent::known("codex"));
@@ -1653,7 +1721,7 @@ batch_implement = false
 "#,
         );
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
 
         assert_eq!(config.review_max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
@@ -1705,7 +1773,7 @@ batch_implement = true
         set_env("AUTO_TEST", "1");
         set_env("AUTO_TEST_CMD", "npm test");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
 
         assert_eq!(config.review_max_rounds, 50);
         assert_eq!(config.timeout_seconds, 1200);
@@ -1733,7 +1801,7 @@ batch_implement = true
         write_toml(&dir, "single_agent = false\n");
         set_env("SINGLE_AGENT", "false");
 
-        let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), true, false, None).expect("from_cli should succeed");
         assert!(config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1751,7 +1819,7 @@ batch_implement = true
         write_toml(&dir, "single_agent = true\n");
         set_env("SINGLE_AGENT", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.single_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1765,7 +1833,7 @@ batch_implement = true
         write_toml(&dir, "auto_test = true\n");
         set_env("AUTO_TEST", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.auto_test);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1779,7 +1847,7 @@ batch_implement = true
         write_toml(&dir, "auto_commit = true\n");
         set_env("AUTO_COMMIT", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1796,7 +1864,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_reviewer_toml");
         write_toml(&dir, "reviewer = \"claude\"\nimplementer = \"claude\"\n");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         // Both claude -> explicit reviewer override honored
         assert_eq!(config.implementer, Agent::known("claude"));
         assert_eq!(config.reviewer, Agent::known("claude"));
@@ -1812,7 +1880,7 @@ batch_implement = true
         write_toml(&dir, "reviewer = \"claude\"\n");
         set_env("REVIEWER", "codex");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::known("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1828,7 +1896,7 @@ batch_implement = true
             "implementer = \"codex\"\nreviewer = \"claude\"\nsingle_agent = true\n",
         );
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.single_agent);
         assert_eq!(config.implementer, Agent::known("codex"));
         assert_eq!(config.reviewer, Agent::known("codex"));
@@ -1843,7 +1911,7 @@ batch_implement = true
         set_env("IMPLEMENTER", "claude");
 
         let dir = create_temp_project_root("cfg_reviewer_sa_env");
-        let config = Config::from_cli(dir.clone(), true, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), true, false, None).expect("from_cli should succeed");
         assert_eq!(config.reviewer, Agent::known("claude"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1858,7 +1926,7 @@ batch_implement = true
         clear_env();
 
         let dir = create_temp_project_root("cfg_planner_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner, config.implementer);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1871,7 +1939,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_planner_toml");
         write_toml(&dir, "planner = \"codex\"\n");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner.name(), "codex");
         assert_eq!(config.planner.model(), None);
         assert_eq!(config.implementer.name(), "claude");
@@ -1887,7 +1955,7 @@ batch_implement = true
         write_toml(&dir, "planner = \"claude\"\n");
         set_env("PLANNER", "codex");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner, Agent::known("codex"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1903,7 +1971,7 @@ batch_implement = true
             "implementer = \"codex\"\nplanner = \"claude\"\nsingle_agent = true\n",
         );
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.single_agent);
         assert_eq!(config.planner, config.implementer);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1928,7 +1996,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_planner_model");
         write_toml(&dir, "planner = \"codex\"\nplanner_model = \"o3\"\n");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner.name(), "codex");
         assert_eq!(config.planner.model(), Some("o3"));
         // Implementer should be unaffected
@@ -1944,7 +2012,7 @@ batch_implement = true
         set_env("IMPLEMENTER_MODEL", "claude-sonnet-4-6");
 
         let dir = create_temp_project_root("cfg_planner_inherit_model");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         // Planner defaults to implementer and inherits its model
         assert_eq!(config.planner.name(), "claude");
         assert_eq!(config.planner.model(), Some("claude-sonnet-4-6"));
@@ -1961,7 +2029,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_planner_no_inherit");
         write_toml(&dir, "planner = \"codex\"\n");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         // Explicit planner should NOT inherit implementer model
         assert_eq!(config.planner.name(), "codex");
         assert_eq!(config.planner.model(), None);
@@ -1980,7 +2048,7 @@ batch_implement = true
         clear_env();
 
         let dir = create_temp_project_root("cfg_ac_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1992,7 +2060,7 @@ batch_implement = true
         set_env("AUTO_COMMIT", "anything");
 
         let dir = create_temp_project_root("cfg_ac_nonzero");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.auto_commit);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2009,7 +2077,7 @@ batch_implement = true
 
         let dir = create_temp_project_root("cfg_zero_planning");
         let config =
-            Config::from_cli(dir.clone(), false, false).expect("0 should be valid (unlimited)");
+            Config::from_cli(dir.clone(), false, false, None).expect("0 should be valid (unlimited)");
         assert_eq!(config.planning_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2022,7 +2090,7 @@ batch_implement = true
 
         let dir = create_temp_project_root("cfg_zero_decomp");
         let config =
-            Config::from_cli(dir.clone(), false, false).expect("0 should be valid (unlimited)");
+            Config::from_cli(dir.clone(), false, false, None).expect("0 should be valid (unlimited)");
         assert_eq!(config.decomposition_max_rounds, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2034,7 +2102,7 @@ batch_implement = true
         set_env("TIMEOUT", "0");
 
         let dir = create_temp_project_root("cfg_zero_timeout");
-        let err = Config::from_cli(dir.clone(), false, false).expect_err("timeout=0 should fail");
+        let err = Config::from_cli(dir.clone(), false, false, None).expect_err("timeout=0 should fail");
         assert!(err.to_string().contains("timeout must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2047,7 +2115,7 @@ batch_implement = true
         set_env("DECISIONS_MAX_LINES", "0");
 
         let dir = create_temp_project_root("cfg_zero_decisions_max_lines");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("decisions_max_lines=0 should fail");
         assert!(err.to_string().contains("decisions_max_lines must be > 0"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2062,7 +2130,7 @@ batch_implement = true
         write_toml(&dir, "compound = true\n");
         set_env("COMPOUND", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.compound);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2076,7 +2144,7 @@ batch_implement = true
         write_toml(&dir, "decisions_max_lines = 20\n");
         set_env("DECISIONS_MAX_LINES", "80");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.decisions_max_lines, 80);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2090,7 +2158,7 @@ batch_implement = true
         write_toml(&dir, "batch_implement = true\n");
         set_env("BATCH_IMPLEMENT", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.batch_implement);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2101,7 +2169,7 @@ batch_implement = true
         clear_env();
 
         let dir = create_temp_project_root("cfg_planner_perm_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner_permission_mode, "default");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2115,7 +2183,7 @@ batch_implement = true
         write_toml(&dir, "planner_permission_mode = \"default\"\n");
         set_env("PLANNER_PERMISSION_MODE", "plan");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planner_permission_mode, "plan");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2128,7 +2196,7 @@ batch_implement = true
         let dir = create_temp_project_root("cfg_invalid_planner_perm");
         write_toml(&dir, "planner_permission_mode = \"invalid\"\n");
 
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid planner_permission_mode should fail");
         assert!(
             err.to_string()
@@ -2177,7 +2245,7 @@ command = "cargo test"
 
         let dir = create_temp_project_root("cfg_valid_defaults");
         let config =
-            Config::from_cli(dir.clone(), false, false).expect("default config should be valid");
+            Config::from_cli(dir.clone(), false, false, None).expect("default config should be valid");
         assert_eq!(config.review_max_rounds, 0); // unlimited by default
         assert_eq!(config.planning_max_rounds, 0); // unlimited by default
         assert!(config.timeout_seconds > 0);
@@ -2216,7 +2284,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_new_fields_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, None);
         assert_eq!(config.context_line_cap, None);
         assert_eq!(config.planning_context_excerpt_lines, None);
@@ -2237,7 +2305,7 @@ planning_context_excerpt_lines = 75
             &dir,
             "diff_max_lines = 250\ncontext_line_cap = 120\nplanning_context_excerpt_lines = 60\n",
         );
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(250));
         assert_eq!(config.context_line_cap, Some(120));
         assert_eq!(config.planning_context_excerpt_lines, Some(60));
@@ -2256,7 +2324,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "diff_max_lines = 250\n");
         set_env("DIFF_MAX_LINES", "999");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.diff_max_lines, Some(999));
         assert_eq!(config.effective_diff_max_lines(), 999);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2271,7 +2339,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "context_line_cap = 120\n");
         set_env("CONTEXT_LINE_CAP", "300");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.context_line_cap, Some(300));
         assert_eq!(config.effective_context_line_cap(), 300);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2286,7 +2354,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "planning_context_excerpt_lines = 60\n");
         set_env("PLANNING_CONTEXT_EXCERPT_LINES", "200");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.planning_context_excerpt_lines, Some(200));
         assert_eq!(config.effective_planning_context_excerpt_lines(), 200);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2302,7 +2370,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_verbose_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2313,7 +2381,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_verbose_flag");
-        let config = Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, true, None).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2325,7 +2393,7 @@ planning_context_excerpt_lines = 75
         set_env("VERBOSE", "1");
 
         let dir = create_temp_project_root("cfg_verbose_env");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2337,7 +2405,7 @@ planning_context_excerpt_lines = 75
         set_env("VERBOSE", "0");
 
         let dir = create_temp_project_root("cfg_verbose_flag_over_env");
-        let config = Config::from_cli(dir.clone(), false, true).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, true, None).expect("from_cli should succeed");
         assert!(config.verbose);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2362,7 +2430,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_max_parallel_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, DEFAULT_MAX_PARALLEL);
         assert_eq!(config.max_parallel, 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2376,7 +2444,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_env_max_parallel");
         write_toml(&dir, "max_parallel = 4\n");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2388,7 +2456,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_toml_max_parallel");
         write_toml(&dir, "max_parallel = 4\n");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(config.max_parallel, 4);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2401,7 +2469,7 @@ planning_context_excerpt_lines = 75
         let dir = create_temp_project_root("cfg_zero_max_parallel");
         write_toml(&dir, "max_parallel = 0\n");
         let err =
-            Config::from_cli(dir.clone(), false, false).expect_err("max_parallel=0 should fail");
+            Config::from_cli(dir.clone(), false, false, None).expect_err("max_parallel=0 should fail");
         assert!(err.to_string().contains("max_parallel must be >= 1"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2454,7 +2522,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_invalid_impl");
         write_toml(&dir, "implementer = \"typo-agent\"\n");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid implementer should fail from_cli");
         assert!(err.to_string().contains("invalid implementer"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2467,7 +2535,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_invalid_rev");
         write_toml(&dir, "reviewer = \"gpt4\"\n");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid reviewer should fail from_cli");
         assert!(err.to_string().contains("invalid reviewer"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2483,7 +2551,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_override_mr");
-        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(42))
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(42), None)
             .expect("override review_max_rounds should succeed");
         assert_eq!(config.review_max_rounds, 42);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2498,7 +2566,7 @@ planning_context_excerpt_lines = 75
         let dir = create_temp_project_root("cfg_override_mr_env");
         write_toml(&dir, "review_max_rounds = 50\n");
 
-        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(7))
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(7), None)
             .expect("override review_max_rounds should win");
         assert_eq!(config.review_max_rounds, 7);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2702,7 +2770,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_adversarial_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(
             config.planning_adversarial_review,
             "planning_adversarial_review should default to true"
@@ -2717,7 +2785,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_adversarial_toml");
         write_toml(&dir, "planning_adversarial_review = false\n");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(
             !config.planning_adversarial_review,
             "planning_adversarial_review should be disabled via TOML"
@@ -2734,7 +2802,7 @@ planning_context_excerpt_lines = 75
         write_toml(&dir, "planning_adversarial_review = true\n");
         set_env("PLANNING_ADVERSARIAL_REVIEW", "0");
 
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(
             !config.planning_adversarial_review,
             "env PLANNING_ADVERSARIAL_REVIEW=0 should override TOML"
@@ -2749,7 +2817,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_ctx_zero");
         write_toml(&dir, "context_line_cap = 0\n");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(
             config.effective_context_line_cap(),
             u32::MAX,
@@ -2765,7 +2833,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_excerpt_zero");
         write_toml(&dir, "planning_context_excerpt_lines = 0\n");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert_eq!(
             config.effective_planning_context_excerpt_lines(),
             u32::MAX,
@@ -2798,7 +2866,7 @@ planning_context_excerpt_lines = 75
         set_env("MAX_ROUNDS", "10");
 
         let dir = create_temp_project_root("cfg_old_max_rounds_env");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("old MAX_ROUNDS env should fail");
         let msg = err.to_string();
         assert!(
@@ -2841,7 +2909,7 @@ planning_context_excerpt_lines = 75
         clear_env();
 
         let dir = create_temp_project_root("cfg_full_access_default");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(
             config.claude_full_access,
             "claude_full_access should default to true"
@@ -2863,7 +2931,7 @@ planning_context_excerpt_lines = 75
             &dir,
             "claude_full_access = false\ncodex_full_access = false\n",
         );
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.claude_full_access);
         assert!(!config.codex_full_access);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2881,7 +2949,7 @@ planning_context_excerpt_lines = 75
         );
         set_env("CLAUDE_FULL_ACCESS", "0");
         set_env("CODEX_FULL_ACCESS", "0");
-        let config = Config::from_cli(dir.clone(), false, false).expect("from_cli should succeed");
+        let config = Config::from_cli(dir.clone(), false, false, None).expect("from_cli should succeed");
         assert!(!config.claude_full_access);
         assert!(!config.codex_full_access);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2985,7 +3053,7 @@ planning_context_excerpt_lines = 75
         set_env("REVIEW_MAX_ROUNDS", "20");
 
         let dir = create_temp_project_root("cfg_override_mr_zero");
-        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(0))
+        let config = Config::from_cli_with_overrides(dir.clone(), false, false, Some(0), None)
             .expect("override review_max_rounds=0 should succeed");
         assert_eq!(
             config.review_max_rounds, 0,
@@ -3073,7 +3141,7 @@ planning_context_excerpt_lines = 75
         set_env("REVIEW_MAX_ROUNDS", "not-a-number");
 
         let dir = create_temp_project_root("cfg_invalid_review_env");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid REVIEW_MAX_ROUNDS env should fail");
         let msg = err.to_string();
         assert!(
@@ -3090,7 +3158,7 @@ planning_context_excerpt_lines = 75
         set_env("PLANNING_MAX_ROUNDS", "-1");
 
         let dir = create_temp_project_root("cfg_invalid_planning_env");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid PLANNING_MAX_ROUNDS env should fail");
         let msg = err.to_string();
         assert!(
@@ -3107,7 +3175,7 @@ planning_context_excerpt_lines = 75
         set_env("DECOMPOSITION_MAX_ROUNDS", "abc");
 
         let dir = create_temp_project_root("cfg_invalid_decomp_env");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("invalid DECOMPOSITION_MAX_ROUNDS env should fail");
         let msg = err.to_string();
         assert!(
@@ -3126,7 +3194,7 @@ planning_context_excerpt_lines = 75
         set_env("DECOMPOSITION_MAX_ROUNDS", "0");
 
         let dir = create_temp_project_root("cfg_valid_round_env");
-        let config = Config::from_cli(dir.clone(), false, false)
+        let config = Config::from_cli(dir.clone(), false, false, None)
             .expect("valid round env values should succeed");
         assert_eq!(config.review_max_rounds, 10);
         assert_eq!(config.planning_max_rounds, 5);
@@ -3242,7 +3310,7 @@ planning_context_excerpt_lines = 75
         set_env("REVIEW_MAX_ROUNDS", "-5");
 
         let dir = create_temp_project_root("cfg_neg_review_env");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("REVIEW_MAX_ROUNDS=-5 should fail");
         let msg = err.to_string();
         assert!(
@@ -3261,7 +3329,7 @@ planning_context_excerpt_lines = 75
         let _guard = env_lock();
         clear_env();
         let dir = create_temp_project_root("cfg_decisions_default");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(!config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3273,7 +3341,7 @@ planning_context_excerpt_lines = 75
         set_env("DECISIONS_ENABLED", "true");
 
         let dir = create_temp_project_root("cfg_decisions_env");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3285,7 +3353,7 @@ planning_context_excerpt_lines = 75
         set_env("DECISIONS_AUTO_REFERENCE", "0");
 
         let dir = create_temp_project_root("cfg_decisions_ref_env");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(!config.decisions_auto_reference);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3297,7 +3365,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_decisions_toml");
         write_toml(&dir, "decisions_enabled = true\n");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(config.decisions_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3310,7 +3378,7 @@ planning_context_excerpt_lines = 75
         set_env("DECISIONS_MAX_LINES", "0");
 
         let dir = create_temp_project_root("cfg_decisions_zero_ok");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert_eq!(config.decisions_max_lines, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3323,7 +3391,7 @@ planning_context_excerpt_lines = 75
         set_env("DECISIONS_MAX_LINES", "0");
 
         let dir = create_temp_project_root("cfg_decisions_zero_err");
-        let err = Config::from_cli(dir.clone(), false, false)
+        let err = Config::from_cli(dir.clone(), false, false, None)
             .expect_err("decisions_max_lines=0 with decisions_enabled should fail");
         let msg = err.to_string();
         assert!(
@@ -3338,7 +3406,7 @@ planning_context_excerpt_lines = 75
         let _guard = env_lock();
         clear_env();
         let dir = create_temp_project_root("cfg_transcript_default");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(config.transcript_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3350,7 +3418,7 @@ planning_context_excerpt_lines = 75
         set_env("TRANSCRIPT_ENABLED", "true");
 
         let dir = create_temp_project_root("cfg_transcript_env");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(config.transcript_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3362,7 +3430,7 @@ planning_context_excerpt_lines = 75
 
         let dir = create_temp_project_root("cfg_transcript_toml");
         write_toml(&dir, "transcript_enabled = true\n");
-        let config = Config::from_cli(dir.clone(), false, false).unwrap();
+        let config = Config::from_cli(dir.clone(), false, false, None).unwrap();
         assert!(config.transcript_enabled);
         let _ = std::fs::remove_dir_all(&dir);
     }
