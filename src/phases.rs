@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -568,6 +568,7 @@ fn run_compound_phase_with_runner<FRunAgent, FLog>(
         role: "implementer".to_string(),
         agent_name: config.implementer.name().to_string(),
         session_hint: None,
+        output_file: None,
     };
 
     log_fn("🧠 Running compound learning phase...", config);
@@ -767,6 +768,21 @@ fn run_agent_with_output_or_record_error(
     workflow: &str,
     phase: &str,
 ) -> Option<String> {
+    run_agent_with_output_or_record_error_inner(
+        config, agent, prompt, round, role, workflow, phase, None,
+    )
+}
+
+fn run_agent_with_output_or_record_error_inner(
+    config: &Config,
+    agent: &Agent,
+    prompt: &str,
+    round: Option<u32>,
+    role: AgentRole,
+    workflow: &str,
+    phase: &str,
+    output_file: Option<PathBuf>,
+) -> Option<String> {
     let sp = system_prompt_for_role(role, config);
     let sp_ref = if sp.is_empty() {
         None
@@ -786,6 +802,7 @@ fn run_agent_with_output_or_record_error(
         role: role_str.to_string(),
         agent_name: agent.name().to_string(),
         session_hint: Some(session_key.clone()),
+        output_file,
     };
     match run_agent_with_session(
         agent,
@@ -827,6 +844,22 @@ fn run_agent_or_record_error(
 ) -> bool {
     run_agent_with_output_or_record_error(config, agent, prompt, round, role, workflow, phase)
         .is_some()
+}
+
+fn run_agent_or_record_error_with_output_file(
+    config: &Config,
+    agent: &Agent,
+    prompt: &str,
+    round: Option<u32>,
+    role: AgentRole,
+    workflow: &str,
+    phase: &str,
+    output_file: PathBuf,
+) -> bool {
+    run_agent_with_output_or_record_error_inner(
+        config, agent, prompt, round, role, workflow, phase, Some(output_file),
+    )
+    .is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,7 +1512,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
             planner_plan_mode_active(config, &planner_agent, AgentRole::Planner);
 
         let _ = log("📝 Implementer proposing plan...", config);
-        let planner_output = match run_agent_with_output_or_record_error(
+        let planner_output = match run_agent_with_output_or_record_error_inner(
             config,
             &planner_agent,
             &planning_initial_prompt(&paths, planner_plan_mode),
@@ -1487,6 +1520,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
             AgentRole::Planner,
             "plan",
             "initial",
+            Some(paths.plan_md.clone()),
         ) {
             Some(output) => output,
             None => return false,
@@ -1553,7 +1587,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
         let _ = write_state_file("review.md", "", config);
 
         let _ = log("🔍 Reviewer evaluating plan...", config);
-        let reviewer_output = match run_agent_with_output_or_record_error(
+        let reviewer_output = match run_agent_with_output_or_record_error_inner(
             config,
             &config.reviewer,
             &planning_reviewer_prompt(&PlanningReviewerParams {
@@ -1565,6 +1599,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
             AgentRole::Reviewer,
             "plan",
             "review",
+            Some(paths.review_md.clone()),
         ) {
             Some(output) => output,
             None => return false,
@@ -1640,7 +1675,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
 
                     // Step 1: Reviewer fixes the plan directly
                     let _ = log("🔧 Reviewer fixing plan...", config);
-                    if !run_agent_or_record_error(
+                    if !run_agent_or_record_error_with_output_file(
                         config,
                         &config.reviewer,
                         &planning_reviewer_fix_prompt(&paths, planning_round > 1),
@@ -1648,6 +1683,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                         AgentRole::Reviewer,
                         "plan",
                         "reviewer-fix",
+                        paths.plan_md.clone(),
                     ) {
                         return false;
                     }
@@ -1655,7 +1691,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                     // Step 2: Implementer reviews the reviewer's fix
                     let _ = log("🔍 Implementer reviewing reviewer's fix...", config);
                     let _ = write_state_file("review.md", "", config);
-                    if !run_agent_or_record_error(
+                    if !run_agent_or_record_error_with_output_file(
                         config,
                         &planner_agent,
                         &planning_implementer_review_fix_prompt(&paths, planning_round > 1),
@@ -1663,6 +1699,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                         AgentRole::Implementer,
                         "plan",
                         "implementer-review-fix",
+                        paths.review_md.clone(),
                     ) {
                         return false;
                     }
@@ -1675,7 +1712,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
 
                 // Normal path: implementer revises
                 let _ = log("📝 Implementer revising plan...", config);
-                if !run_agent_or_record_error(
+                if !run_agent_or_record_error_with_output_file(
                     config,
                     &planner_agent,
                     &planning_implementer_revision_prompt(&paths, planning_round > 1),
@@ -1683,6 +1720,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                     AgentRole::Implementer,
                     "plan",
                     "implementer-revision",
+                    paths.plan_md.clone(),
                 ) {
                     return false;
                 }
@@ -1697,7 +1735,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                     if planning_adversarial_enabled(config) {
                         let _ = log("🔍 Running adversarial second review of plan...", config);
 
-                        let adversarial_output = match run_agent_with_output_or_record_error(
+                        let adversarial_output = match run_agent_with_output_or_record_error_inner(
                             config,
                             &config.implementer,
                             &planning_adversarial_review_prompt(&paths),
@@ -1705,6 +1743,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                             AgentRole::Reviewer,
                             &format!("plan-adversarial-r{planning_round}"),
                             "adversarial-review",
+                            Some(paths.review_md.clone()),
                         ) {
                             Some(output) => output,
                             None => return false,
@@ -1742,7 +1781,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                                 config,
                             );
                             consecutive_revision_rounds += 1;
-                            if !run_agent_or_record_error(
+                            if !run_agent_or_record_error_with_output_file(
                                 config,
                                 &planner_agent,
                                 &planning_implementer_revision_prompt(&paths, planning_round > 1),
@@ -1750,6 +1789,7 @@ fn planning_phase_internal(config: &Config, planning_only: bool, resume: bool) -
                                 AgentRole::Implementer,
                                 "plan",
                                 "implementer-revision",
+                                paths.plan_md.clone(),
                             ) {
                                 return false;
                             }
@@ -2645,6 +2685,7 @@ where
             role: "implementer".to_string(),
             agent_name: config.implementer.name().to_string(),
             session_hint: None,
+            output_file: Some(paths.changes_md.clone()),
         };
         if let Err(err) = run_agent_fn(
             &config.implementer,
@@ -2766,6 +2807,7 @@ where
             role: "reviewer".to_string(),
             agent_name: config.reviewer.name().to_string(),
             session_hint: None,
+            output_file: Some(paths.review_md.clone()),
         };
         if let Err(err) = run_agent_fn(
             &config.reviewer,
@@ -2911,6 +2953,7 @@ where
                         role: "reviewer".to_string(),
                         agent_name: config.reviewer.name().to_string(),
                         session_hint: Some(fresh_session_hint.clone()),
+                        output_file: Some(paths.review_md.clone()),
                     };
 
                     if let Err(err) = run_agent_fn(
@@ -3063,6 +3106,7 @@ where
                                 role: "reviewer".to_string(),
                                 agent_name: config.reviewer.name().to_string(),
                                 session_hint: Some(fresh_session_hint.clone()),
+                                output_file: Some(paths.review_md.clone()),
                             };
                             if let Err(err) = run_agent_fn(
                                 &config.reviewer,
@@ -3206,6 +3250,7 @@ where
                             role: "implementer".to_string(),
                             agent_name: config.implementer.name().to_string(),
                             session_hint: Some(signoff_session_hint.clone()),
+                            output_file: None,
                         };
                         if let Err(err) = run_agent_fn(
                             &config.implementer,
@@ -3325,6 +3370,7 @@ where
                                     role: "reviewer".to_string(),
                                     agent_name: config.reviewer.name().to_string(),
                                     session_hint: Some(fresh_session_hint.clone()),
+                                    output_file: Some(paths.review_md.clone()),
                                 };
                                 if let Err(err) = run_agent_fn(
                                     &config.reviewer,
@@ -5611,6 +5657,7 @@ More text.
             role: role_str.to_string(),
             agent_name: agent.name().to_string(),
             session_hint: Some(session_key.clone()),
+            output_file: None,
         };
 
         assert_eq!(meta.workflow, "plan");

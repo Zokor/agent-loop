@@ -253,6 +253,21 @@ enum Dispatch {
     ConfigInit(ConfigInitArgs),
 }
 
+impl Dispatch {
+    /// Returns `true` for commands that spawn agent subprocesses and need
+    /// graceful SIGINT handling. Simple introspection commands return `false`
+    /// so that the default (immediate termination) behavior is preserved.
+    fn needs_signal_handlers(&self) -> bool {
+        match self {
+            Dispatch::Version | Dispatch::Status | Dispatch::ShowHelp
+            | Dispatch::Reset(_) | Dispatch::ConfigInit(_) => false,
+            Dispatch::Plan(_) | Dispatch::Tasks(_) | Dispatch::Implement(_)
+            | Dispatch::PlanTasksImplement(_) | Dispatch::PlanImplement(_)
+            | Dispatch::TasksImplement(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ImplementExecutionMode {
     Batch,
@@ -460,13 +475,20 @@ fn main() {
 }
 
 fn run() -> Result<i32, AgentLoopError> {
-    interrupt::register_signal_handlers();
     let parse_outcome = parse_cli_from(std::env::args_os())?;
     match parse_outcome {
         ParseOutcome::Exit(code) => Ok(code),
         ParseOutcome::Parsed(cli) => {
             let session = cli.session.clone();
-            execute_dispatch(dispatch_from_cli(cli)?, session.as_deref())
+            let dispatch = dispatch_from_cli(cli)?;
+            // Only register custom signal handlers for commands that spawn
+            // agents and need graceful shutdown. Simple commands (version,
+            // status, help, etc.) keep the default SIGINT behavior so Ctrl-C
+            // terminates immediately.
+            if dispatch.needs_signal_handlers() {
+                interrupt::register_signal_handlers();
+            }
+            execute_dispatch(dispatch, session.as_deref())
         }
     }
 }

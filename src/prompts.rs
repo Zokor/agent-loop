@@ -203,18 +203,8 @@ pub(crate) fn state_manifest(config: &Config) -> String {
     lines.join("\n")
 }
 
-const SINGLE_AGENT_REVIEWER_PREAMBLE: &str = "⚠️ SINGLE-AGENT REVIEWER MODE ⚠️
-You are now switching roles from IMPLEMENTER to REVIEWER. You must adopt a completely independent, critical perspective.
-
-CRITICAL INSTRUCTIONS:
-- You MUST evaluate the work as if you did NOT write it.
-- Do NOT assume correctness because the code \"looks familiar.\"
-- Actively look for bugs, edge cases, missing tests, and design flaws.
-- Apply the same scrutiny you would to a junior developer's first PR.
-- If something is unclear or under-tested, flag it — do not give benefit of the doubt.
-- Your approval carries weight: a false approval means bugs ship to production.
-
-";
+const SINGLE_AGENT_REVIEWER_PREAMBLE: &str =
+    "You are now the REVIEWER. Evaluate the work independently and critically as if you did not write it.";
 
 const DECISION_CAPTURE_INSTRUCTIONS: &str =
     "DECISION CAPTURE: If you make an important architectural decision, discover a constraint,

@@ -293,6 +293,11 @@ pub struct AgentCallMeta {
     pub role: String,
     pub agent_name: String,
     pub session_hint: Option<String>,
+    /// When set, the transcript will read this file's content as the
+    /// "normalized output" instead of using the raw process stdout.
+    /// This lets the transcript show what the agent *wrote* (e.g. plan.md,
+    /// review.md) rather than noisy tool-call traces from PlainText agents.
+    pub output_file: Option<PathBuf>,
 }
 
 impl AgentCallMeta {
@@ -307,6 +312,9 @@ impl AgentCallMeta {
 /// Used to append the completion block in phase 2.
 pub struct TranscriptHandle {
     pub path: PathBuf,
+    /// Optional file whose content should be used as the transcript output
+    /// instead of the raw process stdout.
+    pub output_file: Option<PathBuf>,
 }
 
 /// Completion status for a two-phase transcript entry.
@@ -379,7 +387,10 @@ pub fn begin_transcript_entry(
         return None;
     }
 
-    Some(TranscriptHandle { path })
+    Some(TranscriptHandle {
+        path,
+        output_file: meta.output_file.clone(),
+    })
 }
 
 /// Phase 2: Append the completion block and `=== END ===` to the transcript entry.
@@ -399,6 +410,16 @@ pub fn complete_transcript_entry(
         TranscriptCompletionStatus::Failed => "failed",
     };
 
+    // Prefer the content of the designated output file (e.g. plan.md,
+    // review.md) over raw process stdout, which for PlainText agents
+    // contains noisy tool-call traces instead of meaningful content.
+    let file_content = handle
+        .output_file
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .filter(|c| !c.trim().is_empty());
+    let effective_output = file_content.as_deref().unwrap_or(normalized_output);
+
     let mut entry = String::new();
     entry.push_str("\n--- COMPLETION ---\n");
     entry.push_str(&format!("status: {status_str}\n"));
@@ -407,9 +428,9 @@ pub fn complete_transcript_entry(
         entry.push_str(&format!("failure_reason: {reason}\n"));
     }
 
-    entry.push_str("\n--- NORMALIZED OUTPUT ---\n");
-    entry.push_str(normalized_output);
-    if !normalized_output.ends_with('\n') {
+    entry.push_str("\n--- OUTPUT ---\n");
+    entry.push_str(effective_output);
+    if !effective_output.ends_with('\n') {
         entry.push('\n');
     }
     entry.push_str("=== END ===\n\n");
@@ -3969,6 +3990,7 @@ mod tests {
             role: "reviewer".to_string(),
             agent_name: "codex".to_string(),
             session_hint: Some("implement-reviewer-codex".to_string()),
+            output_file: None,
         };
         append_transcript_entry(
             &project.config,
@@ -3992,7 +4014,7 @@ mod tests {
         assert!(content.contains("user prompt text"));
         assert!(content.contains("--- SYSTEM PROMPT ---"));
         assert!(content.contains("system prompt text"));
-        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("--- OUTPUT ---"));
         assert!(content.contains("normalized output text"));
         assert!(content.contains("=== END ==="));
     }
@@ -4010,6 +4032,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None, // explicitly None
+            output_file: None,
         };
         append_transcript_entry(&project.config, &meta, "p", None, "o");
 
@@ -4067,6 +4090,7 @@ mod tests {
             role: "reviewer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         assert!(meta.is_phase_tracked(), "real phase meta must be tracked");
     }
@@ -4080,6 +4104,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         assert!(
             !meta.is_phase_tracked(),
@@ -4100,6 +4125,7 @@ mod tests {
             role: "unknown".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         append_transcript_entry(&project.config, &meta, "p", None, "o");
 
@@ -4124,6 +4150,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         append_transcript_entry(&project.config, &meta, "p", None, "o");
 
@@ -4148,6 +4175,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: Some("hint-abc".to_string()),
+            output_file: None,
         };
         let handle = begin_transcript_entry(
             &project.config,
@@ -4174,7 +4202,7 @@ mod tests {
         // Phase 1 must NOT write the completion section or end marker
         assert!(!content.contains("=== END ==="), "phase-1 must not contain END marker");
         assert!(!content.contains("--- COMPLETION ---"), "phase-1 must not contain COMPLETION section");
-        assert!(!content.contains("--- NORMALIZED OUTPUT ---"), "phase-1 must not contain NORMALIZED OUTPUT");
+        assert!(!content.contains("--- OUTPUT ---"), "phase-1 must not contain OUTPUT");
     }
 
     #[test]
@@ -4190,6 +4218,7 @@ mod tests {
             role: "unknown".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         let _handle = begin_transcript_entry(&project.config, &meta, "p", None);
 
@@ -4228,6 +4257,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         let handle = begin_transcript_entry(&project.config, &meta, "user p", None);
         complete_transcript_entry(
@@ -4243,7 +4273,7 @@ mod tests {
         assert!(content.contains("status: completed"));
         assert!(content.contains("ended_at:"));
         assert!(!content.contains("failure_reason:"), "completed entries must not have failure_reason");
-        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("--- OUTPUT ---"));
         assert!(content.contains("the output"));
         assert!(content.contains("=== END ==="));
     }
@@ -4261,6 +4291,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         let handle = begin_transcript_entry(&project.config, &meta, "user p", None);
         complete_transcript_entry(
@@ -4276,7 +4307,7 @@ mod tests {
         assert!(content.contains("status: failed"));
         assert!(content.contains("ended_at:"));
         assert!(content.contains("failure_reason: agent timed out after 60s"));
-        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("--- OUTPUT ---"));
         assert!(content.contains("partial output"), "failed entries must still record captured output");
         assert!(content.contains("=== END ==="));
     }
@@ -4305,6 +4336,7 @@ mod tests {
             role: "implementer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: None,
+            output_file: None,
         };
         append_transcript_entry(&project.config, &meta, "user p", None, "output text");
 
@@ -4313,11 +4345,11 @@ mod tests {
         // Verify ordering: in_progress appears before COMPLETION
         let in_progress_pos = content.find("status: in_progress").expect("status: in_progress must be present");
         let completion_pos = content.find("--- COMPLETION ---").expect("--- COMPLETION --- must be present");
-        let output_pos = content.find("--- NORMALIZED OUTPUT ---").expect("--- NORMALIZED OUTPUT --- must be present");
+        let output_pos = content.find("--- OUTPUT ---").expect("--- OUTPUT --- must be present");
         let end_pos = content.find("=== END ===").expect("=== END === must be present");
         assert!(in_progress_pos < completion_pos, "in_progress must come before COMPLETION");
-        assert!(completion_pos < output_pos, "COMPLETION must come before NORMALIZED OUTPUT");
-        assert!(output_pos < end_pos, "NORMALIZED OUTPUT must come before END");
+        assert!(completion_pos < output_pos, "COMPLETION must come before OUTPUT");
+        assert!(output_pos < end_pos, "OUTPUT must come before END");
         assert!(content.contains("status: completed"));
         assert!(content.contains("ended_at:"));
         assert!(content.contains("output text"));

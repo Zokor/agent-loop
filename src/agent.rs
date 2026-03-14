@@ -683,7 +683,7 @@ fn extract_codex_json_usage(output: &str) -> AgentUsage {
 }
 
 fn normalize_agent_output(agent: &Agent, output: String) -> String {
-    match agent.spec().output_format {
+    let text = match agent.spec().output_format {
         OutputFormat::ClaudeStreamJson => {
             extract_claude_stream_json_text(&output).unwrap_or(output)
         }
@@ -692,7 +692,22 @@ fn normalize_agent_output(agent: &Agent, output: String) -> String {
             // attempt to extract the message text from the JSON envelope.
             extract_codex_json_text(&output).unwrap_or(output)
         }
-    }
+    };
+    strip_ansi_escapes(&text)
+}
+
+/// Strip ANSI escape sequences (colors, cursor movement, etc.) from text.
+fn strip_ansi_escapes(s: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        // Matches CSI sequences (\x1b[...X), OSC sequences (\x1b]...ST), and
+        // other common escape patterns (\x1bX for single-char commands).
+        Regex::new(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[A-Za-z]")
+            .expect("valid ANSI regex")
+    });
+    re.replace_all(s, "").into_owned()
 }
 
 fn terminate_for_timeout(child: &mut Child) {
@@ -924,6 +939,7 @@ fn run_agent_inner(
             agent_name: agent.name().to_string(),
             role: role_str.to_string(),
             session_hint: session_key.map(ToString::to_string),
+            output_file: None,
         }
     };
 
@@ -2447,6 +2463,7 @@ mod tests {
             role: "reviewer".to_string(),
             agent_name: "claude".to_string(),
             session_hint: Some("impl-reviewer-claude".to_string()),
+            output_file: None,
         };
 
         let result = run_agent_with_session(
