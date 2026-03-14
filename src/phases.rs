@@ -196,6 +196,7 @@ fn reconcile_findings_after_review(
     status_reason: Option<&str>,
     previous_findings: &FindingsFile,
     current_findings: FindingsFile,
+    config: &Config,
 ) -> FindingsReconcileResult {
     let mut normalized = normalize_findings_for_round(current_findings, round);
 
@@ -224,8 +225,9 @@ fn reconcile_findings_after_review(
             };
 
             let reason = format!(
-                "Open findings: {}. See .agent-loop/state/{FINDINGS_FILENAME}.",
-                findings_id_list(&normalized)
+                "Open findings: {}. See {}/{FINDINGS_FILENAME}.",
+                findings_id_list(&normalized),
+                config.state_dir_rel()
             );
 
             FindingsReconcileResult {
@@ -245,8 +247,9 @@ fn reconcile_findings_after_review(
                 }
             } else {
                 let reason = format!(
-                    "Cannot approve with unresolved findings: {}. See .agent-loop/state/{FINDINGS_FILENAME}.",
-                    findings_id_list(&normalized)
+                    "Cannot approve with unresolved findings: {}. See {}/{FINDINGS_FILENAME}.",
+                    findings_id_list(&normalized),
+                    config.state_dir_rel()
                 );
                 FindingsReconcileResult {
                     status: Status::NeedsChanges,
@@ -1364,7 +1367,7 @@ fn run_quality_checks(config: &Config) -> Option<String> {
     Some(format_quality_checks(&results))
 }
 
-fn format_summary_block(status: &LoopStatus) -> String {
+fn format_summary_block(status: &LoopStatus, config: &Config) -> String {
     let border = "═".repeat(60);
     let task_summary = summarize_task(status.last_run_task.as_str(), None);
     let task_summary = if task_summary.is_empty() {
@@ -1390,7 +1393,7 @@ fn format_summary_block(status: &LoopStatus) -> String {
     }
 
     lines.push(border);
-    lines.push("\n📁 State files in: .agent-loop/state/".to_string());
+    lines.push(format!("\n📁 State files in: {}/", config.state_dir_rel()));
     lines.push(format!(
         "   - Core: task.md, plan.md, tasks.md, changes.md, workflow.txt, {QUALITY_CHECKS_FILENAME}, review.md, status.json, log.txt"
     ));
@@ -1406,7 +1409,7 @@ fn format_summary_block(status: &LoopStatus) -> String {
     lines.join("\n")
 }
 
-fn print_planning_complete_summary(status: &LoopStatus, task: &str) {
+fn print_planning_complete_summary(status: &LoopStatus, task: &str, config: &Config) {
     let last_task_source = if status.last_run_task.trim().is_empty() {
         task
     } else {
@@ -1429,9 +1432,9 @@ fn print_planning_complete_summary(status: &LoopStatus, task: &str) {
     println!("  Last Task:   {summary}");
     println!("{}", "═".repeat(60));
     println!("\n📋 Next steps:");
-    println!("   1. Review tasks in: .agent-loop/state/tasks.md");
+    println!("   1. Review tasks in: {}/tasks.md", config.state_dir_rel());
     println!("   2. Run each task: {}", planning_next_step_command());
-    println!("   3. Or extract a task: cat .agent-loop/state/tasks.md");
+    println!("   3. Or extract a task: cat {}/tasks.md", config.state_dir_rel());
     println!();
 }
 
@@ -1945,7 +1948,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
         let current = read_status(config);
         if current.status == Status::Consensus {
             let _ = log("✅ Task decomposition already reached consensus.", config);
-            print_planning_complete_summary(&current, &task);
+            print_planning_complete_summary(&current, &task, config);
             return true;
         }
     }
@@ -2246,7 +2249,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                             config,
                         );
                         let _ = log("✅ Both agents agreed on task breakdown!", config);
-                        print_planning_complete_summary(&signoff_status, &task);
+                        print_planning_complete_summary(&signoff_status, &task, config);
                         return true;
                     }
 
@@ -2287,7 +2290,7 @@ fn task_decomposition_phase_internal(config: &Config, resume: bool) -> bool {
                         config,
                     );
                     let final_status = read_status(config);
-                    print_planning_complete_summary(&final_status, &task);
+                    print_planning_complete_summary(&final_status, &task, config);
                     return true;
                 }
             }
@@ -2826,6 +2829,7 @@ where
             status.reason.as_deref(),
             &findings_before_review,
             reviewer_findings_result.findings_file,
+            config,
         );
         if let Some(note) = reviewer_findings.log_note.as_deref() {
             log_fn(&format!("⚠ {note}"), config);
@@ -2972,6 +2976,7 @@ where
                         adversarial_status.reason.as_deref(),
                         &findings_before_adversarial,
                         adversarial_findings_result.findings_file,
+                        config,
                     );
                     if let Some(note) = adversarial_findings.log_note.as_deref() {
                         log_fn(&format!("⚠ {note}"), config);
@@ -3694,7 +3699,7 @@ pub fn implementation_loop_resume(config: &Config, baseline_files: &HashSet<Stri
 
 pub fn print_summary(config: &Config) {
     let status = read_status(config);
-    println!("{}", format_summary_block(&status));
+    println!("{}", format_summary_block(&status, config));
 }
 
 #[cfg(test)]
@@ -3864,6 +3869,8 @@ mod tests {
 
     #[test]
     fn reconcile_findings_needs_changes_synthesizes_when_missing() {
+        let root = create_temp_project_root("reconcile_synth");
+        let config = make_test_config(&root, TestConfigOptions::default());
         let previous = FindingsFile::default();
         let current = FindingsFile::default();
 
@@ -3873,6 +3880,7 @@ mod tests {
             Some("missing validation"),
             &previous,
             current,
+            &config,
         );
 
         assert_eq!(result.status, Status::NeedsChanges);
@@ -3890,6 +3898,8 @@ mod tests {
 
     #[test]
     fn reconcile_findings_approved_with_open_forces_needs_changes() {
+        let root = create_temp_project_root("reconcile_approved");
+        let config = make_test_config(&root, TestConfigOptions::default());
         let previous = FindingsFile::default();
         let current = FindingsFile {
             round: 3,
@@ -3901,7 +3911,7 @@ mod tests {
             }],
         };
 
-        let result = reconcile_findings_after_review(3, Status::Approved, None, &previous, current);
+        let result = reconcile_findings_after_review(3, Status::Approved, None, &previous, current, &config);
 
         assert_eq!(result.status, Status::NeedsChanges);
         assert_eq!(result.findings.findings.len(), 1);
@@ -4925,8 +4935,7 @@ More text.
                         mode: "dual-agent".to_string(),
                         last_run_task: "test".to_string(),
                         reason: Some(
-                            "[gate:fresh-context] Open findings: F-001. See .agent-loop/state/findings.json."
-                                .to_string(),
+                            format!("[gate:fresh-context] Open findings: F-001. See {}/{FINDINGS_FILENAME}.", config.state_dir_rel()),
                         ),
 
                         timestamp: "ts".to_string(),

@@ -19,7 +19,10 @@ use crate::{
     error::AgentLoopError,
     prompts::AgentRole,
     state::{
-        AgentCallMeta, FALLBACK_PHASE, FALLBACK_WORKFLOW, append_transcript_entry, log, timestamp,
+        AgentCallMeta, FALLBACK_PHASE, FALLBACK_WORKFLOW,
+        begin_transcript_entry, complete_transcript_entry,
+        TranscriptHandle, TranscriptCompletionStatus,
+        log, timestamp,
     },
 };
 
@@ -893,11 +896,41 @@ fn run_agent_inner(
         });
     }
 
+    // Build agent call metadata for transcript logging.
+    let meta = if let Some(m) = caller_meta {
+        m.clone()
+    } else {
+        let role_str = match role {
+            Some(AgentRole::Implementer) => "implementer",
+            Some(AgentRole::Reviewer) => "reviewer",
+            Some(AgentRole::Planner) => "planner",
+            None => "unknown",
+        };
+        AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            round: 0,
+            agent_name: agent.name().to_string(),
+            role: role_str.to_string(),
+            session_hint: session_key.map(ToString::to_string),
+        }
+    };
+
+    // Phase 1: log the prompt before the agent starts.
+    let handle: Option<TranscriptHandle> =
+        begin_transcript_entry(config, &meta, prompt, system_prompt);
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(err) => {
             let reason = format!("{agent} failed to start: {err}");
             let _ = log(&format!("⚠ {reason}"), config);
+            complete_transcript_entry(
+                handle.as_ref(),
+                TranscriptCompletionStatus::Failed,
+                Some(&reason),
+                "",
+            );
             return Err(AgentLoopError::Agent(reason));
         }
     };
@@ -1047,58 +1080,53 @@ fn run_agent_inner(
 
     let normalized_output = normalize_agent_output(agent, combined_output);
 
-    // Transcript capture: append human-readable entry before error checks
-    // so we capture data even for interrupted/timed-out calls.
-    if config.transcript_enabled {
-        let meta = if let Some(m) = caller_meta {
-            m.clone()
+    // Finalize per-attempt transcript and response block on every exit path.
+
+    // Process-level failures (interrupted, timed_out, run_error, missing exit status)
+    // are handled first — these take priority over stale-session retry logic.
+    let is_process_failure = interrupted || timed_out || run_error.is_some() || status.is_none();
+    if is_process_failure {
+        let failure_reason = if interrupted {
+            "Interrupted by signal".to_string()
+        } else if timed_out {
+            format!(
+                "{agent} timed out after {}s of inactivity",
+                config.timeout_seconds
+            )
+        } else if let Some(ref r) = run_error {
+            r.clone()
         } else {
-            let role_str = match role {
-                Some(AgentRole::Implementer) => "implementer",
-                Some(AgentRole::Reviewer) => "reviewer",
-                Some(AgentRole::Planner) => "planner",
-                None => "unknown",
-            };
-            AgentCallMeta {
-                workflow: FALLBACK_WORKFLOW.to_string(),
-                phase: FALLBACK_PHASE.to_string(),
-                round: 0,
-                agent_name: agent.name().to_string(),
-                role: role_str.to_string(),
-                session_hint: session_key.map(ToString::to_string),
-            }
+            format!("{agent} did not report an exit status")
         };
-        append_transcript_entry(config, &meta, prompt, system_prompt, &normalized_output);
-    }
 
-    if let Err(err) = append_response_block(agent, &normalized_output, config) {
-        let _ = log(&format!("⚠ {agent} error: {err}"), config);
-    }
-
-    if interrupted {
-        let reason = "Interrupted by signal".to_string();
-        let _ = log(&format!("⚠ {reason}"), config);
-        return Err(AgentLoopError::Interrupted(reason));
-    }
-
-    if timed_out {
-        let reason = format!(
-            "{agent} timed out after {}s of inactivity",
-            config.timeout_seconds
+        complete_transcript_entry(
+            handle.as_ref(),
+            TranscriptCompletionStatus::Failed,
+            Some(&failure_reason),
+            &normalized_output,
         );
-        let _ = log(&format!("⚠ {reason}"), config);
-        return Err(AgentLoopError::Agent(reason));
+        if let Err(err) = append_response_block(agent, &normalized_output, config) {
+            let _ = log(&format!("⚠ {agent} error: {err}"), config);
+        }
+
+        if interrupted {
+            let _ = log(&format!("⚠ {failure_reason}"), config);
+            return Err(AgentLoopError::Interrupted(failure_reason));
+        }
+        if timed_out {
+            let _ = log(&format!("⚠ {failure_reason}"), config);
+            return Err(AgentLoopError::Agent(failure_reason));
+        }
+        if run_error.is_some() {
+            return Err(AgentLoopError::Agent(failure_reason));
+        }
+        // status.is_none()
+        let _ = log(&format!("⚠ {failure_reason}"), config);
+        return Err(AgentLoopError::Agent(failure_reason));
     }
 
-    if let Some(reason) = run_error {
-        return Err(AgentLoopError::Agent(reason));
-    }
-
-    let Some(exit_status) = status else {
-        let reason = format!("{agent} did not report an exit status");
-        let _ = log(&format!("⚠ {reason}"), config);
-        return Err(AgentLoopError::Agent(reason));
-    };
+    // At this point we have a valid exit status.
+    let exit_status = status.unwrap();
 
     // Detect session resume failures — either via non-zero exit code OR
     // error patterns in the raw output's error channels (some agents exit 0
@@ -1109,19 +1137,32 @@ fn run_agent_inner(
         && session_id.is_some()
         && let Some(key) = session_key
     {
+        let role_str = match role {
+            Some(AgentRole::Implementer) => "implementer",
+            Some(AgentRole::Reviewer) => "reviewer",
+            Some(AgentRole::Planner) => "planner",
+            None => "unknown",
+        };
         let _ = log(
             &format!(
-                "Session resume failed for {}/{}, retrying fresh",
-                match role {
-                    Some(AgentRole::Implementer) => "implementer",
-                    Some(AgentRole::Reviewer) => "reviewer",
-                    Some(AgentRole::Planner) => "planner",
-                    None => "unknown",
-                },
+                "Session resume failed for {role_str}/{}, retrying fresh",
                 agent.name()
             ),
             config,
         );
+
+        // Finalize this failed attempt before recursing for a fresh retry.
+        let reason = format!("Session resume failed for {role_str}/{}", agent.name());
+        complete_transcript_entry(
+            handle.as_ref(),
+            TranscriptCompletionStatus::Failed,
+            Some(&reason),
+            &normalized_output,
+        );
+        if let Err(err) = append_response_block(agent, &normalized_output, config) {
+            let _ = log(&format!("⚠ {agent} error: {err}"), config);
+        }
+
         clear_session_id(config, key);
 
         // Retry once without session resume.
@@ -1136,12 +1177,31 @@ fn run_agent_inner(
         );
     }
 
-    if !exit_status.success() {
+    // Normal exit path: success or non-zero exit.
+    let (completion_status, maybe_failure_reason) = if !exit_status.success() {
         let code = exit_status
             .code()
             .map(|value| value.to_string())
             .unwrap_or_else(|| "null".to_string());
-        let reason = format!("{agent} exited with code {code}");
+        (
+            TranscriptCompletionStatus::Failed,
+            Some(format!("{agent} exited with code {code}")),
+        )
+    } else {
+        (TranscriptCompletionStatus::Completed, None)
+    };
+
+    complete_transcript_entry(
+        handle.as_ref(),
+        completion_status,
+        maybe_failure_reason.as_deref(),
+        &normalized_output,
+    );
+    if let Err(err) = append_response_block(agent, &normalized_output, config) {
+        let _ = log(&format!("⚠ {agent} error: {err}"), config);
+    }
+
+    if let Some(reason) = maybe_failure_reason {
         let _ = log(&format!("⚠ {reason}"), config);
         return Err(AgentLoopError::Agent(reason));
     }

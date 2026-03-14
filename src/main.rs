@@ -56,6 +56,8 @@ const KNOWN_SUBCOMMANDS: [&str; 11] = [
     about = "Run a collaborative implementation/review loop between coding agents."
 )]
 struct Cli {
+    #[arg(long, global = true, value_name = "NAME")]
+    session: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -462,7 +464,10 @@ fn run() -> Result<i32, AgentLoopError> {
     let parse_outcome = parse_cli_from(std::env::args_os())?;
     match parse_outcome {
         ParseOutcome::Exit(code) => Ok(code),
-        ParseOutcome::Parsed(cli) => execute_dispatch(dispatch_from_cli(cli)?),
+        ParseOutcome::Parsed(cli) => {
+            let session = cli.session.clone();
+            execute_dispatch(dispatch_from_cli(cli)?, session.as_deref())
+        }
     }
 }
 
@@ -478,7 +483,7 @@ where
             ErrorKind::DisplayHelp => {
                 print!("{err}");
                 println!();
-                println!("{}", environment_help());
+                println!("{}", environment_help(None));
                 Ok(ParseOutcome::Exit(0))
             }
             ErrorKind::DisplayVersion => {
@@ -515,20 +520,20 @@ fn dispatch_from_cli(cli: Cli) -> Result<Dispatch, AgentLoopError> {
     }
 }
 
-fn execute_dispatch(dispatch: Dispatch) -> Result<i32, AgentLoopError> {
+fn execute_dispatch(dispatch: Dispatch, session: Option<&str>) -> Result<i32, AgentLoopError> {
     match dispatch {
-        Dispatch::Plan(args) => plan_command(args),
-        Dispatch::Tasks(args) => tasks_command(args),
-        Dispatch::Implement(args) => implement_command(args),
-        Dispatch::PlanTasksImplement(args) => plan_tasks_implement_command(args),
-        Dispatch::PlanImplement(args) => plan_implement_command(args),
-        Dispatch::TasksImplement(args) => tasks_implement_command(args),
-        Dispatch::Reset(args) => reset_command(&args),
-        Dispatch::Status => status_command(),
+        Dispatch::Plan(args) => plan_command(args, session),
+        Dispatch::Tasks(args) => tasks_command(args, session),
+        Dispatch::Implement(args) => implement_command(args, session),
+        Dispatch::PlanTasksImplement(args) => plan_tasks_implement_command(args, session),
+        Dispatch::PlanImplement(args) => plan_implement_command(args, session),
+        Dispatch::TasksImplement(args) => tasks_implement_command(args, session),
+        Dispatch::Reset(args) => reset_command(&args, session),
+        Dispatch::Status => status_command(session),
         Dispatch::Version => version_command(),
         Dispatch::ConfigInit(args) => config_init_command(args),
         Dispatch::ShowHelp => {
-            print_help_message()?;
+            print_help_message(session)?;
             Ok(0)
         }
     }
@@ -543,23 +548,53 @@ where
     args.into_iter().map(Into::into).collect::<Vec<_>>()
 }
 
-fn print_help_message() -> Result<(), AgentLoopError> {
+fn print_help_message(session: Option<&str>) -> Result<(), AgentLoopError> {
     let mut command = Cli::command();
     command.print_long_help()?;
     println!();
     println!();
-    println!("{}", environment_help());
+    println!("{}", environment_help(session));
     Ok(())
 }
 
-fn environment_help() -> String {
+fn session_state_dir_rel(session: Option<&str>) -> String {
+    match session {
+        Some(name) => format!(".agent-loop/state/{name}"),
+        None => ".agent-loop/state".to_string(),
+    }
+}
+
+fn environment_help(session: Option<&str>) -> String {
+    let state_rel = session_state_dir_rel(session);
     format!(
-        "Primary commands:\n  agent-loop plan <task>                    Planning only\n  agent-loop plan --file <path>             Planning only from file\n  agent-loop plan --resume                  Resume planning from existing plan.md\n  agent-loop tasks                          Decompose only\n  agent-loop tasks --resume                 Resume decomposition\n  agent-loop implement                      Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task           Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>           Implement one inline task\n  agent-loop implement --file <p>           Implement one task from file\n  agent-loop implement --resume             Resume implementation\n  agent-loop plan-tasks-implement <task>    Run plan -> tasks -> implement\n  agent-loop plan-implement <task>          Run plan -> implement (supports all implement-mode flags)\n  agent-loop tasks-implement                Run tasks -> implement from state/plan.md or --file\n  agent-loop reset                          Clear .agent-loop/state/ and preserve decisions.md\n  agent-loop config init                    Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nRound limits: 0 = unlimited (timeout and stuck detection remain active).\nImplementation review gates:\n  - single-agent: reviewer gate only\n  - dual-agent: reviewer gate (same-context) -> reviewer gate (fresh-context) -> implementer signoff\n  REVIEW_MAX_ROUNDS applies to the full implementation loop across all gates.\nProgress logs:\n  - planning-progress.md tracks planning rounds\n  - tasks-progress.md tracks decomposition rounds\n  - implement-progress.md is canonical in the active implementation state dir\n    (root state for batch / sequential, task-local state/task-N/ for wave)\n\nEnvironment variables:\n  REVIEW_MAX_ROUNDS     (default: {DEFAULT_REVIEW_MAX_ROUNDS})   Max implementation/review rounds (0 = unlimited)\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds (0 = unlimited)\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds (0 = unlimited)\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_ENABLED     (default: 1)    Master switch for decisions subsystem (0 disables all decisions)\n  DECISIONS_AUTO_REFERENCE (default: 1) Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  DIFF_MAX_LINES        (default: {DEFAULT_DIFF_MAX_LINES})  Max diff lines before truncation\n  CONTEXT_LINE_CAP      (default: 0)    Max lines for project context (0 = unlimited)\n  PLANNING_CONTEXT_EXCERPT_LINES (default: 0) Max lines per file excerpt in planning (0 = unlimited)\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  VERBOSE               (default: 0)    Enable verbose logging when truthy\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n  PLANNING_ADVERSARIAL_REVIEW (default: 1) Adversarial second review of plans (dual-agent only)\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 1)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 1)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\n  Observability:\n  TRANSCRIPT_ENABLED    (default: 0)    Write human-readable agent I/O transcript to .agent-loop/state/transcript.log\n\nMigration note: max_rounds / MAX_ROUNDS has been renamed to review_max_rounds / REVIEW_MAX_ROUNDS.\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
+        "Primary commands:\n  agent-loop plan <task>                    Planning only\n  agent-loop plan --file <path>             Planning only from file\n  agent-loop plan --resume                  Resume planning from existing plan.md\n  agent-loop tasks                          Decompose only\n  agent-loop tasks --resume                 Resume decomposition\n  agent-loop implement                      Implement tasks.md in batch, or fall back to plan.md when tasks are missing/empty\n  agent-loop implement --per-task           Implement tasks one-by-one (legacy mode)\n  agent-loop implement --task <t>           Implement one inline task\n  agent-loop implement --file <p>           Implement one task from file\n  agent-loop implement --resume             Resume implementation\n  agent-loop plan-tasks-implement <task>    Run plan -> tasks -> implement\n  agent-loop plan-implement <task>          Run plan -> implement (supports all implement-mode flags)\n  agent-loop tasks-implement                Run tasks -> implement from state/plan.md or --file\n  agent-loop reset                          Clear {state_rel}/ and preserve decisions.md\n  agent-loop config init                    Generate default .agent-loop.toml\n\nConfiguration sources (highest precedence first):\n  1. CLI flags and subcommands\n  2. Environment variables\n  3. .agent-loop.toml (per-project config file)\n  4. Built-in defaults\n\nRound limits: 0 = unlimited (timeout and stuck detection remain active).\nImplementation review gates:\n  - single-agent: reviewer gate only\n  - dual-agent: reviewer gate (same-context) -> reviewer gate (fresh-context) -> implementer signoff\n  REVIEW_MAX_ROUNDS applies to the full implementation loop across all gates.\nProgress logs:\n  - planning-progress.md tracks planning rounds\n  - tasks-progress.md tracks decomposition rounds\n  - implement-progress.md is canonical in the active implementation state dir\n    (root state for batch / sequential, task-local {state_rel}/.wave-task-N/ for wave)\n\nEnvironment variables:\n  REVIEW_MAX_ROUNDS     (default: {DEFAULT_REVIEW_MAX_ROUNDS})   Max implementation/review rounds (0 = unlimited)\n  PLANNING_MAX_ROUNDS   (default: {DEFAULT_PLANNING_MAX_ROUNDS})  Max planning consensus rounds (0 = unlimited)\n  DECOMPOSITION_MAX_ROUNDS (default: {DEFAULT_DECOMPOSITION_MAX_ROUNDS})  Max decomposition rounds (0 = unlimited)\n  TIMEOUT               (default: {DEFAULT_TIMEOUT_SECONDS})  Idle timeout in seconds\n  IMPLEMENTER           (default: claude) Implementer agent name (any registered agent)\n  REVIEWER                              Reviewer agent name (default: opposite of implementer)\n  PLANNER                               Planner agent name (default: same as implementer)\n  SINGLE_AGENT          (default: 0)    Enable single-agent mode when truthy\n  AUTO_COMMIT           (default: 1)    Auto-commit loop-owned changes (0 disables)\n  AUTO_TEST             (default: 0)    Run quality checks before review when truthy\n  AUTO_TEST_CMD                         Override auto-detected quality check command\n  COMPOUND              (default: 1)    Enable post-consensus compound learning phase\n  DECISIONS_ENABLED     (default: 1)    Master switch for decisions subsystem (0 disables all decisions)\n  DECISIONS_AUTO_REFERENCE (default: 1) Auto-sync managed decisions-reference blocks in AGENTS.md/CLAUDE.md\n  DECISIONS_MAX_LINES   (default: 50)   Number of decision lines injected into prompts\n  DIFF_MAX_LINES        (default: {DEFAULT_DIFF_MAX_LINES})  Max diff lines before truncation\n  CONTEXT_LINE_CAP      (default: 0)    Max lines for project context (0 = unlimited)\n  PLANNING_CONTEXT_EXCERPT_LINES (default: 0) Max lines per file excerpt in planning (0 = unlimited)\n  BATCH_IMPLEMENT       (default: 1)    Implement all tasks.md tasks in one loop by default\n  MAX_PARALLEL          (default: 1)    Maximum parallel task execution in wave mode\n  VERBOSE               (default: 0)    Enable verbose logging when truthy\n  PROGRESSIVE_CONTEXT   (default: 0)    Replace front-loaded context with on-demand manifest\n  PLANNING_ADVERSARIAL_REVIEW (default: 1) Adversarial second review of plans (dual-agent only)\n\n  Model selection:\n  IMPLEMENTER_MODEL                     Model override for implementer (e.g. claude-sonnet-4-6)\n  REVIEWER_MODEL                        Model override for reviewer (e.g. o3)\n  PLANNER_MODEL                         Model override for planning phase\n  PLANNER_PERMISSION_MODE               Planner permission mode: default|plan\n\n  Claude CLI tuning:\n  CLAUDE_FULL_ACCESS    (default: 1)    Use --dangerously-skip-permissions instead of --allowedTools\n  CLAUDE_ALLOWED_TOOLS  (default: Bash,Read,Edit,Write,Grep,Glob,WebFetch)\n  REVIEWER_ALLOWED_TOOLS (default: Read,Grep,Glob,WebFetch) Reviewer read-only sandbox\n  CLAUDE_SESSION_PERSISTENCE (default: 1) Persist Claude sessions across rounds\n  CLAUDE_EFFORT_LEVEL                   Thinking depth: low|medium|high\n  CLAUDE_MAX_OUTPUT_TOKENS              Max output tokens (1-64000)\n  CLAUDE_MAX_THINKING_TOKENS            Extended thinking token budget\n  IMPLEMENTER_EFFORT_LEVEL              Override effort level for implementer role\n  REVIEWER_EFFORT_LEVEL                 Override effort level for reviewer role\n\n  Codex CLI tuning:\n  CODEX_FULL_ACCESS     (default: 1)    Use --dangerously-bypass-approvals-and-sandbox instead of --full-auto\n  CODEX_SESSION_PERSISTENCE (default: 1) Persist Codex sessions across rounds\n\n  Stuck detection:\n  STUCK_DETECTION_ENABLED (default: 0)  Enable stuck detection in implementation loop\n  STUCK_NO_DIFF_ROUNDS   (default: 3)   Consecutive no-diff rounds before signalling\n  STUCK_THRESHOLD_MINUTES (default: 10)  Wall-clock minutes before signalling\n  STUCK_ACTION           (default: warn) Action on stuck: abort|warn|retry\n\n  Wave runtime:\n  WAVE_LOCK_STALE_SECONDS (default: 30)  Seconds before a wave lock is considered stale\n  WAVE_SHUTDOWN_GRACE_MS  (default: 30000) Grace period (ms) for in-flight tasks on interrupt\n\n  Observability:\n  TRANSCRIPT_ENABLED    (default: 0)    Write human-readable agent I/O transcript to {state_rel}/transcript.log\n\nMigration note: max_rounds / MAX_ROUNDS has been renamed to review_max_rounds / REVIEW_MAX_ROUNDS.\n\nPer-project config: place .agent-loop.toml in the project root (see README)."
     )
 }
 
 fn current_project_dir() -> Result<PathBuf, AgentLoopError> {
     std::env::current_dir().map_err(AgentLoopError::from)
+}
+
+fn session_state_dir(project_dir: &Path, session: Option<&str>) -> Result<PathBuf, AgentLoopError> {
+    if let Some(name) = session {
+        config::validate_session_name(name)?;
+    }
+    let base = project_dir.join(".agent-loop").join("state");
+    Ok(match session {
+        Some(name) => base.join(name),
+        None => base,
+    })
+}
+
+fn session_wave_lock_path(project_dir: &Path, session: Option<&str>) -> Result<PathBuf, AgentLoopError> {
+    if let Some(name) = session {
+        config::validate_session_name(name)?;
+    }
+    let agent_loop_dir = project_dir.join(".agent-loop");
+    Ok(match session {
+        Some(name) => agent_loop_dir.join(format!("wave-{name}.lock")),
+        None => agent_loop_dir.join("wave.lock"),
+    })
 }
 
 fn resolve_task_for_run(args: &RunArgs) -> Result<String, AgentLoopError> {
@@ -934,8 +969,8 @@ fn resolve_resume_implement_settings(
     Ok((mode, normalize_flags_for_mode(flags, mode)))
 }
 
-fn read_current_status(project_dir: &Path, single_agent: bool) -> Option<LoopStatus> {
-    let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false).ok()?;
+fn read_current_status(project_dir: &Path, single_agent: bool, session: Option<&str>) -> Option<LoopStatus> {
+    let config = Config::from_cli(project_dir.to_path_buf(), single_agent, false, session).ok()?;
     if !config.state_dir.join("status.json").is_file() {
         return None;
     }
@@ -1002,6 +1037,7 @@ struct ImplementationRunOptions {
 fn run_command_with_review_max_rounds(
     args: RunArgs,
     options: ImplementationRunOptions,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     if args.resume {
         return Err(AgentLoopError::Config(
@@ -1024,6 +1060,7 @@ fn run_command_with_review_max_rounds(
         args.single_agent,
         false,
         options.review_max_rounds_override,
+        session,
     )?;
     preflight::run_preflight(&mut config)?;
 
@@ -1094,18 +1131,19 @@ where
 fn resume_for_tasks(
     single_agent: bool,
     review_max_rounds_override: Option<u32>,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
-    implementation_resume_with_review_max_rounds(single_agent, review_max_rounds_override)
+    implementation_resume_with_review_max_rounds(single_agent, review_max_rounds_override, session)
 }
 
-fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
+fn plan_command(args: PlanArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     let started = Instant::now();
 
     if args.resume {
         let project_dir = current_project_dir()?;
-        let state_dir = project_dir.join(".agent-loop").join("state");
+        let state_dir = session_state_dir(&project_dir, session)?;
         ensure_resume_state_dir_exists(&state_dir)?;
-        let config = Config::from_cli(project_dir, args.single_agent, false)?;
+        let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
         let workflow = state::read_workflow(&config);
         if workflow != Some(state::WorkflowKind::Plan) {
             return Err(AgentLoopError::State(
@@ -1145,7 +1183,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
 
     let task = resolve_task_for_plan(&args)?;
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
 
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
@@ -1153,7 +1191,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
         Vec::new()
     };
 
-    reset_state_dir(&config.project_dir)?;
+    reset_state_dir(&config.project_dir, session)?;
     state::init(
         task.as_str(),
         &config,
@@ -1197,7 +1235,7 @@ fn plan_command(args: PlanArgs) -> Result<i32, AgentLoopError> {
 fn ensure_resume_state_dir_exists(state_dir: &Path) -> Result<(), AgentLoopError> {
     if !state_dir.is_dir() {
         return Err(AgentLoopError::State(
-            "Cannot resume: .agent-loop/state does not exist. Run a command first.".to_string(),
+            format!("Cannot resume: {} does not exist. Run a command first.", state_dir.display()),
         ));
     }
 
@@ -1461,10 +1499,11 @@ fn implementation_resume_with_review_max_rounds_internal(
     review_max_rounds_override: Option<u32>,
     print_elapsed: bool,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     let started = Instant::now();
     let project_dir = current_project_dir()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
+    let state_dir = session_state_dir(&project_dir, session)?;
     ensure_resume_state_dir_exists(&state_dir)?;
     let task = read_resume_task_from_state_dir(&state_dir)?;
 
@@ -1473,6 +1512,7 @@ fn implementation_resume_with_review_max_rounds_internal(
         single_agent,
         false,
         review_max_rounds_override,
+        session,
     )?;
     preflight::run_preflight(&mut config)?;
     let workflow = state::read_workflow(&config);
@@ -1540,12 +1580,14 @@ where
 fn implementation_resume_with_review_max_rounds(
     single_agent: bool,
     review_max_rounds_override: Option<u32>,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     implementation_resume_with_review_max_rounds_internal(
         single_agent,
         review_max_rounds_override,
         true,
         true,
+        session,
     )
 }
 
@@ -1566,6 +1608,7 @@ fn implement_all_tasks_command_with_mode(
     project_dir: &Path,
     mode: ImplementExecutionMode,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     implement_all_tasks_command_with_mode_using(
         args,
@@ -1575,9 +1618,11 @@ fn implement_all_tasks_command_with_mode(
         cleanup_on_success,
         implement_all_tasks_wave,
         implement_all_tasks_per_task,
+        session,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn implement_all_tasks_command_with_mode_using<W, P>(
     args: &ImplementArgs,
     config: &Config,
@@ -1586,15 +1631,13 @@ fn implement_all_tasks_command_with_mode_using<W, P>(
     cleanup_on_success: bool,
     run_wave: W,
     run_per_task: P,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError>
 where
     W: FnOnce(&ImplementArgs, &[ParsedTask], &Config, &Path) -> Result<i32, AgentLoopError>,
     P: FnOnce(&ImplementArgs, &[ParsedTask], &Config, &Path) -> Result<i32, AgentLoopError>,
 {
-    let tasks_file = project_dir
-        .join(".agent-loop")
-        .join("state")
-        .join("tasks.md");
+    let tasks_file = config.state_dir.join("tasks.md");
     let raw_tasks = load_tasks_markdown(&tasks_file)?;
 
     if per_task_only_flags_present(args) && mode == ImplementExecutionMode::Batch {
@@ -1650,6 +1693,7 @@ where
                     project_dir,
                     raw_tasks,
                     cleanup_on_success,
+                    session,
                 );
             }
 
@@ -1662,6 +1706,7 @@ where
                     project_dir,
                     &raw_plan,
                     cleanup_on_success,
+                    session,
                 );
             }
 
@@ -1685,6 +1730,7 @@ fn resume_implementation_for_mode(
     mode: ImplementExecutionMode,
     print_elapsed: bool,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     match mode {
         ImplementExecutionMode::Batch => implementation_resume_with_review_max_rounds_internal(
@@ -1692,6 +1738,7 @@ fn resume_implementation_for_mode(
             None,
             print_elapsed,
             cleanup_on_success,
+            session,
         ),
         ImplementExecutionMode::Wave => implement_all_tasks_command_with_mode(
             args,
@@ -1699,6 +1746,7 @@ fn resume_implementation_for_mode(
             project_dir,
             mode,
             cleanup_on_success,
+            session,
         ),
         ImplementExecutionMode::PerTask => Err(AgentLoopError::Config(
             "--per-task cannot be combined with --resume.".to_string(),
@@ -1706,14 +1754,14 @@ fn resume_implementation_for_mode(
     }
 }
 
-fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
+fn implement_command(args: ImplementArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     args.validate()?;
 
     if args.resume {
         let project_dir = current_project_dir()?;
-        let state_dir = project_dir.join(".agent-loop").join("state");
+        let state_dir = session_state_dir(&project_dir, session)?;
         ensure_resume_state_dir_exists(&state_dir)?;
-        let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+        let config = Config::from_cli(project_dir.clone(), args.single_agent, false, session)?;
         let workflow = state::read_workflow(&config);
         if workflow != Some(state::WorkflowKind::Implement) {
             return Err(AgentLoopError::State(
@@ -1735,6 +1783,7 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
             mode,
             true,
             true,
+            session,
         );
     }
 
@@ -1755,24 +1804,25 @@ fn implement_command(args: ImplementArgs) -> Result<i32, AgentLoopError> {
                 persist_flags: Some(args.flags.clone()),
                 cleanup_on_success: true,
             },
+            session,
         );
     }
 
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false, session)?;
     let mode = resolve_fresh_implement_mode(&args.flags, &config);
-    implement_all_tasks_command_with_mode(&args, &config, &project_dir, mode, true)
+    implement_all_tasks_command_with_mode(&args, &config, &project_dir, mode, true, session)
 }
 
-fn tasks_command(args: TasksArgs) -> Result<i32, AgentLoopError> {
+fn tasks_command(args: TasksArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     let started = Instant::now();
     args.validate()?;
 
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false, session)?;
 
     if args.resume {
-        let state_dir = project_dir.join(".agent-loop").join("state");
+        let state_dir = session_state_dir(&project_dir, session)?;
         ensure_resume_state_dir_exists(&state_dir)?;
         let workflow = state::read_workflow(&config);
         if workflow != Some(state::WorkflowKind::Decompose) {
@@ -1936,6 +1986,7 @@ fn finish_command_exit(
     Ok(exit_code)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transition_to_implementation(
     task: &str,
     plan_content: &str,
@@ -1944,6 +1995,7 @@ fn transition_to_implementation(
     implement_args: &ImplementArgs,
     config: &Config,
     baseline_vec: &[String],
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     state::init(task, config, baseline_vec, state::WorkflowKind::Implement)?;
     persist_implement_settings(mode, &implement_args.flags, config)?;
@@ -1954,20 +2006,20 @@ fn transition_to_implementation(
         state::write_state_file("tasks.md", tasks_content, config)?;
     }
 
-    implement_all_tasks_command_with_mode(implement_args, config, &config.project_dir, mode, false)
+    implement_all_tasks_command_with_mode(implement_args, config, &config.project_dir, mode, false, session)
 }
 
-fn plan_tasks_implement_command(args: PlanTasksImplementArgs) -> Result<i32, AgentLoopError> {
+fn plan_tasks_implement_command(args: PlanTasksImplementArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     args.validate()?;
     let started = Instant::now();
 
     if args.resume {
-        return plan_tasks_implement_resume(args, started);
+        return plan_tasks_implement_resume(args, started, session);
     }
 
     let task = resolve_compound_task(args.task.as_ref(), args.file.as_ref())?;
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let mode = resolve_fresh_implement_mode(&args.flags, &config);
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
@@ -1975,7 +2027,7 @@ fn plan_tasks_implement_command(args: PlanTasksImplementArgs) -> Result<i32, Age
         Vec::new()
     };
 
-    reset_state_dir(&config.project_dir)?;
+    reset_state_dir(&config.project_dir, session)?;
     state::init(
         task.as_str(),
         &config,
@@ -2012,6 +2064,7 @@ fn plan_tasks_implement_command(args: PlanTasksImplementArgs) -> Result<i32, Age
         &implement_args,
         &config,
         &baseline_vec,
+        session,
     )?;
 
     finish_command_exit(started, &config, exit_code)
@@ -2020,11 +2073,12 @@ fn plan_tasks_implement_command(args: PlanTasksImplementArgs) -> Result<i32, Age
 fn plan_tasks_implement_resume(
     args: PlanTasksImplementArgs,
     started: Instant,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
+    let state_dir = session_state_dir(&project_dir, session)?;
     ensure_resume_state_dir_exists(&state_dir)?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let workflow = state::read_workflow(&config).ok_or_else(|| {
         AgentLoopError::State("Cannot resume: workflow state not found.".to_string())
     })?;
@@ -2066,6 +2120,7 @@ fn plan_tasks_implement_resume(
                 &implement_args,
                 &config,
                 &baseline_vec,
+                session,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2083,6 +2138,7 @@ fn plan_tasks_implement_resume(
                 &implement_args,
                 &config,
                 &baseline_vec,
+                session,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2095,23 +2151,24 @@ fn plan_tasks_implement_resume(
                 mode,
                 false,
                 false,
+                session,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
     }
 }
 
-fn plan_implement_command(args: PlanImplementArgs) -> Result<i32, AgentLoopError> {
+fn plan_implement_command(args: PlanImplementArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     args.validate()?;
     let started = Instant::now();
 
     if args.resume {
-        return plan_implement_resume(args, started);
+        return plan_implement_resume(args, started, session);
     }
 
     let task = resolve_compound_task(args.task.as_ref(), args.file.as_ref())?;
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let mode = resolve_fresh_implement_mode(&args.flags, &config);
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
@@ -2119,7 +2176,7 @@ fn plan_implement_command(args: PlanImplementArgs) -> Result<i32, AgentLoopError
         Vec::new()
     };
 
-    reset_state_dir(&config.project_dir)?;
+    reset_state_dir(&config.project_dir, session)?;
     state::init(
         task.as_str(),
         &config,
@@ -2147,16 +2204,17 @@ fn plan_implement_command(args: PlanImplementArgs) -> Result<i32, AgentLoopError
         &implement_args,
         &config,
         &baseline_vec,
+        session,
     )?;
 
     finish_command_exit(started, &config, exit_code)
 }
 
-fn plan_implement_resume(args: PlanImplementArgs, started: Instant) -> Result<i32, AgentLoopError> {
+fn plan_implement_resume(args: PlanImplementArgs, started: Instant, session: Option<&str>) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
+    let state_dir = session_state_dir(&project_dir, session)?;
     ensure_resume_state_dir_exists(&state_dir)?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let workflow = state::read_workflow(&config).ok_or_else(|| {
         AgentLoopError::State("Cannot resume: workflow state not found.".to_string())
     })?;
@@ -2190,6 +2248,7 @@ fn plan_implement_resume(args: PlanImplementArgs, started: Instant) -> Result<i3
                 &implement_args,
                 &config,
                 &baseline_vec,
+                session,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2203,6 +2262,7 @@ fn plan_implement_resume(args: PlanImplementArgs, started: Instant) -> Result<i3
                     mode,
                     false,
                     false,
+                    session,
                 )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2213,16 +2273,16 @@ fn plan_implement_resume(args: PlanImplementArgs, started: Instant) -> Result<i3
     }
 }
 
-fn tasks_implement_command(args: TasksImplementArgs) -> Result<i32, AgentLoopError> {
+fn tasks_implement_command(args: TasksImplementArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     args.validate()?;
     let started = Instant::now();
 
     if args.resume {
-        return tasks_implement_resume(args, started);
+        return tasks_implement_resume(args, started, session);
     }
 
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir.clone(), args.single_agent, false)?;
+    let config = Config::from_cli(project_dir.clone(), args.single_agent, false, session)?;
     let plan_content = if let Some(path) = args.file.as_ref() {
         fs::read_to_string(path).map_err(|err| {
             AgentLoopError::Config(format!(
@@ -2251,8 +2311,8 @@ fn tasks_implement_command(args: TasksImplementArgs) -> Result<i32, AgentLoopErr
     };
     let mode = resolve_fresh_implement_mode(&args.flags, &config);
 
-    reset_state_dir(&project_dir)?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    reset_state_dir(&project_dir, session)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let baseline_vec = if git::is_git_repo(&config) {
         git::list_changed_files(&config)?
     } else {
@@ -2281,6 +2341,7 @@ fn tasks_implement_command(args: TasksImplementArgs) -> Result<i32, AgentLoopErr
         &implement_args,
         &config,
         &baseline_vec,
+        session,
     )?;
 
     finish_command_exit(started, &config, exit_code)
@@ -2289,11 +2350,12 @@ fn tasks_implement_command(args: TasksImplementArgs) -> Result<i32, AgentLoopErr
 fn tasks_implement_resume(
     args: TasksImplementArgs,
     started: Instant,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let state_dir = project_dir.join(".agent-loop").join("state");
+    let state_dir = session_state_dir(&project_dir, session)?;
     ensure_resume_state_dir_exists(&state_dir)?;
-    let config = Config::from_cli(project_dir, args.single_agent, false)?;
+    let config = Config::from_cli(project_dir, args.single_agent, false, session)?;
     let workflow = state::read_workflow(&config).ok_or_else(|| {
         AgentLoopError::State("Cannot resume: workflow state not found.".to_string())
     })?;
@@ -2323,6 +2385,7 @@ fn tasks_implement_resume(
                 &implement_args,
                 &config,
                 &baseline_vec,
+                session,
             )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2336,6 +2399,7 @@ fn tasks_implement_resume(
                     mode,
                     false,
                     false,
+                    session,
                 )?;
             finish_command_exit(started, &config, exit_code)
         }
@@ -2386,6 +2450,7 @@ fn implement_all_tasks_batch(
     project_dir: &Path,
     raw_tasks: &str,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     implement_all_tasks_batch_using(
         args,
@@ -2394,7 +2459,7 @@ fn implement_all_tasks_batch(
         project_dir,
         raw_tasks,
         cleanup_on_success,
-        run_batch_implementation_with_title,
+        |a, c, p, t, ct, cl| run_batch_implementation_with_title(a, c, p, t, ct, cl, session),
     )
 }
 
@@ -2429,6 +2494,7 @@ fn implement_plan_batch(
     project_dir: &Path,
     plan: &str,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     println!("No tasks found; falling back to plan.md for batch implementation.");
     let original_task = state::read_state_file("task.md", config);
@@ -2440,6 +2506,7 @@ fn implement_plan_batch(
         "Batch implementation (plan fallback)",
         combined_task,
         cleanup_on_success,
+        session,
     )
 }
 
@@ -2450,6 +2517,7 @@ fn run_batch_implementation_with_title(
     title: &str,
     combined_task: String,
     cleanup_on_success: bool,
+    session: Option<&str>,
 ) -> Result<i32, AgentLoopError> {
     run_batch_implementation_with_title_using(
         args,
@@ -2458,7 +2526,7 @@ fn run_batch_implementation_with_title(
         title,
         combined_task,
         cleanup_on_success,
-        run_command_with_review_max_rounds,
+        |run_args, opts| run_command_with_review_max_rounds(run_args, opts, session),
     )
 }
 
@@ -2503,7 +2571,7 @@ where
         Ok(_) => (
             TaskRunStatus::Failed,
             Some(format_status_reason(
-                read_current_status(project_dir, args.single_agent).as_ref(),
+                read_current_status(project_dir, args.single_agent, config.session.as_deref()).as_ref(),
             )),
         ),
         Err(err) => (TaskRunStatus::Failed, Some(err.to_string())),
@@ -2544,16 +2612,8 @@ fn implement_all_tasks_wave(
         .unwrap_or(config.max_parallel)
         .max(1) as usize;
 
-    // Durable runtime artifacts live in .agent-loop/ (parent of state/) so that
-    // `reset` (which removes state/) does not delete them.
-    let agent_loop_dir = config
-        .state_dir
-        .parent()
-        .unwrap_or(&config.state_dir)
-        .to_path_buf();
-
     // Acquire wave lock to prevent concurrent wave runs.
-    let lock_path = agent_loop_dir.join("wave.lock");
+    let lock_path = config.wave_lock_path();
     let wave_lock = wave_runtime::WaveRunLock::acquire(
         lock_path,
         "wave",
@@ -2563,7 +2623,7 @@ fn implement_all_tasks_wave(
     .map_err(AgentLoopError::Wave)?;
 
     // Journal file for progress events (append-only, survives reset).
-    let journal_path = agent_loop_dir.join("wave-progress.jsonl");
+    let journal_path = config.wave_journal_path();
 
     println!(
         "Wave mode: {} task(s), {} wave(s), max_parallel={}",
@@ -2916,7 +2976,7 @@ fn launch_wave_task(
 ) {
     let task_title = parsed_tasks[task_idx].title.clone();
     let task_content = parsed_tasks[task_idx].content.clone();
-    let task_state_dir = config.state_dir.join(format!("task-{}", task_idx + 1));
+    let task_state_dir = config.state_dir.join(format!(".wave-task-{}", task_idx + 1));
     let task_config = config.with_state_dir(task_state_dir);
     let clear_progress = !args.resume;
     let tx = tx.clone();
@@ -3104,7 +3164,7 @@ fn implement_all_tasks_per_task(
 
             let usage_before_attempt = agent::usage_snapshot();
             let exit_code = if is_resume {
-                resume_for_tasks(args.single_agent, Some(current_review_max_rounds))?
+                resume_for_tasks(args.single_agent, Some(current_review_max_rounds), config.session.as_deref())?
             } else {
                 let run_args = RunArgs {
                     task: Some(task.content.clone()),
@@ -3122,6 +3182,7 @@ fn implement_all_tasks_per_task(
                         persist_flags: None,
                         cleanup_on_success: true,
                     },
+                    config.session.as_deref(),
                 )?
             };
             let usage_after_attempt = agent::usage_snapshot();
@@ -3134,7 +3195,7 @@ fn implement_all_tasks_per_task(
                 break;
             }
 
-            let status = read_current_status(project_dir, args.single_agent);
+            let status = read_current_status(project_dir, args.single_agent, config.session.as_deref());
             if !is_retryable_run_tasks_status(status.as_ref()) {
                 // Non-retryable failure.
                 break;
@@ -3178,7 +3239,7 @@ fn implement_all_tasks_per_task(
         } else {
             task_statuses[index].status = TaskRunStatus::Failed;
             task_statuses[index].retries = retry;
-            let status = read_current_status(project_dir, args.single_agent);
+            let status = read_current_status(project_dir, args.single_agent, config.session.as_deref());
             task_statuses[index].last_error = Some(format_status_reason(status.as_ref()));
             had_failures = true;
 
@@ -3251,21 +3312,62 @@ fn terminalize_interrupted_tasks(statuses: &mut [TaskStatusEntry]) {
     }
 }
 
-fn reset_state_dir(project_dir: &Path) -> Result<(), AgentLoopError> {
-    let state_dir = project_dir.join(".agent-loop").join("state");
-    if state_dir.exists() {
-        fs::remove_dir_all(&state_dir)?;
+fn reset_state_dir(project_dir: &Path, session: Option<&str>) -> Result<(), AgentLoopError> {
+    if let Some(name) = session {
+        config::validate_session_name(name)?;
     }
-    fs::create_dir_all(&state_dir)?;
+    let state_dir = match session {
+        Some(name) => project_dir.join(".agent-loop").join("state").join(name),
+        None => project_dir.join(".agent-loop").join("state"),
+    };
+    match session {
+        Some(_) => {
+            // Session-scoped: remove the session directory entirely
+            if state_dir.is_dir() {
+                fs::remove_dir_all(&state_dir)?;
+            }
+            fs::create_dir_all(&state_dir)?;
+        }
+        None => {
+            // Default: remove top-level files and wave task dirs, preserve session dirs
+            if state_dir.is_dir() {
+                let agent_loop_dir = project_dir.join(".agent-loop");
+                let sentinel_exists =
+                    state::wave_task_migration_sentinel(&agent_loop_dir).exists();
+                for entry in fs::read_dir(&state_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() {
+                        fs::remove_file(&path)?;
+                    } else if path.is_dir() {
+                        let name = entry.file_name();
+                        let name_str = name.to_string_lossy();
+                        if name_str.starts_with(".wave-task-") {
+                            fs::remove_dir_all(&path)?;
+                        } else if !sentinel_exists
+                            && state::is_legacy_wave_task_dir(&name_str, &path)
+                        {
+                            // Pre-sentinel only: safe because no --session dirs exist yet.
+                            // Post-sentinel: any task-N dir could be a session.
+                            fs::remove_dir_all(&path)?;
+                        }
+                        // Other subdirectories (session namespaces) are left untouched
+                    }
+                }
+            } else {
+                fs::create_dir_all(&state_dir)?;
+            }
+        }
+    }
     Ok(())
 }
 
-fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
+fn reset_command(args: &ResetArgs, session: Option<&str>) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
 
     if args.wave_lock {
         // Lock lives in .agent-loop/ (parent of state/) to survive reset.
-        let lock_path = project_dir.join(".agent-loop").join("wave.lock");
+        let lock_path = session_wave_lock_path(&project_dir, session)?;
         if lock_path.exists() {
             fs::remove_file(&lock_path)?;
             println!("Wave lock removed.");
@@ -3275,7 +3377,7 @@ fn reset_command(args: &ResetArgs) -> Result<i32, AgentLoopError> {
         return Ok(0);
     }
 
-    reset_state_dir(&project_dir)?;
+    reset_state_dir(&project_dir, session)?;
     println!("State cleared. decisions.md preserved.");
     Ok(0)
 }
@@ -3331,7 +3433,7 @@ fn task_local_implement_progress_paths(config: &Config) -> Vec<PathBuf> {
         }
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("task-") {
+        if !name.starts_with(".wave-task-") {
             continue;
         }
         let progress_path = entry.path().join("implement-progress.md");
@@ -3344,9 +3446,9 @@ fn task_local_implement_progress_paths(config: &Config) -> Vec<PathBuf> {
     paths
 }
 
-fn status_command() -> Result<i32, AgentLoopError> {
+fn status_command(session: Option<&str>) -> Result<i32, AgentLoopError> {
     let project_dir = current_project_dir()?;
-    let config = Config::from_cli(project_dir, false, false)?;
+    let config = Config::from_cli(project_dir, false, false, session)?;
     let status_path = config.state_dir.join("status.json");
 
     if !config.state_dir.is_dir() || !status_path.is_file() {
@@ -3409,12 +3511,7 @@ fn status_command() -> Result<i32, AgentLoopError> {
     }
 
     // Wave lock info. Durable artifacts live in .agent-loop/ (parent of state/).
-    let agent_loop_dir = config
-        .state_dir
-        .parent()
-        .unwrap_or(&config.state_dir)
-        .to_path_buf();
-    let lock_path = agent_loop_dir.join("wave.lock");
+    let lock_path = config.wave_lock_path();
     if lock_path.exists()
         && let Ok(raw) = fs::read_to_string(&lock_path)
         && let Ok(lock) = serde_json::from_str::<wave_runtime::LockFileContent>(&raw)
@@ -3431,6 +3528,11 @@ fn status_command() -> Result<i32, AgentLoopError> {
             );
         }
     }
+
+    // One-time migration for read-only entry points that bypass state::init.
+    let agent_loop_dir = config.agent_loop_dir();
+    let base_state_dir = agent_loop_dir.join("state");
+    state::migrate_legacy_wave_task_dirs(&base_state_dir, &agent_loop_dir)?;
 
     // Planning artifacts.
     let planning_progress_path = config.state_dir.join("planning-progress.md");
@@ -3489,7 +3591,7 @@ fn status_command() -> Result<i32, AgentLoopError> {
     }
 
     // Recent wave progress events (journal also lives in .agent-loop/).
-    let journal_path = agent_loop_dir.join("wave-progress.jsonl");
+    let journal_path = config.wave_journal_path();
     let recent = wave_runtime::read_recent_events(&journal_path, 5);
     if !recent.is_empty() {
         println!();
@@ -3977,7 +4079,7 @@ mod tests {
     fn finish_command_exit_cleans_session_files_on_success() {
         let root = create_temp_project_root("main_finish_cleanup_success");
         let config = make_test_config(&root, TestConfigOptions::default());
-        fs::create_dir_all(config.state_dir.join("task-1")).expect("state dir should exist");
+        fs::create_dir_all(config.state_dir.join(".wave-task-1")).expect("state dir should exist");
         fs::write(
             config.state_dir.join("implement-implementer_session_id"),
             "root",
@@ -3986,7 +4088,7 @@ mod tests {
         fs::write(
             config
                 .state_dir
-                .join("task-1")
+                .join(".wave-task-1")
                 .join("implement-reviewer_session_id"),
             "nested",
         )
@@ -4005,7 +4107,7 @@ mod tests {
         assert!(
             !config
                 .state_dir
-                .join("task-1")
+                .join(".wave-task-1")
                 .join("implement-reviewer_session_id")
                 .exists()
         );
@@ -4083,8 +4185,8 @@ mod tests {
         )
         .expect("tasks.md should be written");
 
-        // Seed session files in root and nested task-1 directory.
-        let nested_dir = config.state_dir.join("task-1");
+        // Seed session files in root and nested .wave-task-1 directory.
+        let nested_dir = config.state_dir.join(".wave-task-1");
         fs::create_dir_all(&nested_dir).expect("nested state dir should exist");
         fs::write(
             config.state_dir.join("implement-implementer_session_id"),
@@ -4116,6 +4218,7 @@ mod tests {
             |_args, _tasks, _config, _project_dir| Ok(0),
             // Mock per-task executor: unused for Wave mode.
             |_args, _tasks, _config, _project_dir| unreachable!("wave mode should not call per-task"),
+            None,
         )
         .expect("wave mode should succeed");
 
@@ -4129,7 +4232,7 @@ mod tests {
         );
         assert!(
             !nested_dir.join("implement-reviewer_session_id").exists(),
-            "nested task-1 session file should be cleaned up after successful wave run"
+            "nested .wave-task-1 session file should be cleaned up after successful wave run"
         );
         assert!(
             config.state_dir.join("workflow.txt").exists(),
@@ -4167,7 +4270,7 @@ mod tests {
         // Seed session files AFTER state::init (which creates the state dir
         // and may clean it), then re-run to prove cleanup wiring.
         // We need a fresh config because init may have written state files.
-        let nested_dir = config.state_dir.join("task-1");
+        let nested_dir = config.state_dir.join(".wave-task-1");
         fs::create_dir_all(&nested_dir).expect("nested dir should exist");
         fs::write(
             config.state_dir.join("implement-implementer_session_id"),
@@ -4223,7 +4326,7 @@ mod tests {
         fs::create_dir_all(&config.state_dir).expect("state dir should exist");
 
         // Seed session files before calling the resume path.
-        let nested_dir = config.state_dir.join("task-2");
+        let nested_dir = config.state_dir.join(".wave-task-2");
         fs::create_dir_all(&nested_dir).expect("nested dir should exist");
         fs::write(
             config.state_dir.join("implement-implementer_session_id"),
@@ -4381,7 +4484,7 @@ mod tests {
     /// environment_help() and clear_env(). This test prevents future omissions.
     #[test]
     fn environment_help_contains_all_recognized_env_vars() {
-        let help = environment_help();
+        let help = environment_help(None);
         // Every env var parsed in Config::from_cli_with_overrides must appear.
         for var in [
             "REVIEW_MAX_ROUNDS",
@@ -4461,7 +4564,7 @@ mod tests {
 
     #[test]
     fn environment_help_contains_migration_note() {
-        let help = environment_help();
+        let help = environment_help(None);
         assert!(
             help.contains(
                 "max_rounds / MAX_ROUNDS has been renamed to review_max_rounds / REVIEW_MAX_ROUNDS"
@@ -4472,7 +4575,7 @@ mod tests {
 
     #[test]
     fn environment_help_shows_unlimited_round_defaults() {
-        let help = environment_help();
+        let help = environment_help(None);
         // All three round-limit defaults should show 0 (unlimited)
         assert!(
             help.contains(&format!(
@@ -4499,7 +4602,7 @@ mod tests {
 
     #[test]
     fn environment_help_shows_full_access_default_on() {
-        let help = environment_help();
+        let help = environment_help(None);
         assert!(
             help.contains("CLAUDE_FULL_ACCESS    (default: 1)"),
             "CLAUDE_FULL_ACCESS default should show 1"
@@ -4512,7 +4615,7 @@ mod tests {
 
     #[test]
     fn environment_help_does_not_list_max_rounds_as_active_setting() {
-        let help = environment_help();
+        let help = environment_help(None);
         // MAX_ROUNDS should only appear in the migration note, not as an active env var setting.
         // The active setting is REVIEW_MAX_ROUNDS.
         let lines: Vec<&str> = help.lines().collect();
@@ -4531,10 +4634,121 @@ mod tests {
 
     #[test]
     fn environment_help_contains_round_limit_semantics_note() {
-        let help = environment_help();
+        let help = environment_help(None);
         assert!(
             help.contains("Round limits: 0 = unlimited"),
             "environment_help() should document that 0 = unlimited for round limits"
         );
+    }
+
+    #[test]
+    fn reset_state_dir_rejects_invalid_session_name() {
+        let root = create_temp_project_root("reset_invalid_session");
+        let result = reset_state_dir(&root, Some("../../escape"));
+        assert!(
+            result.is_err(),
+            "reset_state_dir should reject session names with path separators"
+        );
+        let result = reset_state_dir(&root, Some("has.dot"));
+        assert!(
+            result.is_err(),
+            "reset_state_dir should reject session names with dots"
+        );
+    }
+
+    #[test]
+    fn reset_state_dir_with_valid_session_only_clears_session_dir() {
+        let root = create_temp_project_root("reset_valid_session");
+        let state_dir = root.join(".agent-loop").join("state");
+        let session_dir = state_dir.join("my-session");
+        let other_dir = state_dir.join("other-session");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&other_dir).unwrap();
+        fs::write(session_dir.join("status.json"), "{}").unwrap();
+        fs::write(other_dir.join("status.json"), "{}").unwrap();
+        fs::write(state_dir.join("plan.md"), "default").unwrap();
+
+        reset_state_dir(&root, Some("my-session")).unwrap();
+
+        // Session dir is recreated empty
+        assert!(session_dir.is_dir());
+        assert!(!session_dir.join("status.json").exists());
+        // Other session and default state are untouched
+        assert!(other_dir.join("status.json").exists());
+        assert!(state_dir.join("plan.md").exists());
+    }
+
+    #[test]
+    fn migrate_does_not_rename_session_named_task_n_after_sentinel() {
+        let root = create_temp_project_root("migrate_session_task_n");
+        let agent_loop_dir = root.join(".agent-loop");
+        let state_dir = agent_loop_dir.join("state");
+        let session_dir = state_dir.join("task-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        // Simulate a session that has written markers
+        fs::write(session_dir.join("implement-progress.md"), "progress").unwrap();
+        fs::write(session_dir.join("implement_session_id"), "sid").unwrap();
+
+        // Simulate the real upgrade path: run migration once on an empty state
+        // dir to write the sentinel (no legacy dirs to rename).
+        let empty_state = agent_loop_dir.join("empty-state");
+        fs::create_dir_all(&empty_state).unwrap();
+        state::migrate_legacy_wave_task_dirs(&empty_state, &agent_loop_dir).unwrap();
+        assert!(
+            state::wave_task_migration_sentinel(&agent_loop_dir).exists(),
+            "sentinel should be written"
+        );
+
+        // Now simulate a session named task-1 being created after sentinel.
+        // Run migration again — it should skip because sentinel exists.
+        state::migrate_legacy_wave_task_dirs(&state_dir, &agent_loop_dir).unwrap();
+        assert!(
+            session_dir.is_dir(),
+            "task-1 session directory must NOT be renamed after sentinel exists"
+        );
+        assert!(
+            !state_dir.join(".wave-task-1").exists(),
+            ".wave-task-1 should not be created from a session dir"
+        );
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_crash_safe() {
+        // Simulate a partial migration (crash after renaming only one dir).
+        let root = create_temp_project_root("migrate_crash_safe");
+        let agent_loop_dir = root.join(".agent-loop");
+        let state_dir = agent_loop_dir.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+
+        // Create two legacy wave task dirs
+        let task1 = state_dir.join("task-1");
+        let task2 = state_dir.join("task-2");
+        fs::create_dir_all(&task1).unwrap();
+        fs::create_dir_all(&task2).unwrap();
+        fs::write(task1.join("implement-progress.md"), "p1").unwrap();
+        fs::write(task2.join("implement-progress.md"), "p2").unwrap();
+
+        // Manually rename task-1 but do NOT write sentinel (simulates crash).
+        fs::rename(&task1, state_dir.join(".wave-task-1")).unwrap();
+        assert!(!state::wave_task_migration_sentinel(&agent_loop_dir).exists());
+
+        // Re-run migration — should pick up task-2 and write sentinel.
+        state::migrate_legacy_wave_task_dirs(&state_dir, &agent_loop_dir).unwrap();
+        assert!(
+            state_dir.join(".wave-task-1").is_dir(),
+            "previously renamed dir should still exist"
+        );
+        assert!(
+            state_dir.join(".wave-task-2").is_dir(),
+            "task-2 should be renamed on retry"
+        );
+        assert!(!task2.exists(), "task-2 should no longer exist");
+        assert!(
+            state::wave_task_migration_sentinel(&agent_loop_dir).exists(),
+            "sentinel should be written after successful retry"
+        );
+
+        // Third call should be a no-op (sentinel exists).
+        state::migrate_legacy_wave_task_dirs(&state_dir, &agent_loop_dir).unwrap();
     }
 }

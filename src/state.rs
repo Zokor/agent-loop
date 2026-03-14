@@ -266,10 +266,10 @@ fn remove_project_guide_decisions_references(config: &Config) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        if let Some(updated) = strip_decisions_reference(&content) {
-            if let Err(err) = fs::write(&path, updated) {
-                eprintln!("⚠ failed to remove decisions reference from {filename}: {err}");
-            }
+        if let Some(updated) = strip_decisions_reference(&content)
+            && let Err(err) = fs::write(&path, updated)
+        {
+            eprintln!("⚠ failed to remove decisions reference from {filename}: {err}");
         }
     }
 }
@@ -303,23 +303,31 @@ impl AgentCallMeta {
     }
 }
 
-/// Append a human-readable transcript entry to `.agent-loop/state/transcript.log`.
-///
-/// No-op when `!config.transcript_enabled`. Failures are best-effort (non-fatal).
-pub fn append_transcript_entry(
+/// A handle to an in-progress transcript entry returned by [`begin_transcript_entry`].
+/// Used to append the completion block in phase 2.
+pub struct TranscriptHandle {
+    pub path: PathBuf,
+}
+
+/// Completion status for a two-phase transcript entry.
+pub enum TranscriptCompletionStatus {
+    Completed,
+    Failed,
+}
+
+/// Phase 1: Write the entry header, metadata block, and prompt sections before the agent runs.
+/// Returns a [`TranscriptHandle`] on success (used to complete the entry in phase 2).
+/// No-op when `!config.transcript_enabled`; returns `None`.
+pub fn begin_transcript_entry(
     config: &Config,
     meta: &AgentCallMeta,
     user_prompt: &str,
     system_prompt: Option<&str>,
-    normalized_output: &str,
-) {
+) -> Option<TranscriptHandle> {
     if !config.transcript_enabled {
-        return;
+        return None;
     }
 
-    // Debug-mode sanity check: phase callers should always provide real
-    // metadata.  Fallback "direct/untracked" entries are expected only from
-    // run_agent() (non-session, non-phase) calls.
     debug_assert!(
         !meta.workflow.is_empty() && !meta.phase.is_empty(),
         "transcript entry has empty workflow/phase — caller should provide AgentCallMeta"
@@ -344,6 +352,7 @@ pub fn append_transcript_entry(
     if let Some(hint) = &meta.session_hint {
         entry.push_str(&format!("session_hint: {hint}\n"));
     }
+    entry.push_str("status: in_progress\n");
 
     entry.push_str("\n--- USER PROMPT ---\n");
     entry.push_str(user_prompt);
@@ -359,14 +368,6 @@ pub fn append_transcript_entry(
         }
     }
 
-    entry.push_str("\n--- NORMALIZED OUTPUT ---\n");
-    entry.push_str(normalized_output);
-    if !normalized_output.ends_with('\n') {
-        entry.push('\n');
-    }
-    entry.push_str("=== END ===\n\n");
-
-    // Best-effort append
     let write_result = OpenOptions::new()
         .create(true)
         .append(true)
@@ -375,11 +376,56 @@ pub fn append_transcript_entry(
 
     if let Err(err) = write_result {
         eprintln!("⚠ transcript write failed: {err}");
+        return None;
+    }
+
+    Some(TranscriptHandle { path })
+}
+
+/// Phase 2: Append the completion block and `=== END ===` to the transcript entry.
+/// Runs transcript rotation after writing.
+/// No-op when `handle` is `None`.
+pub fn complete_transcript_entry(
+    handle: Option<&TranscriptHandle>,
+    status: TranscriptCompletionStatus,
+    failure_reason: Option<&str>,
+    normalized_output: &str,
+) {
+    let Some(handle) = handle else { return };
+
+    let ended_at = timestamp();
+    let status_str = match status {
+        TranscriptCompletionStatus::Completed => "completed",
+        TranscriptCompletionStatus::Failed => "failed",
+    };
+
+    let mut entry = String::new();
+    entry.push_str("\n--- COMPLETION ---\n");
+    entry.push_str(&format!("status: {status_str}\n"));
+    entry.push_str(&format!("ended_at: {ended_at}\n"));
+    if let Some(reason) = failure_reason {
+        entry.push_str(&format!("failure_reason: {reason}\n"));
+    }
+
+    entry.push_str("\n--- NORMALIZED OUTPUT ---\n");
+    entry.push_str(normalized_output);
+    if !normalized_output.ends_with('\n') {
+        entry.push('\n');
+    }
+    entry.push_str("=== END ===\n\n");
+
+    let write_result = OpenOptions::new()
+        .append(true)
+        .open(&handle.path)
+        .and_then(|mut f| f.write_all(entry.as_bytes()));
+
+    if let Err(err) = write_result {
+        eprintln!("⚠ transcript write failed: {err}");
         return;
     }
 
     // Cap/rotate: if file exceeds TRANSCRIPT_MAX_LINES, keep the last half.
-    if let Ok(content) = fs::read_to_string(&path) {
+    if let Ok(content) = fs::read_to_string(&handle.path) {
         let line_count = content.lines().count();
         if line_count > TRANSCRIPT_MAX_LINES {
             let keep_from = line_count - (TRANSCRIPT_MAX_LINES / 2);
@@ -393,9 +439,31 @@ pub fn append_transcript_entry(
             if !rotated.ends_with('\n') {
                 rotated.push('\n');
             }
-            let _ = fs::write(&path, rotated);
+            let _ = fs::write(&handle.path, rotated);
         }
     }
+}
+
+/// Append a human-readable transcript entry to `.agent-loop/state/transcript.log`.
+///
+/// Convenience wrapper around [`begin_transcript_entry`] and [`complete_transcript_entry`],
+/// retained for backward compatibility with existing tests and direct call sites.
+///
+/// No-op when `!config.transcript_enabled`. Failures are best-effort (non-fatal).
+pub fn append_transcript_entry(
+    config: &Config,
+    meta: &AgentCallMeta,
+    user_prompt: &str,
+    system_prompt: Option<&str>,
+    normalized_output: &str,
+) {
+    let handle = begin_transcript_entry(config, meta, user_prompt, system_prompt);
+    complete_transcript_entry(
+        handle.as_ref(),
+        TranscriptCompletionStatus::Completed,
+        None,
+        normalized_output,
+    );
 }
 
 pub fn normalize_task_text(value: &str) -> String {
@@ -853,9 +921,9 @@ pub fn log(msg: &str, config: &Config) -> io::Result<()> {
 
 /// Delete all `*_session_id` files from the state directory.
 pub fn cleanup_session_files(config: &Config) -> io::Result<usize> {
-    fn cleanup_dir(path: &Path) -> io::Result<usize> {
+    fn cleanup_dir(dir: &Path) -> io::Result<usize> {
         let mut deleted = 0usize;
-        for entry in fs::read_dir(path)? {
+        for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
             if file_type.is_dir() {
@@ -875,14 +943,134 @@ pub fn cleanup_session_files(config: &Config) -> io::Result<usize> {
         Ok(deleted)
     }
 
-    let deleted = match fs::read_dir(&config.state_dir) {
-        Ok(_) => cleanup_dir(&config.state_dir)?,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
-        Err(err) => return Err(err),
-    };
+    if config.session.is_some() {
+        // Session-scoped: existing recursive behavior is correct.
+        // config.state_dir is already scoped to the session directory.
+        let deleted = match fs::read_dir(&config.state_dir) {
+            Ok(_) => cleanup_dir(&config.state_dir)?,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(err),
+        };
 
-    log(&format!("Cleaned up {deleted} session file(s)"), config)?;
-    Ok(deleted)
+        log(&format!("Cleaned up {deleted} session file(s)"), config)?;
+        Ok(deleted)
+    } else {
+        // Default session: only walk top-level files and .wave-task-* dirs.
+        let mut removed = 0;
+        match fs::read_dir(&config.state_dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() {
+                        if path.to_string_lossy().ends_with("_session_id") {
+                            fs::remove_file(&path)?;
+                            removed += 1;
+                        }
+                    } else if path.is_dir() {
+                        let name = entry.file_name();
+                        if name.to_string_lossy().starts_with(".wave-task-") {
+                            removed += cleanup_dir(&path)?;
+                        }
+                        // Skip session namespace directories
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+
+        log(&format!("Cleaned up {removed} session file(s)"), config)?;
+        Ok(removed)
+    }
+}
+
+const WAVE_TASK_MIGRATION_SENTINEL: &str = ".wave-task-migration-v1";
+
+/// One-time migration: renames pre-existing `task-{N}` wave task directories
+/// to `.wave-task-{N}`.
+///
+/// Called from `state::init` (covers implementation/planning commands) and
+/// `status_command` in main.rs (covers `agent-loop status`, which bypasses
+/// `state::init`).
+///
+/// The sentinel is written **after** all renames complete so that a crash
+/// mid-migration allows the next startup to retry remaining directories.
+/// The rename loop is idempotent: `is_legacy_wave_task_dir` only matches
+/// `task-\d+` directories with wave markers, and renames are skipped when
+/// the target `.wave-task-{N}` already exists or the source has vanished
+/// (concurrent process). Re-running after a partial migration simply
+/// finishes any outstanding renames.
+///
+/// Session collision safety: migration runs in `state::init` after
+/// `create_dir_all(config.state_dir)` but before any state files are
+/// written. A session directory like `task-1/` created in the same call
+/// is empty at scan time, so `is_legacy_wave_task_dir` returns false and
+/// skips it. After the sentinel is written, no future startup will attempt
+/// renames at all.
+pub(crate) fn migrate_legacy_wave_task_dirs(
+    state_dir: &Path,
+    agent_loop_dir: &Path,
+) -> Result<(), crate::error::AgentLoopError> {
+    if !agent_loop_dir.is_dir() {
+        return Ok(());
+    }
+    let sentinel = agent_loop_dir.join(WAVE_TASK_MIGRATION_SENTINEL);
+    if sentinel.exists() {
+        return Ok(());
+    }
+    if state_dir.is_dir() {
+        for entry in fs::read_dir(state_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !is_legacy_wave_task_dir(&name_str, &path) {
+                continue;
+            }
+            let suffix = &name_str["task-".len()..];
+            let new_name = format!(".wave-task-{suffix}");
+            let new_path = state_dir.join(&new_name);
+            if !new_path.exists() {
+                match fs::rename(&path, &new_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // Another process already renamed this directory
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    // Write sentinel after all renames so a crash mid-loop allows retry.
+    fs::write(&sentinel, "")?;
+    Ok(())
+}
+
+/// Detects pre-rename wave task directories: matches `task-\d+` names that
+/// contain marker files (`implement-progress.md` or `*_session_id`).
+pub(crate) fn is_legacy_wave_task_dir(name: &str, path: &Path) -> bool {
+    if !name.starts_with("task-") {
+        return false;
+    }
+    let suffix = &name["task-".len()..];
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    path.join("implement-progress.md").exists()
+        || fs::read_dir(path).ok().is_some_and(|entries| {
+            entries.filter_map(|e| e.ok()).any(|e| {
+                e.file_name().to_string_lossy().ends_with("_session_id")
+            })
+        })
+}
+
+/// Returns the path to the migration sentinel file.
+pub(crate) fn wave_task_migration_sentinel(agent_loop_dir: &Path) -> PathBuf {
+    agent_loop_dir.join(WAVE_TASK_MIGRATION_SENTINEL)
 }
 
 pub fn append_round_summary(
@@ -1000,7 +1188,7 @@ pub fn review_has_no_findings(review_text: &str) -> bool {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .is_some_and(|last| {
-            let stripped = last.trim_end_matches(|c: char| matches!(c, '.' | '!' | ':' | ';'));
+            let stripped = last.trim_end_matches(['.', '!', ':', ';']);
             stripped.eq_ignore_ascii_case("no findings")
         })
 }
@@ -1424,6 +1612,12 @@ pub fn init(
 ) -> io::Result<()> {
     fs::create_dir_all(&config.state_dir)?;
 
+    // One-time migration: rename legacy task-{N} wave task dirs to .wave-task-{N}.
+    let agent_loop_dir = config.agent_loop_dir();
+    let base_state_dir = agent_loop_dir.join("state");
+    migrate_legacy_wave_task_dirs(&base_state_dir, &agent_loop_dir)
+        .map_err(|e| io::Error::other(e.to_string()))?;
+
     // Decisions subsystem initialization
     if config.decisions_enabled {
         let decisions = decisions_path(config);
@@ -1795,7 +1989,7 @@ mod tests {
     #[test]
     fn cleanup_session_files_removes_root_and_nested_session_files_only() {
         let project = new_project();
-        let nested_dir = project.config.state_dir.join("task-1");
+        let nested_dir = project.config.state_dir.join(".wave-task-1");
         fs::create_dir_all(&nested_dir).expect("nested state dir should exist");
 
         fs::write(
@@ -3938,5 +4132,224 @@ mod tests {
             !content.contains("tracking: untracked"),
             "phase-tracked entries must NOT include untracked annotation, got:\n{content}"
         );
+    }
+
+    #[test]
+    fn begin_transcript_entry_writes_full_metadata_and_prompts() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 2,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: Some("hint-abc".to_string()),
+        };
+        let handle = begin_transcript_entry(
+            &project.config,
+            &meta,
+            "user prompt text",
+            Some("system prompt text"),
+        );
+        assert!(handle.is_some(), "should return a handle when enabled");
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("=== AGENT CALL ["));
+        assert!(content.contains("workflow: implement"));
+        assert!(content.contains("phase: implementer"));
+        assert!(content.contains("round: 2"));
+        assert!(content.contains("role: implementer"));
+        assert!(content.contains("agent: claude"));
+        assert!(content.contains("session_hint: hint-abc"));
+        assert!(content.contains("status: in_progress"));
+        assert!(content.contains("--- USER PROMPT ---"));
+        assert!(content.contains("user prompt text"));
+        assert!(content.contains("--- SYSTEM PROMPT ---"));
+        assert!(content.contains("system prompt text"));
+        // Phase 1 must NOT write the completion section or end marker
+        assert!(!content.contains("=== END ==="), "phase-1 must not contain END marker");
+        assert!(!content.contains("--- COMPLETION ---"), "phase-1 must not contain COMPLETION section");
+        assert!(!content.contains("--- NORMALIZED OUTPUT ---"), "phase-1 must not contain NORMALIZED OUTPUT");
+    }
+
+    #[test]
+    fn begin_transcript_entry_includes_untracked_annotation_for_fallback() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            round: 0,
+            role: "unknown".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        let _handle = begin_transcript_entry(&project.config, &meta, "p", None);
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("tracking: untracked (direct agent call)"),
+            "fallback begin entries must include tracking annotation"
+        );
+    }
+
+    #[test]
+    fn begin_transcript_entry_returns_none_when_disabled() {
+        let project = new_project(); // transcript_enabled = false by default
+        let meta = AgentCallMeta {
+            agent_name: "claude".to_string(),
+            role: "implementer".to_string(),
+            ..AgentCallMeta::default()
+        };
+        let handle = begin_transcript_entry(&project.config, &meta, "prompt", None);
+        assert!(handle.is_none(), "should return None when transcript disabled");
+        let path = project.config.state_dir.join("transcript.log");
+        assert!(!path.exists(), "no file should be created when disabled");
+    }
+
+    #[test]
+    fn complete_transcript_entry_appends_completion_output_and_end() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 1,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        let handle = begin_transcript_entry(&project.config, &meta, "user p", None);
+        complete_transcript_entry(
+            handle.as_ref(),
+            TranscriptCompletionStatus::Completed,
+            None,
+            "the output",
+        );
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("--- COMPLETION ---"));
+        assert!(content.contains("status: completed"));
+        assert!(content.contains("ended_at:"));
+        assert!(!content.contains("failure_reason:"), "completed entries must not have failure_reason");
+        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("the output"));
+        assert!(content.contains("=== END ==="));
+    }
+
+    #[test]
+    fn complete_transcript_entry_records_failure_reason() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 1,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        let handle = begin_transcript_entry(&project.config, &meta, "user p", None);
+        complete_transcript_entry(
+            handle.as_ref(),
+            TranscriptCompletionStatus::Failed,
+            Some("agent timed out after 60s"),
+            "partial output",
+        );
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("--- COMPLETION ---"));
+        assert!(content.contains("status: failed"));
+        assert!(content.contains("ended_at:"));
+        assert!(content.contains("failure_reason: agent timed out after 60s"));
+        assert!(content.contains("--- NORMALIZED OUTPUT ---"));
+        assert!(content.contains("partial output"), "failed entries must still record captured output");
+        assert!(content.contains("=== END ==="));
+    }
+
+    #[test]
+    fn complete_transcript_entry_noop_when_handle_is_none() {
+        // Should not panic or create any files.
+        complete_transcript_entry(
+            None,
+            TranscriptCompletionStatus::Completed,
+            None,
+            "output",
+        );
+    }
+
+    #[test]
+    fn append_transcript_entry_wrapper_produces_correct_format() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: "implement".to_string(),
+            phase: "implementer".to_string(),
+            round: 1,
+            role: "implementer".to_string(),
+            agent_name: "claude".to_string(),
+            session_hint: None,
+        };
+        append_transcript_entry(&project.config, &meta, "user p", None, "output text");
+
+        let path = project.config.state_dir.join("transcript.log");
+        let content = fs::read_to_string(&path).unwrap();
+        // Verify ordering: in_progress appears before COMPLETION
+        let in_progress_pos = content.find("status: in_progress").expect("status: in_progress must be present");
+        let completion_pos = content.find("--- COMPLETION ---").expect("--- COMPLETION --- must be present");
+        let output_pos = content.find("--- NORMALIZED OUTPUT ---").expect("--- NORMALIZED OUTPUT --- must be present");
+        let end_pos = content.find("=== END ===").expect("=== END === must be present");
+        assert!(in_progress_pos < completion_pos, "in_progress must come before COMPLETION");
+        assert!(completion_pos < output_pos, "COMPLETION must come before NORMALIZED OUTPUT");
+        assert!(output_pos < end_pos, "NORMALIZED OUTPUT must come before END");
+        assert!(content.contains("status: completed"));
+        assert!(content.contains("ended_at:"));
+        assert!(content.contains("output text"));
+    }
+
+    #[test]
+    fn rotation_triggers_after_complete_transcript_entry() {
+        let mut project = new_project();
+        project.config.transcript_enabled = true;
+        fs::create_dir_all(&project.config.state_dir).unwrap();
+
+        let path = project.config.state_dir.join("transcript.log");
+        // Pre-seed a large file
+        let mut big = String::new();
+        for i in 0..TRANSCRIPT_MAX_LINES + 100 {
+            big.push_str(&format!("line {i}\n"));
+        }
+        fs::write(&path, &big).unwrap();
+
+        let meta = AgentCallMeta {
+            workflow: FALLBACK_WORKFLOW.to_string(),
+            phase: FALLBACK_PHASE.to_string(),
+            ..AgentCallMeta::default()
+        };
+        let handle = begin_transcript_entry(&project.config, &meta, "p", None);
+        complete_transcript_entry(handle.as_ref(), TranscriptCompletionStatus::Completed, None, "o");
+
+        let content = fs::read_to_string(&path).unwrap();
+        let line_count = content.lines().count();
+        assert!(
+            line_count <= TRANSCRIPT_MAX_LINES,
+            "transcript should be rotated after complete: got {line_count} lines"
+        );
+        assert!(content.starts_with("[transcript rotated]"));
     }
 }

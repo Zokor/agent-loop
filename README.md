@@ -354,7 +354,7 @@ On `agent-loop implement --wave --resume`, the completed tasks stay `Done`, Task
 
 ### Runtime behavior
 
-Each task keeps its own state, metrics, and conversation history under `.agent-loop/state/task-{index}/`, while wave-level status is tracked centrally in `.agent-loop/state/task_status.json`, `.agent-loop/state/task_metrics.json`, and `wave-progress.jsonl`.
+Each task keeps its own state, metrics, and conversation history under `.agent-loop/state/.wave-task-{index}/`, while wave-level status is tracked centrally in `.agent-loop/state/task_status.json`, `.agent-loop/state/task_metrics.json`, and `wave-progress.jsonl`.
 
 Features:
 - Per-task state isolation: every task runs in its own state directory.
@@ -875,12 +875,12 @@ Wave runtime:
     task_status.json                     # per-task lifecycle state for per-task/wave execution
     task_metrics.json                    # per-task timing and usage metrics
     transcript.log                       # agent I/O transcript (when transcript_enabled=true)
-    task-{index}/                        # per-task state dirs (wave mode)
+    .wave-task-{index}/                   # per-task state dirs (wave mode)
 ```
 
 `implement-progress.md` is canonical in the active implementation state directory:
 - batch and sequential per-task runs use `.agent-loop/state/implement-progress.md`
-- wave runs use `.agent-loop/state/task-{index}/implement-progress.md`
+- wave runs use `.agent-loop/state/.wave-task-{index}/implement-progress.md`
 
 `status` reads `workflow.txt`, prints phase-specific resume guidance, and surfaces task-local wave progress files when they exist.
 

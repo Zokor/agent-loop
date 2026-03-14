@@ -236,12 +236,9 @@ pub(crate) struct PhasePaths {
     pub(crate) status_json: PathBuf,
 }
 
-/// State directory relative to the project root, used in prompt text.
-const STATE_REL: &str = ".agent-loop/state";
-
-pub(crate) fn phase_paths(_config: &Config) -> PhasePaths {
+pub(crate) fn phase_paths(config: &Config) -> PhasePaths {
     use crate::state::TASKS_FINDINGS_FILENAME;
-    let base = Path::new(STATE_REL);
+    let base = PathBuf::from(config.state_dir_rel());
     PhasePaths {
         task_md: base.join("task.md"),
         plan_md: base.join("plan.md"),
