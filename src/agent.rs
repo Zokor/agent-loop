@@ -56,6 +56,10 @@ pub(crate) fn resolve_command(
                     args.insert(pos + 1, "resume".to_string());
                 }
             }
+            "opencode" => {
+                args.insert(0, sid.to_string());
+                args.insert(0, "--session".to_string());
+            }
             _ => {}
         }
     }

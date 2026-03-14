@@ -94,6 +94,16 @@ fn deepseek_command(prompt: &str, _model: Option<&str>) -> Vec<String> {
     vec![prompt.to_string()]
 }
 
+fn opencode_command(prompt: &str, model: Option<&str>) -> Vec<String> {
+    let mut args = vec!["run".to_string()];
+    if let Some(m) = model {
+        args.push("-m".to_string());
+        args.push(m.to_string());
+    }
+    args.push(prompt.to_string());
+    args
+}
+
 // ---------------------------------------------------------------------------
 // Static registry
 // ---------------------------------------------------------------------------
@@ -213,6 +223,22 @@ static REGISTRY: LazyLock<BTreeMap<&'static str, AgentSpec>> = LazyLock::new(|| 
         },
     );
 
+    m.insert(
+        "opencode",
+        AgentSpec {
+            name: "opencode",
+            binary: "opencode",
+            install_hint: "Install OpenCode: https://opencode.ai",
+            default_reviewer: "claude",
+            command_builder: opencode_command,
+            output_format: OutputFormat::PlainText,
+            tier: Tier::Experimental,
+            probe_args: &["--version"],
+            supports_model_flag: true,
+            supports_session_resume: true,
+        },
+    );
+
     m
 });
 
@@ -251,8 +277,8 @@ pub fn is_known_agent(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    const ALL_AGENTS: [&str; 7] = [
-        "claude", "codex", "gemini", "aider", "qwen", "vibe", "deepseek",
+    const ALL_AGENTS: [&str; 8] = [
+        "claude", "codex", "gemini", "aider", "qwen", "vibe", "deepseek", "opencode",
     ];
 
     #[test]
@@ -350,6 +376,21 @@ mod tests {
                 "gpt-4",
                 "do stuff",
             ],
+        );
+    }
+
+    #[test]
+    fn opencode_command_builder_without_model() {
+        let args = opencode_command("do stuff", None);
+        assert_eq!(args, vec!["run", "do stuff"]);
+    }
+
+    #[test]
+    fn opencode_command_builder_with_model() {
+        let args = opencode_command("do stuff", Some("anthropic/claude-sonnet-4-20250514"));
+        assert_eq!(
+            args,
+            vec!["run", "-m", "anthropic/claude-sonnet-4-20250514", "do stuff"],
         );
     }
 }

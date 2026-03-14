@@ -23,6 +23,7 @@ It persists session state under `.agent-loop/`, captures reusable decisions in `
 | qwen      | qwen      | Experimental | claude           |
 | vibe      | vibe      | Experimental | claude           |
 | deepseek  | deepseek  | Experimental | claude           |
+| opencode  | opencode  | Experimental | claude           |
 
 Experimental agents emit a warning at startup:
 
@@ -32,11 +33,11 @@ Warning: 'gemini' is experimental and may not work correctly.
 
 Agent capabilities vary by registry entry:
 
-| Capability | claude | codex | Experimental |
-|---|---|---|---|
-| Model flag | Yes (`--model`) | Yes (`-m`) | No (cleared with warning) |
-| Session resume | Yes | Yes | No |
-| Output format | ClaudeStreamJson | JSON | PlainText |
+| Capability | claude | codex | opencode | Other Experimental |
+|---|---|---|---|---|
+| Model flag | Yes (`--model`) | Yes (`-m`) | Yes (`-m`) | No (cleared with warning) |
+| Session resume | Yes | Yes | Yes (`--session`) | No |
+| Output format | ClaudeStreamJson | JSON | PlainText | PlainText |
 
 ## Commands
 
