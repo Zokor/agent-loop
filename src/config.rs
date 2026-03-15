@@ -2,9 +2,11 @@ use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 
 use serde::Deserialize;
 
+use crate::db::Db;
 use crate::error::AgentLoopError;
 
 /// Default review/implementation round limit. `0` = unlimited (no cap).
@@ -191,6 +193,10 @@ struct FileConfig {
     // ── Observability ────────────────────────────────────────────────
     /// Write a human-readable agent I/O transcript to `.agent-loop/state/transcript.log` (default true).
     transcript_enabled: Option<bool>,
+
+    // ── SQLite persistence ──────────────────────────────────────────
+    /// Use SQLite for state persistence instead of flat files (default false).
+    sqlite_state: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +363,10 @@ pub struct Config {
     // ── Observability ─────────────────────────────────────────────────
     /// When true, write a human-readable agent I/O transcript.
     pub transcript_enabled: bool,
+
+    // ── SQLite persistence ──────────────────────────────────────────
+    /// When set, state is persisted to SQLite instead of flat files.
+    pub db: Option<Arc<Db>>,
 }
 
 impl Config {
@@ -664,7 +674,7 @@ impl Config {
             None => project_dir.join(".agent-loop").join("state"),
         };
 
-        let config = Self {
+        let mut config = Self {
             state_dir,
             session: session.map(|s| s.to_string()),
             run_mode: resolve_run_mode(single_agent),
@@ -713,7 +723,25 @@ impl Config {
             codex_full_access,
             codex_session_persistence,
             transcript_enabled,
+            db: None,
         };
+
+        // Open SQLite database for state persistence (opt-in via env var or config)
+        let sqlite_enabled = env_bool("SQLITE_STATE")
+            .or(file.sqlite_state)
+            .unwrap_or(false);
+        if sqlite_enabled {
+            let db_path = config.state_dir.join("agent-loop.db");
+            if let Some(parent) = db_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match Db::open(&db_path) {
+                Ok(db) => config.db = Some(Arc::new(db)),
+                Err(err) => {
+                    eprintln!("\u{26a0} failed to open SQLite database, falling back to flat files: {err}");
+                }
+            }
+        }
 
         validate_config_bounds(&config)?;
         emit_config_warnings(

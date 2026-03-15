@@ -11,12 +11,15 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use std::sync::Arc;
+
 use crate::config::{
     Agent, Config, DEFAULT_CLAUDE_ALLOWED_TOOLS, DEFAULT_DECISIONS_MAX_LINES,
     DEFAULT_DECOMPOSITION_MAX_ROUNDS, DEFAULT_MAX_PARALLEL, DEFAULT_PLANNING_MAX_ROUNDS,
     DEFAULT_PLANNING_ROLE_SWAP_AFTER, DEFAULT_REVIEW_MAX_ROUNDS, DEFAULT_REVIEWER_ALLOWED_TOOLS,
     DEFAULT_TIMEOUT_SECONDS, QualityCommand, RunMode,
 };
+use crate::db::Db;
 
 #[derive(Debug, Clone)]
 pub struct TestConfigOptions {
@@ -64,6 +67,7 @@ pub struct TestConfigOptions {
     pub codex_session_persistence: bool,
     pub transcript_enabled: bool,
     pub session: Option<String>,
+    pub use_db: bool,
 }
 
 impl Default for TestConfigOptions {
@@ -113,6 +117,7 @@ impl Default for TestConfigOptions {
             codex_session_persistence: true,
             transcript_enabled: false,
             session: None,
+            use_db: false,
         }
     }
 }
@@ -138,7 +143,7 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         None => base_state_dir,
     };
 
-    Config {
+    let mut config = Config {
         project_dir: root.to_path_buf(),
         state_dir,
         session: options.session.clone(),
@@ -191,7 +196,17 @@ pub fn make_test_config(root: &Path, options: TestConfigOptions) -> Config {
         codex_full_access: options.codex_full_access,
         codex_session_persistence: options.codex_session_persistence,
         transcript_enabled: options.transcript_enabled,
+        db: None,
+    };
+
+    if options.use_db {
+        fs::create_dir_all(&config.state_dir).ok();
+        if let Ok(db) = Db::open(&config.state_dir.join("agent-loop.db")) {
+            config.db = Some(Arc::new(db));
+        }
     }
+
+    config
 }
 
 pub fn unique_temp_path(prefix: &str) -> PathBuf {
@@ -450,6 +465,11 @@ impl TestProjectBuilder {
     #[allow(dead_code)]
     pub fn session(mut self, name: impl Into<String>) -> Self {
         self.options.session = Some(name.into());
+        self
+    }
+
+    pub fn with_db(mut self) -> Self {
+        self.options.use_db = true;
         self
     }
 

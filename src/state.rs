@@ -315,6 +315,10 @@ pub struct TranscriptHandle {
     /// Optional file whose content should be used as the transcript output
     /// instead of the raw process stdout.
     pub output_file: Option<PathBuf>,
+    /// When using DB, the row ID for the in-progress transcript entry.
+    pub db_row_id: Option<i64>,
+    /// Reference to the DB for completing the entry.
+    pub db: Option<std::sync::Arc<crate::db::Db>>,
 }
 
 /// Completion status for a two-phase transcript entry.
@@ -376,6 +380,25 @@ pub fn begin_transcript_entry(
         }
     }
 
+    // Write to DB if available
+    let db_row_id = if let Some(db) = &config.db {
+        match db.begin_transcript(&crate::db::TranscriptRow {
+            phase: &meta.phase,
+            role: &meta.role,
+            round: meta.round,
+            prompt: user_prompt,
+        }) {
+            Ok(id) => Some(id),
+            Err(err) => {
+                eprintln!("\u{26a0} transcript DB write failed: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Always write to flat file (dual-write for tail -f debugging)
     let write_result = OpenOptions::new()
         .create(true)
         .append(true)
@@ -383,13 +406,17 @@ pub fn begin_transcript_entry(
         .and_then(|mut f| f.write_all(entry.as_bytes()));
 
     if let Err(err) = write_result {
-        eprintln!("⚠ transcript write failed: {err}");
-        return None;
+        eprintln!("\u{26a0} transcript write failed: {err}");
+        if db_row_id.is_none() {
+            return None;
+        }
     }
 
     Some(TranscriptHandle {
         path,
         output_file: meta.output_file.clone(),
+        db_row_id,
+        db: config.db.clone(),
     })
 }
 
@@ -435,13 +462,22 @@ pub fn complete_transcript_entry(
     }
     entry.push_str("=== END ===\n\n");
 
+    // Complete DB entry if available
+    if let (Some(db), Some(row_id)) = (&handle.db, handle.db_row_id) {
+        if let Err(err) = db.complete_transcript(row_id, effective_output) {
+            eprintln!("\u{26a0} transcript DB complete failed: {err}");
+        }
+        let _ = db.rotate_transcript(TRANSCRIPT_MAX_LINES);
+    }
+
+    // Always write to flat file (dual-write for tail -f debugging)
     let write_result = OpenOptions::new()
         .append(true)
         .open(&handle.path)
         .and_then(|mut f| f.write_all(entry.as_bytes()));
 
     if let Err(err) = write_result {
-        eprintln!("⚠ transcript write failed: {err}");
+        eprintln!("\u{26a0} transcript write failed: {err}");
         return;
     }
 
@@ -768,10 +804,18 @@ pub fn normalize_status_value_with_warnings(raw: &Value, config: &Config) -> Sta
 }
 
 pub fn read_state_file(name: &str, config: &Config) -> String {
+    if let Some(db) = &config.db {
+        return db.read_document(name);
+    }
     fs::read_to_string(state_file_path(name, config)).unwrap_or_default()
 }
 
 pub fn write_state_file(name: &str, content: &str, config: &Config) -> io::Result<()> {
+    if let Some(db) = &config.db {
+        db.write_document(name, content)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
     let target = state_file_path(name, config);
 
     if let Some(parent) = target.parent() {
@@ -840,7 +884,11 @@ pub fn is_status_stale(expected_ts: &str, status: &LoopStatus) -> bool {
 }
 
 pub fn read_status_with_warnings(config: &Config) -> StatusReadResult {
-    let raw = read_state_file("status.json", config);
+    let raw = if let Some(db) = &config.db {
+        db.read_status().unwrap_or_default()
+    } else {
+        read_state_file("status.json", config)
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return StatusReadResult {
@@ -920,7 +968,12 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
     };
 
     let serialized = serde_json::to_string_pretty(&updated).map_err(io::Error::other)?;
-    write_state_file("status.json", &serialized, config)?;
+    if let Some(db) = &config.db {
+        db.write_status(&serialized)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+    } else {
+        write_state_file("status.json", &serialized, config)?;
+    }
 
     Ok(updated)
 }
@@ -928,6 +981,12 @@ pub fn write_status(patch: StatusPatch, config: &Config) -> io::Result<LoopStatu
 pub fn log(msg: &str, config: &Config) -> io::Result<()> {
     let line = format!("[{}] {}", timestamp(), msg);
     println!("{line}");
+
+    if let Some(db) = &config.db {
+        db.append_log(&line)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
 
     let log_path = state_file_path("log.txt", config);
     if let Some(parent) = log_path.parent() {
@@ -1103,8 +1162,24 @@ pub fn append_round_summary(
 ) -> io::Result<()> {
     let normalized = summarize_task(summary, Some(120));
     let line = format!("Round {round} {phase}: {normalized}\n");
-    let path = state_file_path("conversation.md", config);
 
+    if let Some(db) = &config.db {
+        let mut existing = db.read_document("conversation.md");
+        existing.push_str(&line);
+        // Cap at CONVERSATION_MAX_LINES
+        let lines: Vec<&str> = existing.lines().collect();
+        if lines.len() > CONVERSATION_MAX_LINES {
+            let kept = &lines[lines.len() - CONVERSATION_MAX_LINES..];
+            let mut capped = kept.join("\n");
+            capped.push('\n');
+            existing = capped;
+        }
+        db.write_document("conversation.md", &existing)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
+
+    let path = state_file_path("conversation.md", config);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1165,7 +1240,11 @@ pub struct FindingsReadResult {
 }
 
 pub fn read_findings_with_warnings(config: &Config) -> FindingsReadResult {
-    let raw = read_state_file(FINDINGS_FILENAME, config);
+    let raw = if let Some(db) = &config.db {
+        db.read_findings(FINDINGS_FILENAME)
+    } else {
+        read_state_file(FINDINGS_FILENAME, config)
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return FindingsReadResult {
@@ -1196,6 +1275,11 @@ pub fn read_findings(config: &Config) -> FindingsFile {
 
 pub fn write_findings(findings: &FindingsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(findings).map_err(io::Error::other)?;
+    if let Some(db) = &config.db {
+        db.write_findings(FINDINGS_FILENAME, &serialized)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
     write_state_file(FINDINGS_FILENAME, &serialized, config)
 }
 
@@ -1221,11 +1305,15 @@ pub fn append_planning_progress(
     findings_summary: Option<&str>,
     config: &Config,
 ) {
-    let path = config.state_dir.join("planning-progress.md");
     let full_summary = match findings_summary {
         Some(findings) => format!("{summary}\n{findings}"),
         None => summary.to_string(),
     };
+    if let Some(db) = &config.db {
+        let _ = append_round_progress_db(db, "planning-progress.md", round, &full_summary);
+        return;
+    }
+    let path = config.state_dir.join("planning-progress.md");
     let _ = append_round_progress(&path, round, &full_summary);
 }
 
@@ -1245,6 +1333,48 @@ fn last_progress_round(content: &str) -> Option<u32> {
         }
     }
     None
+}
+
+fn append_round_progress_db(
+    db: &crate::db::Db,
+    key: &str,
+    round: u32,
+    summary: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return Ok(());
+    }
+    let existing = db.read_document(key);
+    let heading = format!("## Round {round}");
+    let mut updated = if existing.trim().is_empty() {
+        format!("{heading}\n{summary}\n")
+    } else if last_progress_round(&existing) == Some(round) {
+        let mut content = existing;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        content.push_str(summary);
+        content.push('\n');
+        content
+    } else {
+        let mut content = existing;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+        if !content.ends_with("\n\n") {
+            content.push('\n');
+        }
+        content.push_str(&heading);
+        content.push('\n');
+        content.push_str(summary);
+        content.push('\n');
+        content
+    };
+    if updated.starts_with('\n') {
+        updated = updated.trim_start_matches('\n').to_string();
+    }
+    Ok(db.write_document(key, &updated)?)
 }
 
 fn append_round_progress(path: &Path, round: u32, summary: &str) -> io::Result<()> {
@@ -1341,31 +1471,68 @@ pub fn append_tasks_progress(
     findings_summary: Option<&str>,
     config: &Config,
 ) {
-    let path = config.state_dir.join("tasks-progress.md");
     let full_summary = match findings_summary {
         Some(findings) => format!("{summary}\n{findings}"),
         None => summary.to_string(),
     };
+    if let Some(db) = &config.db {
+        let _ = append_round_progress_db(db, "tasks-progress.md", round, &full_summary);
+        return;
+    }
+    let path = config.state_dir.join("tasks-progress.md");
     let _ = append_round_progress(&path, round, &full_summary);
 }
 
 pub fn clear_tasks_progress(config: &Config) {
+    if let Some(db) = &config.db {
+        let _ = db.write_document("tasks-progress.md", "");
+        return;
+    }
     let path = config.state_dir.join("tasks-progress.md");
     let _ = clear_progress_file(&path);
 }
 
 pub fn append_implement_progress(round: u32, summary: &str, config: &Config) {
+    if let Some(db) = &config.db {
+        let _ = append_round_progress_db(db, "implement-progress.md", round, summary);
+        return;
+    }
     let path = config.state_dir.join("implement-progress.md");
     let _ = append_round_progress(&path, round, summary);
 }
 
 pub fn append_implement_progress_task(task_title: &str, config: &Config) {
+    if let Some(db) = &config.db {
+        let heading = format!("{IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX}{task_title}");
+        let heading = heading.trim();
+        if heading.is_empty() {
+            return;
+        }
+        let existing = db.read_document("implement-progress.md");
+        let mut updated = existing;
+        if !updated.trim().is_empty() {
+            if !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            if !updated.ends_with("\n\n") {
+                updated.push('\n');
+            }
+        }
+        updated.push_str(heading);
+        updated.push('\n');
+        let _ = db.write_document("implement-progress.md", &updated);
+        return;
+    }
     let path = config.state_dir.join("implement-progress.md");
     let heading = format!("{IMPLEMENT_PROGRESS_TASK_HEADING_PREFIX}{task_title}");
     let _ = append_progress_heading(&path, &heading);
 }
 
 pub fn clear_implement_progress(config: &Config) {
+    if let Some(db) = &config.db {
+        let _ = db.write_document("implement-progress.md", "");
+        return;
+    }
     let path = config.state_dir.join("implement-progress.md");
     let _ = clear_progress_file(&path);
 }
@@ -1411,6 +1578,10 @@ pub fn write_tasks_findings(findings: &TasksFindingsFile, config: &Config) -> io
 }
 
 pub fn clear_tasks_findings(config: &Config) {
+    if let Some(db) = &config.db {
+        let _ = db.write_document(TASKS_FINDINGS_FILENAME, "");
+        return;
+    }
     let path = config.state_dir.join(TASKS_FINDINGS_FILENAME);
     let _ = fs::remove_file(path);
 }
@@ -1494,7 +1665,11 @@ pub struct TaskStatusReadResult {
 }
 
 pub fn read_task_status_with_warnings(config: &Config) -> TaskStatusReadResult {
-    let raw = read_state_file("task_status.json", config);
+    let raw = if let Some(db) = &config.db {
+        db.read_task_status()
+    } else {
+        read_state_file("task_status.json", config)
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return TaskStatusReadResult {
@@ -1526,6 +1701,11 @@ pub fn read_task_status(config: &Config) -> TaskStatusFile {
 
 pub fn write_task_status(status: &TaskStatusFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(status).map_err(io::Error::other)?;
+    if let Some(db) = &config.db {
+        db.write_task_status(&serialized)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
     write_state_file("task_status.json", &serialized, config)
 }
 
@@ -1567,7 +1747,11 @@ pub struct TaskMetricsReadResult {
 }
 
 pub fn read_task_metrics_with_warnings(config: &Config) -> TaskMetricsReadResult {
-    let raw = read_state_file("task_metrics.json", config);
+    let raw = if let Some(db) = &config.db {
+        db.read_task_metrics()
+    } else {
+        read_state_file("task_metrics.json", config)
+    };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return TaskMetricsReadResult {
@@ -1598,6 +1782,11 @@ pub fn read_task_metrics(config: &Config) -> TaskMetricsFile {
 
 pub fn write_task_metrics(metrics: &TaskMetricsFile, config: &Config) -> io::Result<()> {
     let serialized = serde_json::to_string_pretty(metrics).map_err(io::Error::other)?;
+    if let Some(db) = &config.db {
+        db.write_task_metrics(&serialized)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        return Ok(());
+    }
     write_state_file("task_metrics.json", &serialized, config)
 }
 
@@ -1664,23 +1853,43 @@ pub fn init(
     // Accepted for API parity with the TypeScript implementation's checkpoint baseline flow.
     let _baseline_files = baseline_files;
 
-    // Clear stale quality check output when starting a new workflow. A fresh
-    // run should not inherit old results if checks are skipped this round.
-    let quality_checks_path = state_file_path(QUALITY_CHECKS_FILENAME, config);
-    match fs::remove_file(&quality_checks_path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err),
+    // Clear stale quality check output when starting a new workflow.
+    if let Some(db) = &config.db {
+        let _ = db.write_document(QUALITY_CHECKS_FILENAME, "");
+    } else {
+        let quality_checks_path = state_file_path(QUALITY_CHECKS_FILENAME, config);
+        match fs::remove_file(&quality_checks_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
     }
 
-    write_state_file("task.md", task, config)?;
-    write_state_file("plan.md", "", config)?;
-    write_state_file("review.md", "", config)?;
-    write_findings(&FindingsFile::default(), config)?;
-    write_state_file("changes.md", "", config)?;
-    write_state_file("conversation.md", "", config)?;
-    write_state_file("log.txt", "", config)?;
-    write_workflow(workflow, config)?;
+    // When DB is available, wrap all initial writes in a transaction for atomicity.
+    if let Some(db) = &config.db {
+        db.transaction(|db| {
+            db.write_document("task.md", task)?;
+            db.write_document("plan.md", "")?;
+            db.write_document("review.md", "")?;
+            let findings_json = serde_json::to_string_pretty(&FindingsFile::default())
+                .unwrap_or_else(|_| "{}".to_string());
+            db.write_findings(FINDINGS_FILENAME, &findings_json)?;
+            db.write_document("changes.md", "")?;
+            db.write_document("conversation.md", "")?;
+            db.write_document("workflow.txt", &format!("{workflow}\n"))?;
+            Ok(())
+        })
+        .map_err(|e| io::Error::other(e.to_string()))?;
+    } else {
+        write_state_file("task.md", task, config)?;
+        write_state_file("plan.md", "", config)?;
+        write_state_file("review.md", "", config)?;
+        write_findings(&FindingsFile::default(), config)?;
+        write_state_file("changes.md", "", config)?;
+        write_state_file("conversation.md", "", config)?;
+        write_state_file("log.txt", "", config)?;
+        write_workflow(workflow, config)?;
+    }
 
     write_status(
         StatusPatch {

@@ -1,6 +1,7 @@
 mod agent;
 mod agent_registry;
 mod config;
+mod db;
 mod error;
 mod git;
 mod interrupt;
@@ -11,6 +12,7 @@ mod state;
 mod stuck;
 #[cfg(test)]
 mod test_support;
+mod tui;
 mod wave;
 mod wave_runtime;
 
@@ -58,6 +60,9 @@ const KNOWN_SUBCOMMANDS: [&str; 11] = [
 struct Cli {
     #[arg(long, global = true, value_name = "NAME")]
     session: Option<String>,
+    /// Launch read-only TUI dashboard for monitoring agent-loop instances
+    #[arg(long, value_name = "PATH", num_args = 0..)]
+    tui: Option<Vec<PathBuf>>,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -479,6 +484,13 @@ fn run() -> Result<i32, AgentLoopError> {
     match parse_outcome {
         ParseOutcome::Exit(code) => Ok(code),
         ParseOutcome::Parsed(cli) => {
+            // Handle --tui before normal command dispatch
+            if let Some(paths) = cli.tui {
+                return tui::run(paths)
+                    .map(|()| 0)
+                    .map_err(|e| AgentLoopError::Config(e.to_string()));
+            }
+
             let session = cli.session.clone();
             let dispatch = dispatch_from_cli(cli)?;
             // Only register custom signal handlers for commands that spawn
@@ -3400,6 +3412,16 @@ fn reset_command(args: &ResetArgs, session: Option<&str>) -> Result<i32, AgentLo
     }
 
     reset_state_dir(&project_dir, session)?;
+
+    // Also remove the SQLite database file (and WAL/SHM companions)
+    let state_dir = match session {
+        Some(name) => project_dir.join(".agent-loop").join("state").join(name),
+        None => project_dir.join(".agent-loop").join("state"),
+    };
+    for ext in ["agent-loop.db", "agent-loop.db-wal", "agent-loop.db-shm"] {
+        let _ = fs::remove_file(state_dir.join(ext));
+    }
+
     println!("State cleared. decisions.md preserved.");
     Ok(0)
 }
