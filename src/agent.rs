@@ -890,6 +890,13 @@ fn run_agent_inner(
         }
     }
 
+    // OpenCode-specific environment variable pass-through.
+    if agent.name() == "opencode" {
+        if matches!(role, Some(AgentRole::Planner)) {
+            cmd.env("OPENCODE_EXPERIMENTAL_PLAN_MODE", "true");
+        }
+    }
+
     #[cfg(unix)]
     unsafe {
         cmd.pre_exec(|| {
